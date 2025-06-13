@@ -1,6 +1,6 @@
 # Parquet streaming merge example
 
-Fastest of 3 runs:
+Fastest of 3 runs (with `--release`, M3 Max MBP):
 
 Parquet + Arrow crates: `333.084µs`
 
