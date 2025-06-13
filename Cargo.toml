@@ -1,0 +1,19 @@
+[package]
+name = "rust_parquet_merge"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow = "55.1.0"
+arrow-array = "55.1.0"
+arrow-schema = "55.1.0"
+parquet = "55.1.0"
+polars = { version = "0.48.1", features = ["lazy", "parquet"] }
+
+[[example]]
+name = "streaming_merge"
+path = "examples/streaming_merge.rs"
+
+[[example]]
+name = "polars_streaming_merge"
+path = "examples/polars_streaming_merge.rs"
