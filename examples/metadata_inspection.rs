@@ -48,43 +48,6 @@ fn inspect_parquet_layout(file_path: &str) -> Result<()> {
     );
     println!("-------------------");
 
-    // 2. Row Group Metadata Locations
-    for (i, row_group_meta) in parquet_metadata.row_groups().iter().enumerate() {
-        if let Some(file_offset) = row_group_meta.file_offset() {
-            println!("\n--- Row Group {} ---", i);
-            println!("  Offset: {}", file_offset);
-            println!("  Total Byte Size: {}", row_group_meta.total_byte_size());
-            println!("  Compressed Size: {}", row_group_meta.compressed_size());
-            println!("  Number of Rows: {}", row_group_meta.num_rows());
-
-            // 3. Column Chunk Metadata Locations
-            for (j, col_chunk_meta) in row_group_meta.columns().iter().enumerate() {
-                println!("\n  --- Column Chunk {} in Row Group {} ---", j, i);
-                println!("    Column Path: {}", col_chunk_meta.column_path());
-                println!(
-                    "    Data Page Offset: {}",
-                    col_chunk_meta.data_page_offset()
-                );
-                if let Some(dict_offset) = col_chunk_meta.dictionary_page_offset() {
-                    println!("    Dictionary Page Offset: {}", dict_offset);
-                }
-                println!(
-                    "    Total Compressed Size: {}",
-                    col_chunk_meta.compressed_size()
-                );
-
-                if let Some(stats) = col_chunk_meta.statistics() {
-                    if stats.min_bytes_opt().is_some() && stats.max_bytes_opt().is_some() {
-                        println!("    Statistics available (for predicate pushdown)");
-                    }
-                }
-            }
-        } else {
-            println!("\n--- Row Group {} ---", i);
-            println!("  Offset information not available.");
-        }
-    }
-
     Ok(())
 }
 
