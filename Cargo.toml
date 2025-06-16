@@ -8,6 +8,9 @@ arrow = "55.1.0"
 arrow-array = "55.1.0"
 arrow-schema = "55.1.0"
 parquet = "55.1.0"
+aisle = { git = "https://github.com/tonbo-io/aisle.git", branch = "main" }
+tokio = { version = "1.45.1", features = ["full"] }
+futures-util = "0.3.31"
 # polars = { version = "0.48.1", features = ["lazy", "parquet"] }
 
 [[example]]
@@ -21,3 +24,7 @@ path = "examples/streaming_merge.rs"
 [[example]]
 name = "metadata_inspection"
 path = "examples/metadata_inspection.rs"
+
+[[example]]
+name = "aisle_streaming_merge"
+path = "examples/aisle_streaming_merge.rs"
