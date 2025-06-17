@@ -28,3 +28,7 @@ path = "examples/metadata_inspection.rs"
 [[example]]
 name = "aisle_streaming_merge"
 path = "examples/aisle_streaming_merge.rs"
+
+[[example]]
+name = "async_streaming_merge"
+path = "examples/async_streaming_merge.rs"
