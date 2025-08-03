@@ -4,16 +4,15 @@ use std::time::Instant;
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures_util::StreamExt;
-use parquet::arrow::ArrowWriter;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_writer::AsyncArrowWriter;
 use parquet::file::properties::WriterProperties;
 use tokio::fs::File;
 use tokio::io::AsyncWrite;
 
-/// Async helper function to adjust a RecordBatch to match a target schema.
+/// Helper function to adjust a RecordBatch to match a target schema.
 /// This adds null arrays for any columns that are in the target schema but not in the batch.
-async fn adjust_record_batch(
+fn adjust_record_batch(
     batch: RecordBatch,
     target_schema: SchemaRef,
 ) -> Result<RecordBatch, parquet::errors::ParquetError> {
@@ -45,11 +44,11 @@ async fn create_sample_file(
     schema: SchemaRef,
     batch: RecordBatch,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // For creating files, we still need to use sync I/O since ArrowWriter requires std::io::Write
-    let file = std::fs::File::create(filename)?;
-    let mut writer = ArrowWriter::try_new(file, schema, Some(WriterProperties::new()))?;
-    writer.write(&batch)?;
-    writer.close()?;
+    // Using async I/O for consistency
+    let file = File::create(filename).await?;
+    let mut writer = AsyncArrowWriter::try_new(file, schema, Some(WriterProperties::new()))?;
+    writer.write(&batch).await?;
+    writer.close().await?;
     Ok(())
 }
 
@@ -94,7 +93,7 @@ where
 
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
-        let adjusted_batch = adjust_record_batch(batch, target_schema.clone()).await?;
+        let adjusted_batch = adjust_record_batch(batch, target_schema.clone())?;
         writer.write(&adjusted_batch).await?;
     }
 
@@ -132,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
     )?;
 
-    // Create sample files asynchronously
+    // Create sample files asynchronously with proper async I/O
     tokio::try_join!(
         create_sample_file("async_file1.parquet", schema1.clone(), batch1),
         create_sample_file("async_file2.parquet", schema2.clone(), batch2)
