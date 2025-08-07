@@ -1,3 +1,4 @@
+use std::io::BufWriter;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,61 +10,49 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use tokio::fs::File as TokioFile;
 
-/// This helper function adjusts a RecordBatch to match a target schema,
-/// adding null arrays for missing columns.
-fn adjust_record_batch(
-    batch: RecordBatch,
-    target_schema: SchemaRef,
-) -> Result<RecordBatch, Box<dyn std::error::Error>> {
-    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(target_schema.fields().len());
-    let batch_schema = batch.schema();
+/// Build a one-time column index mapping from a source schema to a target schema.
+/// Each entry is `Some(source_index)` if the target field exists in the source, otherwise `None`.
+fn build_index_mapping(source_schema: &Schema, target_schema: &Schema) -> Vec<Option<usize>> {
+    target_schema
+        .fields()
+        .iter()
+        .map(|target_field| source_schema.index_of(target_field.name()).ok())
+        .collect()
+}
 
-    for target_field in target_schema.fields() {
-        match batch_schema.index_of(target_field.name()) {
-            // Column exists in the batch, so we clone it.
-            Ok(idx) => {
-                new_columns.push(batch.column(idx).clone());
-            }
-            // Column is missing, so we create a null array for it.
-            Err(_) => {
-                let null_array =
-                    arrow::array::new_null_array(target_field.data_type(), batch.num_rows());
-                new_columns.push(null_array);
-            }
+/// Adjust a `RecordBatch` to match `target_schema` using a precomputed index mapping.
+fn adjust_with_mapping(
+    batch: &RecordBatch,
+    target_schema: &SchemaRef,
+    mapping: &[Option<usize>],
+) -> Result<RecordBatch, parquet::errors::ParquetError> {
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(mapping.len());
+
+    for (i, maybe_src_idx) in mapping.iter().enumerate() {
+        match maybe_src_idx {
+            Some(src_idx) => new_columns.push(batch.column(*src_idx).clone()),
+            None => new_columns.push(arrow::array::new_null_array(
+                target_schema.field(i).data_type(),
+                batch.num_rows(),
+            )),
         }
     }
 
-    Ok(RecordBatch::try_new(target_schema, new_columns)?)
+    RecordBatch::try_new(target_schema.clone(), new_columns)
+        .map_err(|e| parquet::errors::ParquetError::General(format!("Arrow error: {}", e)))
 }
 
-/// Create an async Parquet reader using Aisle with tokio::fs::File
-async fn create_aisle_reader(
+/// Open a parquet file and return an Aisle builder initialized with options.
+async fn open_aisle_builder(
     file_path: &str,
-) -> Result<
-    impl futures_util::Stream<Item = Result<RecordBatch, parquet::errors::ParquetError>>,
-    Box<dyn std::error::Error>,
-> {
-    let file = TokioFile::open(file_path).await?;
-
-    // Initialize builder with page index enabled for better performance
-    let builder = ParquetRecordBatchStreamBuilder::new_with_options(
-        file,
-        ArrowReaderOptions::new().with_page_index(true),
-    )
-    .await?;
-
-    Ok(builder.build()?)
-}
-
-/// Get schema from a parquet file using Aisle
-async fn get_schema_from_file(file_path: &str) -> Result<SchemaRef, Box<dyn std::error::Error>> {
+) -> Result<ParquetRecordBatchStreamBuilder<TokioFile>, Box<dyn std::error::Error>> {
     let file = TokioFile::open(file_path).await?;
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(
         file,
         ArrowReaderOptions::new().with_page_index(true),
     )
     .await?;
-    Ok(builder.schema().clone())
+    Ok(builder)
 }
 
 #[tokio::main]
@@ -108,7 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---- Demonstrate Aisle's async streaming ----
     println!("\n=== Reading with Aisle (async streaming) ===");
     let start_time = Instant::now();
-    let mut stream = create_aisle_reader("aisle_file1.parquet").await?;
+    let builder_demo = open_aisle_builder("aisle_file1.parquet").await?;
+    let mut stream = builder_demo.build()?;
     let mut total_rows = 0;
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
@@ -120,9 +110,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---- Schema merging and streaming merge ----
     println!("\n=== Performing Aisle Streaming Merge ===");
 
-    // Get schemas from files
-    let schema1_aisle = get_schema_from_file("aisle_file1.parquet").await?;
-    let schema2_aisle = get_schema_from_file("aisle_file2.parquet").await?;
+    // Open builders once and get schemas
+    let (builder1, builder2) = tokio::try_join!(
+        open_aisle_builder("aisle_file1.parquet"),
+        open_aisle_builder("aisle_file2.parquet"),
+    )?;
+    let schema1_aisle = builder1.schema().clone();
+    let schema2_aisle = builder2.schema().clone();
 
     // Merge schemas
     let mut merged_fields: Vec<_> = schema1_aisle.fields().iter().cloned().collect();
@@ -137,27 +131,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         merged_schema.fields().len()
     );
 
-    // Create output writer
+    // Precompute index mappings
+    let mapping1 = build_index_mapping(schema1_aisle.as_ref(), merged_schema.as_ref());
+    let mapping2 = build_index_mapping(schema2_aisle.as_ref(), merged_schema.as_ref());
+
+    // Create output writer (buffered)
     let file_out = std::fs::File::create("aisle_merged.parquet")?;
-    let mut writer = ArrowWriter::try_new(file_out, merged_schema.clone(), None)?;
+    let buf_out = BufWriter::with_capacity(1 << 20, file_out);
+    let mut writer = ArrowWriter::try_new(buf_out, merged_schema.clone(), None)?;
 
     let merge_start = Instant::now();
 
     // Stream from file1 and write to output
     println!("Streaming data from file1...");
-    let mut stream1 = create_aisle_reader("aisle_file1.parquet").await?;
+    let mut stream1 = builder1.build()?;
     while let Some(batch_result) = stream1.next().await {
         let batch = batch_result?;
-        let adjusted_batch = adjust_record_batch(batch, merged_schema.clone())?;
+        let adjusted_batch = adjust_with_mapping(&batch, &merged_schema, &mapping1)?;
         writer.write(&adjusted_batch)?;
     }
 
     // Stream from file2 and write to output
     println!("Streaming data from file2...");
-    let mut stream2 = create_aisle_reader("aisle_file2.parquet").await?;
+    let mut stream2 = builder2.build()?;
     while let Some(batch_result) = stream2.next().await {
         let batch = batch_result?;
-        let adjusted_batch = adjust_record_batch(batch, merged_schema.clone())?;
+        let adjusted_batch = adjust_with_mapping(&batch, &merged_schema, &mapping2)?;
         writer.write(&adjusted_batch)?;
     }
 
@@ -169,7 +168,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- Show final merged results ----
     println!("\n=== Contents of merged file (via Aisle) ===");
-    let mut final_stream = create_aisle_reader("aisle_merged.parquet").await?;
+    let final_builder = open_aisle_builder("aisle_merged.parquet").await?;
+    let mut final_stream = final_builder.build()?;
     while let Some(batch_result) = final_stream.next().await {
         let batch = batch_result?;
         println!("{:#?}", batch);

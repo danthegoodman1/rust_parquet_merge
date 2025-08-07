@@ -8,4 +8,4 @@ Parquet + Arrow crates (async): `550-900us`
 
 Polars: `8.977625ms` 🫣 _I hope this isn't the most efficient way?_
 
-Aisle: `657.458µs-1.6ms` (but jumped up to 1ms, more variance)
+Aisle: `463-820us` (but jumped up to 1ms, more variance)
