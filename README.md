@@ -2,10 +2,10 @@
 
 Fastest of 3 runs (with `--release`, M3 Max MBP):
 
-Parquet + Arrow crates: `333.084µs`
+Parquet + Arrow crates: `246-616µs`
 
-Parquet + Arrow crates (async): `538.333µs`
+Parquet + Arrow crates (async): `550-900us`
 
 Polars: `8.977625ms` 🫣 _I hope this isn't the most efficient way?_
 
-Aisle: `657.458µs` (but jumped up to 1ms, more variance)
+Aisle: `657.458µs-1.6ms` (but jumped up to 1ms, more variance)
