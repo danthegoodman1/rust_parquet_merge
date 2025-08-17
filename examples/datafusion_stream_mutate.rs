@@ -3,13 +3,33 @@ use arrow::{
         Array, ArrayRef, RecordBatch, StringArray, StructArray, TimestampMillisecondArray,
         UInt64Array,
     },
-    datatypes::{DataType, Field, Schema, TimeUnit},
+    datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     util::display::array_value_to_string,
 };
 use chrono::{DateTime, Utc};
-use datafusion::{datasource::MemTable, prelude::*};
+use datafusion::execution::context::TaskContext;
+use datafusion::physical_plan::streaming::PartitionStream;
+use datafusion::physical_plan::{SendableRecordBatchStream, memory::MemoryStream};
+use datafusion::{catalog::streaming::StreamingTable, datasource::MemTable, prelude::*};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+#[derive(Debug)]
+struct StaticBatchesPartition {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+}
+
+impl PartitionStream for StaticBatchesPartition {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        // Adapt the in-memory batches into a SendableRecordBatchStream
+        Box::pin(MemoryStream::try_new(self.batches.clone(), self.schema.clone(), None).unwrap())
+    }
+}
 
 // Sample JSON structure for our events
 #[derive(Debug, Serialize, Deserialize)]
@@ -200,8 +220,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let batch1 = create_record_batch(&batch1_events, &schema)?;
 
     // Process this batch through DataFusion
-    let mem_table2 = MemTable::try_new(schema.clone(), vec![vec![batch1]])?;
-    ctx.register_table("stream_batch", Arc::new(mem_table2))?;
+    // Wrap our batch in a PartitionStream implementation and register a StreamingTable
+    let partition = Arc::new(StaticBatchesPartition {
+        schema: schema.clone(),
+        batches: vec![batch1],
+    }) as Arc<dyn PartitionStream>;
+    let streaming_table = StreamingTable::try_new(schema.clone(), vec![partition])?;
+    ctx.register_table("stream_batch", Arc::new(streaming_table))?;
 
     let stream_sql = r#"
         SELECT 
