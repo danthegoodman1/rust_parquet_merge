@@ -11,6 +11,7 @@ use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::physical_plan::{SendableRecordBatchStream, memory::MemoryStream};
 use datafusion::{catalog::streaming::StreamingTable, datasource::MemTable, prelude::*};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -246,16 +247,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     "#;
 
     let df_stream = ctx.sql(stream_sql).await?;
-    let stream_results = df_stream.collect().await?;
+    let mut out_stream = df_stream.execute_stream().await?;
 
-    println!("New streaming batch with computed partitions (struct):");
-    for batch in &stream_results {
+    println!("New streaming output (printing as batches arrive):");
+    while let Some(batch_res) = out_stream.next().await {
+        let batch = batch_res?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
         arrow::util::pretty::print_batches(&[batch.clone()])?;
+        print_partition_structs(&[batch.clone()], "partition_struct")?;
     }
-    println!();
-
-    println!("=== Streaming Batch Partition Details ===");
-    print_partition_structs(&stream_results, "partition_struct")?;
 
     Ok(())
 }
