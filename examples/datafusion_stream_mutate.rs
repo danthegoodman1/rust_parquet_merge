@@ -3,34 +3,13 @@ use arrow::{
         Array, ArrayRef, RecordBatch, StringArray, StructArray, TimestampMillisecondArray,
         UInt64Array,
     },
-    datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
+    datatypes::{DataType, Field, Schema, TimeUnit},
     util::display::array_value_to_string,
 };
 use chrono::{DateTime, Utc};
-use datafusion::execution::context::TaskContext;
-use datafusion::physical_plan::streaming::PartitionStream;
-use datafusion::physical_plan::{SendableRecordBatchStream, memory::MemoryStream};
-use datafusion::{catalog::streaming::StreamingTable, datasource::MemTable, prelude::*};
-use futures_util::StreamExt;
+use datafusion::{datasource::MemTable, prelude::*};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-
-#[derive(Debug)]
-struct StaticBatchesPartition {
-    schema: SchemaRef,
-    batches: Vec<RecordBatch>,
-}
-
-impl PartitionStream for StaticBatchesPartition {
-    fn schema(&self) -> &SchemaRef {
-        &self.schema
-    }
-
-    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
-        // Adapt the in-memory batches into a SendableRecordBatchStream
-        Box::pin(MemoryStream::try_new(self.batches.clone(), self.schema.clone(), None).unwrap())
-    }
-}
 
 // Sample JSON structure for our events
 #[derive(Debug, Serialize, Deserialize)]
@@ -194,11 +173,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_partition_structs(&results, "partition_struct")?;
     println!();
 
-    // Step 4: Demonstrate streaming approach (processing batches)
-    println!("=== Streaming Approach Demo ===");
+    // Step 4: Demonstrate per-row streaming approach with MemTable
+    println!("=== Per-Row Streaming with MemTable Demo ===");
 
-    // Simulate receiving batches of data
-    let batch1_events = vec![
+    // Simulate receiving individual events as they stream in
+    let streaming_events = vec![
         Event {
             timestamp: "2025-01-18T10:00:00Z".parse()?,
             org_id: 150,
@@ -215,23 +194,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             amount: None,
             country: "FR".to_string(),
         },
+        Event {
+            timestamp: "2025-01-18T12:30:00Z".parse()?,
+            org_id: 350,
+            user_id: "stream_user3".to_string(),
+            event_type: "purchase".to_string(),
+            amount: Some(199.50),
+            country: "DE".to_string(),
+        },
     ];
 
-    // Convert new batch to RecordBatch and process
-    let batch1 = create_record_batch(&batch1_events, &schema)?;
+    // Create a RecordBatch for each individual event (simulating streaming)
+    let mut individual_batches = Vec::new();
 
-    // Process this batch through DataFusion
-    // Wrap our batch in a PartitionStream implementation and register a StreamingTable
-    let partition = Arc::new(StaticBatchesPartition {
-        schema: schema.clone(),
-        batches: vec![batch1],
-    }) as Arc<dyn PartitionStream>;
-    let streaming_table = StreamingTable::try_new(schema.clone(), vec![partition])?;
-    ctx.register_table("stream_batch", Arc::new(streaming_table))?;
+    println!("Processing events as they arrive (one RecordBatch per event):");
+    for (i, event) in streaming_events.iter().enumerate() {
+        println!("  Processing event {}: {:?}", i + 1, event);
 
-    let stream_sql = r#"
+        // Create a single-row RecordBatch for this event
+        let single_batch = create_single_event_batch(event, &schema)?;
+        individual_batches.push(single_batch);
+    }
+
+    println!(
+        "Created {} individual RecordBatches",
+        individual_batches.len()
+    );
+
+    // Create a MemTable where each RecordBatch becomes a partition
+    // MemTable expects Vec<Vec<RecordBatch>> where outer Vec = partitions, inner Vec = batches per partition
+    let partitions: Vec<Vec<RecordBatch>> = individual_batches
+        .into_iter()
+        .map(|batch| vec![batch]) // Each batch becomes its own partition
+        .collect();
+
+    let streaming_mem_table = MemTable::try_new(schema.clone(), partitions)?;
+    ctx.register_table("streaming_events", Arc::new(streaming_mem_table))?;
+
+    // Query the streaming data using the same partition logic
+    let streaming_sql = r#"
         SELECT 
             user_id,
+            timestamp,
+            org_id,
+            country,
             named_struct(
                 'year',   EXTRACT(year  FROM timestamp),
                 'month',  EXTRACT(month FROM timestamp),
@@ -243,26 +249,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ELSE 'tier3'
                 END
             ) as partition_struct
-        FROM stream_batch
+        FROM streaming_events
+        ORDER BY timestamp
     "#;
 
-    let df_stream = ctx.sql(stream_sql).await?;
-    let mut out_stream = df_stream.execute_stream().await?;
+    let df_streaming = ctx.sql(streaming_sql).await?;
+    let streaming_results = df_streaming.collect().await?;
 
-    println!("New streaming output (printing as batches arrive):");
-    while let Some(batch_res) = out_stream.next().await {
-        let batch = batch_res?;
-        if batch.num_rows() == 0 {
-            continue;
-        }
+    println!("=== Streaming Results (from MemTable with per-event partitions) ===");
+    for batch in &streaming_results {
         arrow::util::pretty::print_batches(&[batch.clone()])?;
-        print_partition_structs(&[batch.clone()], "partition_struct")?;
     }
+    println!();
+
+    println!("=== Streaming Partition Struct Details ===");
+    print_partition_structs(&streaming_results, "partition_struct")?;
 
     Ok(())
 }
 
-// Helper function to create RecordBatch from events
+// Helper function to create RecordBatch from events (kept for potential future use)
+#[allow(dead_code)]
 fn create_record_batch(
     events: &[Event],
     schema: &Arc<Schema>,
@@ -286,6 +293,28 @@ fn create_record_batch(
             Arc::new(StringArray::from(event_types)) as ArrayRef,
             Arc::new(arrow::array::Float64Array::from(amounts)) as ArrayRef,
             Arc::new(StringArray::from(countries)) as ArrayRef,
+        ],
+    )?;
+
+    Ok(batch)
+}
+
+// Helper function to create RecordBatch from a single event
+fn create_single_event_batch(
+    event: &Event,
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(TimestampMillisecondArray::from(vec![
+                event.timestamp.timestamp_millis(),
+            ])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![event.org_id])) as ArrayRef,
+            Arc::new(StringArray::from(vec![event.user_id.clone()])) as ArrayRef,
+            Arc::new(StringArray::from(vec![event.event_type.clone()])) as ArrayRef,
+            Arc::new(arrow::array::Float64Array::from(vec![event.amount])) as ArrayRef,
+            Arc::new(StringArray::from(vec![event.country.clone()])) as ArrayRef,
         ],
     )?;
 
@@ -412,28 +441,27 @@ fn print_partition_structs(
                     field.data_type()
                 );
             }
+        }
+        // A more compact way:
 
-            // A more compact way:
-
-            for row in 0..batch.num_rows() {
-                // Get the user_id for better context (if available)
-                let user_info = if let Ok(user_idx) = batch.schema().index_of("user_id") {
-                    let user_col = batch.column(user_idx);
-                    if let Some(user_array) = user_col.as_any().downcast_ref::<StringArray>() {
-                        format!(" (user: {})", user_array.value(row))
-                    } else {
-                        String::new()
-                    }
+        for row in 0..batch.num_rows() {
+            // Get the user_id for better context (if available)
+            let user_info = if let Ok(user_idx) = batch.schema().index_of("user_id") {
+                let user_col = batch.column(user_idx);
+                if let Some(user_array) = user_col.as_any().downcast_ref::<StringArray>() {
+                    format!(" (user: {})", user_array.value(row))
                 } else {
                     String::new()
-                };
-
-                println!("Row {}{}:", row, user_info);
-                for (field_idx, field) in fields.iter().enumerate() {
-                    let child = struct_array.column(field_idx);
-                    let value = array_value_to_string(child.as_ref(), row)?;
-                    println!("\t{}: {}", field.name(), value);
                 }
+            } else {
+                String::new()
+            };
+
+            println!("Row {}{}:", row, user_info);
+            for (field_idx, field) in fields.iter().enumerate() {
+                let child = struct_array.column(field_idx);
+                let value = array_value_to_string(child.as_ref(), row)?;
+                println!("\t{}: {}", field.name(), value);
             }
         }
     }
