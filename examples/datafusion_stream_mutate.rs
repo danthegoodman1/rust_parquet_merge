@@ -134,11 +134,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Method 1: Using SQL to compute partition columns
     let partition_sql = r#"
-        SELECT 
+        SELECT
             *,
             -- Compute partition columns
             date_trunc('day', timestamp) as partition_date,
-            CASE 
+            CASE
                 WHEN org_id < 200 THEN 'tier1'
                 WHEN org_id < 300 THEN 'tier2'
                 ELSE 'tier3'
@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 'month',  EXTRACT(month FROM timestamp),
                 'day',    EXTRACT(day   FROM timestamp),
                 'country', country,
-                'org_tier', CASE 
+                'org_tier', CASE
                     WHEN org_id < 200 THEN 'tier1'
                     WHEN org_id < 300 THEN 'tier2'
                     ELSE 'tier3'
@@ -233,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Query the streaming data using the same partition logic
     let streaming_sql = r#"
-        SELECT 
+        SELECT
             user_id,
             timestamp,
             org_id,
@@ -243,7 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 'month',  EXTRACT(month FROM timestamp),
                 'day',    EXTRACT(day   FROM timestamp),
                 'country', country,
-                'org_tier', CASE 
+                'org_tier', CASE
                     WHEN org_id < 200 THEN 'tier1'
                     WHEN org_id < 300 THEN 'tier2'
                     ELSE 'tier3'
