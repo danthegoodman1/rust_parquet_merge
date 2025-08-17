@@ -11,6 +11,10 @@ parquet = "55.1.0"
 aisle = { git = "https://github.com/tonbo-io/aisle.git", branch = "main" }
 tokio = { version = "1.45.1", features = ["full"] }
 futures-util = "0.3.31"
+datafusion = "49.0.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.142"
+chrono = { version = "0.4.41", features = ["serde"] }
 # polars = { version = "0.48.1", features = ["lazy", "parquet"] }
 
 [[example]]
