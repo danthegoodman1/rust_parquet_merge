@@ -31,3 +31,7 @@ path = "examples/metadata_inspection.rs"
 [[example]]
 name = "async_streaming_merge"
 path = "examples/async_streaming_merge.rs"
+
+[[example]]
+name = "async_streaming_merge_widening"
+path = "examples/async_streaming_merge_widening.rs"
