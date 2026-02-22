@@ -146,7 +146,8 @@ fn make_nullable(field: &Field, nullable: bool) -> Field {
 }
 
 fn widen_fields(left: &Field, right: &Field) -> Result<Field, String> {
-    let widened = widen_data_type(left.data_type(), right.data_type())?;
+    let widened = widen_data_type(left.data_type(), right.data_type())
+        .map_err(|error| format!("field `{}` conflict: {error}", left.name()))?;
     let nullable = left.is_nullable() || right.is_nullable();
     Ok(Field::new(left.name(), widened, nullable))
 }
@@ -178,7 +179,8 @@ fn widen_struct_fields(left: &Fields, right: &Fields) -> Result<Fields, String> 
 }
 
 fn widen_list_field(left: &FieldRef, right: &FieldRef) -> Result<FieldRef, String> {
-    let widened_child_type = widen_data_type(left.data_type(), right.data_type())?;
+    let widened_child_type = widen_data_type(left.data_type(), right.data_type())
+        .map_err(|error| format!("list element `{}` conflict: {error}", left.name()))?;
     let nullable = left.is_nullable() || right.is_nullable();
     Ok(Arc::new(Field::new(
         left.name(),
@@ -207,7 +209,7 @@ fn widen_data_type(left: &DataType, right: &DataType) -> Result<DataType, String
             DataType::LargeList(widen_list_field(left_field, right_field)?),
         ),
         (left_other, right_other) => Err(format!(
-            "incompatible types for widening: {left_other:?} vs {right_other:?}"
+            "incompatible types for widening: left={left_other:?}, right={right_other:?}"
         )),
     }
 }
@@ -678,6 +680,50 @@ mod tests {
             DataType::Struct(vec![Arc::new(Field::new("x", DataType::Int32, true))].into());
         let error = widen_data_type(&DataType::Utf8, &struct_type).unwrap_err();
         assert!(error.contains("incompatible types"));
+        assert!(error.contains("Utf8"));
+        assert!(error.contains("Struct"));
+    }
+
+    #[test]
+    fn conflict_message_includes_top_level_property_and_types() {
+        let left = Schema::new(vec![Field::new("payload", DataType::Utf8, true)]);
+        let right = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(vec![Arc::new(Field::new("x", DataType::Int32, true))].into()),
+            true,
+        )]);
+
+        let error = merge_schemas_with_widening(&left, &right).unwrap_err();
+        assert!(error.contains("field `payload`"));
+        assert!(error.contains("Utf8"));
+        assert!(error.contains("Struct"));
+    }
+
+    #[test]
+    fn conflict_message_includes_nested_property_and_types() {
+        let left = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(vec![Arc::new(Field::new("x", DataType::Int32, true))].into()),
+            true,
+        )]);
+        let right = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(
+                vec![Arc::new(Field::new(
+                    "x",
+                    DataType::Struct(vec![Arc::new(Field::new("y", DataType::Utf8, true))].into()),
+                    true,
+                ))]
+                .into(),
+            ),
+            true,
+        )]);
+
+        let error = merge_schemas_with_widening(&left, &right).unwrap_err();
+        assert!(error.contains("field `payload`"));
+        assert!(error.contains("field `x`"));
+        assert!(error.contains("Int32"));
+        assert!(error.contains("Struct"));
     }
 
     #[test]
