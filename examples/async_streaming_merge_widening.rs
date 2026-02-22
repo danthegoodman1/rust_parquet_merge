@@ -145,14 +145,33 @@ fn make_nullable(field: &Field, nullable: bool) -> Field {
     new_field
 }
 
-fn widen_fields(left: &Field, right: &Field) -> Result<Field, String> {
-    let widened = widen_data_type(left.data_type(), right.data_type())
-        .map_err(|error| format!("field `{}` conflict: {error}", left.name()))?;
-    let nullable = left.is_nullable() || right.is_nullable();
-    Ok(Field::new(left.name(), widened, nullable))
+fn format_conflicts(conflicts: &[String]) -> String {
+    format!(
+        "schema widening found {} conflict(s):\n- {}",
+        conflicts.len(),
+        conflicts.join("\n- ")
+    )
 }
 
-fn widen_struct_fields(left: &Fields, right: &Fields) -> Result<Fields, String> {
+fn push_conflict(conflicts: &mut Vec<String>, path: &str, left: &DataType, right: &DataType) {
+    let path_display = if path.is_empty() { "<root>" } else { path };
+    conflicts.push(format!(
+        "field `{path_display}` incompatible types for widening: left={left:?}, right={right:?}"
+    ));
+}
+
+fn widen_fields(left: &Field, right: &Field, path: &str, conflicts: &mut Vec<String>) -> Field {
+    let widened = widen_data_type_with_conflicts(path, left.data_type(), right.data_type(), conflicts);
+    let nullable = left.is_nullable() || right.is_nullable();
+    Field::new(left.name(), widened, nullable)
+}
+
+fn widen_struct_fields(
+    left: &Fields,
+    right: &Fields,
+    parent_path: &str,
+    conflicts: &mut Vec<String>,
+) -> Fields {
     let right_by_name: HashMap<&str, &FieldRef> = right
         .iter()
         .map(|field| (field.name().as_str(), field))
@@ -162,8 +181,19 @@ fn widen_struct_fields(left: &Fields, right: &Fields) -> Result<Fields, String> 
     let mut widened: Vec<FieldRef> = Vec::new();
 
     for left_field in left {
+        let child_path = if parent_path.is_empty() {
+            left_field.name().to_string()
+        } else {
+            format!("{parent_path}.{}", left_field.name())
+        };
+
         if let Some(right_field) = right_by_name.get(left_field.name().as_str()) {
-            widened.push(Arc::new(widen_fields(left_field, right_field)?));
+            widened.push(Arc::new(widen_fields(
+                left_field,
+                right_field,
+                &child_path,
+                conflicts,
+            )));
         } else {
             widened.push(Arc::new(make_nullable(left_field, true)));
         }
@@ -175,42 +205,64 @@ fn widen_struct_fields(left: &Fields, right: &Fields) -> Result<Fields, String> 
         }
     }
 
-    Ok(widened.into())
+    widened.into()
 }
 
-fn widen_list_field(left: &FieldRef, right: &FieldRef) -> Result<FieldRef, String> {
-    let widened_child_type = widen_data_type(left.data_type(), right.data_type())
-        .map_err(|error| format!("list element `{}` conflict: {error}", left.name()))?;
+fn widen_list_field(
+    left: &FieldRef,
+    right: &FieldRef,
+    parent_path: &str,
+    conflicts: &mut Vec<String>,
+) -> FieldRef {
+    let element_path = if parent_path.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("{parent_path}[]")
+    };
+    let widened_child_type =
+        widen_data_type_with_conflicts(&element_path, left.data_type(), right.data_type(), conflicts);
     let nullable = left.is_nullable() || right.is_nullable();
-    Ok(Arc::new(Field::new(
-        left.name(),
-        widened_child_type,
-        nullable,
-    )))
+    Arc::new(Field::new(left.name(), widened_child_type, nullable))
 }
 
-fn widen_data_type(left: &DataType, right: &DataType) -> Result<DataType, String> {
+fn widen_data_type_with_conflicts(
+    path: &str,
+    left: &DataType,
+    right: &DataType,
+    conflicts: &mut Vec<String>,
+) -> DataType {
     if let Some(widened) = widen_primitive_or_string(left, right) {
-        return Ok(widened);
+        return widened;
     }
 
     match (left, right) {
-        (DataType::Struct(left_fields), DataType::Struct(right_fields)) => Ok(DataType::Struct(
-            widen_struct_fields(left_fields, right_fields)?,
-        )),
-        (DataType::List(left_field), DataType::List(right_field)) => {
-            Ok(DataType::List(widen_list_field(left_field, right_field)?))
+        (DataType::Struct(left_fields), DataType::Struct(right_fields)) => {
+            DataType::Struct(widen_struct_fields(left_fields, right_fields, path, conflicts))
         }
-        (DataType::LargeList(left_field), DataType::LargeList(right_field)) => Ok(
-            DataType::LargeList(widen_list_field(left_field, right_field)?),
-        ),
+        (DataType::List(left_field), DataType::List(right_field)) => {
+            DataType::List(widen_list_field(left_field, right_field, path, conflicts))
+        }
+        (DataType::LargeList(left_field), DataType::LargeList(right_field)) => {
+            DataType::LargeList(widen_list_field(left_field, right_field, path, conflicts))
+        }
         (DataType::List(left_field), DataType::LargeList(right_field))
-        | (DataType::LargeList(right_field), DataType::List(left_field)) => Ok(
-            DataType::LargeList(widen_list_field(left_field, right_field)?),
-        ),
-        (left_other, right_other) => Err(format!(
-            "incompatible types for widening: left={left_other:?}, right={right_other:?}"
-        )),
+        | (DataType::LargeList(right_field), DataType::List(left_field)) => {
+            DataType::LargeList(widen_list_field(left_field, right_field, path, conflicts))
+        }
+        _ => {
+            push_conflict(conflicts, path, left, right);
+            left.clone()
+        }
+    }
+}
+
+fn widen_data_type(left: &DataType, right: &DataType) -> Result<DataType, String> {
+    let mut conflicts = Vec::new();
+    let widened = widen_data_type_with_conflicts("", left, right, &mut conflicts);
+    if conflicts.is_empty() {
+        Ok(widened)
+    } else {
+        Err(format_conflicts(&conflicts))
     }
 }
 
@@ -227,10 +279,16 @@ fn merge_schemas_with_widening(left: &Schema, right: &Schema) -> Result<Schema, 
         .collect();
 
     let mut merged_fields: Vec<FieldRef> = Vec::new();
+    let mut conflicts = Vec::new();
 
     for left_field in left.fields() {
         if let Some(right_field) = right_by_name.get(left_field.name().as_str()) {
-            merged_fields.push(Arc::new(widen_fields(left_field, right_field)?));
+            merged_fields.push(Arc::new(widen_fields(
+                left_field,
+                right_field,
+                left_field.name(),
+                &mut conflicts,
+            )));
         } else {
             merged_fields.push(Arc::new(make_nullable(left_field, true)));
         }
@@ -242,7 +300,11 @@ fn merge_schemas_with_widening(left: &Schema, right: &Schema) -> Result<Schema, 
         }
     }
 
-    Ok(Schema::new(merged_fields))
+    if conflicts.is_empty() {
+        Ok(Schema::new(merged_fields))
+    } else {
+        Err(format_conflicts(&conflicts))
+    }
 }
 
 /// Build a one-time column index mapping from a source schema to a target schema.
@@ -720,10 +782,34 @@ mod tests {
         )]);
 
         let error = merge_schemas_with_widening(&left, &right).unwrap_err();
-        assert!(error.contains("field `payload`"));
-        assert!(error.contains("field `x`"));
+        assert!(error.contains("field `payload.x`"));
         assert!(error.contains("Int32"));
         assert!(error.contains("Struct"));
+    }
+
+    #[test]
+    fn conflict_message_collects_multiple_conflicts() {
+        let left = Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        let right = Schema::new(vec![
+            Field::new(
+                "a",
+                DataType::Struct(vec![Arc::new(Field::new("x", DataType::Int32, true))].into()),
+                true,
+            ),
+            Field::new(
+                "b",
+                DataType::Struct(vec![Arc::new(Field::new("y", DataType::Utf8, true))].into()),
+                true,
+            ),
+        ]);
+
+        let error = merge_schemas_with_widening(&left, &right).unwrap_err();
+        assert!(error.contains("2 conflict(s)"));
+        assert!(error.contains("field `a`"));
+        assert!(error.contains("field `b`"));
     }
 
     #[test]
