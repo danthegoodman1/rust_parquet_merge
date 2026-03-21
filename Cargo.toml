@@ -20,10 +20,6 @@ chrono = { version = "0.4.41", features = ["serde"] }
 name = "streaming_merge"
 path = "examples/streaming_merge.rs"
 
-# [[example]]
-# name = "polars_streaming_merge"
-# path = "examples/polars_streaming_merge.rs"
-
 [[example]]
 name = "metadata_inspection"
 path = "examples/metadata_inspection.rs"

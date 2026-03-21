@@ -5,8 +5,8 @@ use std::time::Instant;
 use arrow::array::new_null_array;
 use arrow::compute::cast;
 use arrow_array::{
-    Array, ArrayRef, Float64Array, Int32Array, LargeListArray, ListArray, RecordBatch,
-    StringArray, StructArray,
+    Array, ArrayRef, Float64Array, Int32Array, LargeListArray, ListArray, RecordBatch, StringArray,
+    StructArray,
 };
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use futures_util::StreamExt;
@@ -161,7 +161,8 @@ fn push_conflict(conflicts: &mut Vec<String>, path: &str, left: &DataType, right
 }
 
 fn widen_fields(left: &Field, right: &Field, path: &str, conflicts: &mut Vec<String>) -> Field {
-    let widened = widen_data_type_with_conflicts(path, left.data_type(), right.data_type(), conflicts);
+    let widened =
+        widen_data_type_with_conflicts(path, left.data_type(), right.data_type(), conflicts);
     let nullable = left.is_nullable() || right.is_nullable();
     Field::new(left.name(), widened, nullable)
 }
@@ -219,8 +220,12 @@ fn widen_list_field(
     } else {
         format!("{parent_path}[]")
     };
-    let widened_child_type =
-        widen_data_type_with_conflicts(&element_path, left.data_type(), right.data_type(), conflicts);
+    let widened_child_type = widen_data_type_with_conflicts(
+        &element_path,
+        left.data_type(),
+        right.data_type(),
+        conflicts,
+    );
     let nullable = left.is_nullable() || right.is_nullable();
     Arc::new(Field::new(left.name(), widened_child_type, nullable))
 }
@@ -236,9 +241,9 @@ fn widen_data_type_with_conflicts(
     }
 
     match (left, right) {
-        (DataType::Struct(left_fields), DataType::Struct(right_fields)) => {
-            DataType::Struct(widen_struct_fields(left_fields, right_fields, path, conflicts))
-        }
+        (DataType::Struct(left_fields), DataType::Struct(right_fields)) => DataType::Struct(
+            widen_struct_fields(left_fields, right_fields, path, conflicts),
+        ),
         (DataType::List(left_field), DataType::List(right_field)) => {
             DataType::List(widen_list_field(left_field, right_field, path, conflicts))
         }
@@ -253,16 +258,6 @@ fn widen_data_type_with_conflicts(
             push_conflict(conflicts, path, left, right);
             left.clone()
         }
-    }
-}
-
-fn widen_data_type(left: &DataType, right: &DataType) -> Result<DataType, String> {
-    let mut conflicts = Vec::new();
-    let widened = widen_data_type_with_conflicts("", left, right, &mut conflicts);
-    if conflicts.is_empty() {
-        Ok(widened)
-    } else {
-        Err(format_conflicts(&conflicts))
     }
 }
 
@@ -898,9 +893,12 @@ mod tests {
 
     #[test]
     fn coerce_large_list_to_list_casts_child_values() {
-        let list = LargeListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(
-            vec![Some(vec![Some(1), Some(2)]), Some(vec![Some(3)]), None],
-        );
+        let list =
+            LargeListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(vec![
+                Some(vec![Some(1), Some(2)]),
+                Some(vec![Some(3)]),
+                None,
+            ]);
         let source = Arc::new(list) as ArrayRef;
         let target_type = DataType::List(Arc::new(Field::new("item", DataType::Float64, true)));
         let coerced = coerce_array_to_type(&source, &target_type).unwrap();
