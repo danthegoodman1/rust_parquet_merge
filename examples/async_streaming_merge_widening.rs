@@ -16,6 +16,36 @@ use parquet::file::properties::WriterProperties;
 use tokio::fs::File;
 use tokio::io::{AsyncWrite, BufWriter};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumericWideningMode {
+    Float64Pragmatic,
+    ExactSafe,
+}
+
+impl Default for NumericWideningMode {
+    fn default() -> Self {
+        Self::Float64Pragmatic
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StringFallbackMode {
+    StrictTyped,
+    PrimitiveToStringFallback,
+}
+
+impl Default for StringFallbackMode {
+    fn default() -> Self {
+        Self::StrictTyped
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WideningOptions {
+    numeric_mode: NumericWideningMode,
+    string_mode: StringFallbackMode,
+}
+
 fn to_parquet_error(message: impl Into<String>) -> parquet::errors::ParquetError {
     parquet::errors::ParquetError::General(message.into())
 }
@@ -66,71 +96,151 @@ fn is_primitive_or_string(dt: &DataType) -> bool {
     )
 }
 
-fn widen_numeric(left: &DataType, right: &DataType) -> DataType {
-    if is_float(left) || is_float(right) {
-        return DataType::Float64;
+fn signed_int_width(dt: &DataType) -> Option<u8> {
+    match dt {
+        DataType::Int8 => Some(8),
+        DataType::Int16 => Some(16),
+        DataType::Int32 => Some(32),
+        DataType::Int64 => Some(64),
+        _ => None,
     }
-
-    if is_signed_int(left) && is_signed_int(right) {
-        if matches!(left, DataType::Int64) || matches!(right, DataType::Int64) {
-            return DataType::Int64;
-        }
-        if matches!(left, DataType::Int32) || matches!(right, DataType::Int32) {
-            return DataType::Int32;
-        }
-        if matches!(left, DataType::Int16) || matches!(right, DataType::Int16) {
-            return DataType::Int16;
-        }
-        return DataType::Int8;
-    }
-
-    if is_unsigned_int(left) && is_unsigned_int(right) {
-        if matches!(left, DataType::UInt64) || matches!(right, DataType::UInt64) {
-            return DataType::UInt64;
-        }
-        if matches!(left, DataType::UInt32) || matches!(right, DataType::UInt32) {
-            return DataType::UInt32;
-        }
-        if matches!(left, DataType::UInt16) || matches!(right, DataType::UInt16) {
-            return DataType::UInt16;
-        }
-        return DataType::UInt8;
-    }
-
-    if matches!(left, DataType::UInt64) || matches!(right, DataType::UInt64) {
-        return DataType::Float64;
-    }
-
-    DataType::Int64
 }
 
-fn widen_primitive_or_string(left: &DataType, right: &DataType) -> Option<DataType> {
+fn unsigned_int_width(dt: &DataType) -> Option<u8> {
+    match dt {
+        DataType::UInt8 => Some(8),
+        DataType::UInt16 => Some(16),
+        DataType::UInt32 => Some(32),
+        DataType::UInt64 => Some(64),
+        _ => None,
+    }
+}
+
+fn signed_type_for_width(width: u8) -> Option<DataType> {
+    match width {
+        0..=8 => Some(DataType::Int8),
+        9..=16 => Some(DataType::Int16),
+        17..=32 => Some(DataType::Int32),
+        33..=64 => Some(DataType::Int64),
+        _ => None,
+    }
+}
+
+fn unsigned_type_for_width(width: u8) -> Option<DataType> {
+    match width {
+        0..=8 => Some(DataType::UInt8),
+        9..=16 => Some(DataType::UInt16),
+        17..=32 => Some(DataType::UInt32),
+        33..=64 => Some(DataType::UInt64),
+        _ => None,
+    }
+}
+
+fn exact_safe_numeric_widen(left: &DataType, right: &DataType) -> Option<DataType> {
+    if let (Some(left_width), Some(right_width)) = (signed_int_width(left), signed_int_width(right))
+    {
+        return signed_type_for_width(left_width.max(right_width));
+    }
+
+    if let (Some(left_width), Some(right_width)) =
+        (unsigned_int_width(left), unsigned_int_width(right))
+    {
+        return unsigned_type_for_width(left_width.max(right_width));
+    }
+
+    if let (Some(signed_width), Some(unsigned_width)) =
+        (signed_int_width(left), unsigned_int_width(right))
+    {
+        return signed_type_for_width(signed_width.max(unsigned_width.saturating_add(1)));
+    }
+
+    if let (Some(unsigned_width), Some(signed_width)) =
+        (unsigned_int_width(left), signed_int_width(right))
+    {
+        return signed_type_for_width(signed_width.max(unsigned_width.saturating_add(1)));
+    }
+
+    None
+}
+
+fn widen_numeric(left: &DataType, right: &DataType, options: &WideningOptions) -> Option<DataType> {
+    match options.numeric_mode {
+        NumericWideningMode::Float64Pragmatic => {
+            if is_float(left) || is_float(right) {
+                return Some(DataType::Float64);
+            }
+
+            if is_signed_int(left) && is_signed_int(right) {
+                return Some(exact_safe_numeric_widen(left, right).expect("signed widen exists"));
+            }
+
+            if is_unsigned_int(left) && is_unsigned_int(right) {
+                return Some(exact_safe_numeric_widen(left, right).expect("unsigned widen exists"));
+            }
+
+            if matches!(left, DataType::UInt64) || matches!(right, DataType::UInt64) {
+                return Some(DataType::Float64);
+            }
+
+            Some(DataType::Int64)
+        }
+        NumericWideningMode::ExactSafe => {
+            if is_float(left) || is_float(right) {
+                return None;
+            }
+            exact_safe_numeric_widen(left, right)
+        }
+    }
+}
+
+fn typed_string_widen(left: &DataType, right: &DataType) -> Option<DataType> {
+    match (left, right) {
+        (DataType::Utf8, DataType::LargeUtf8) | (DataType::LargeUtf8, DataType::Utf8) => {
+            Some(DataType::LargeUtf8)
+        }
+        (DataType::Utf8, DataType::Utf8) => Some(DataType::Utf8),
+        (DataType::LargeUtf8, DataType::LargeUtf8) => Some(DataType::LargeUtf8),
+        _ => None,
+    }
+}
+
+fn primitive_string_fallback_type(left: &DataType, right: &DataType) -> Option<DataType> {
+    if !is_primitive_or_string(left) || !is_primitive_or_string(right) {
+        return None;
+    }
+
+    if matches!(left, DataType::LargeUtf8) || matches!(right, DataType::LargeUtf8) {
+        Some(DataType::LargeUtf8)
+    } else {
+        Some(DataType::Utf8)
+    }
+}
+
+fn widen_primitive_or_string(
+    left: &DataType,
+    right: &DataType,
+    options: &WideningOptions,
+) -> Option<DataType> {
     if left == right {
         return Some(left.clone());
     }
 
     match (left, right) {
         (DataType::Null, other) | (other, DataType::Null) => Some(other.clone()),
-        (DataType::Utf8, DataType::LargeUtf8) | (DataType::LargeUtf8, DataType::Utf8) => {
-            Some(DataType::LargeUtf8)
-        }
-        (DataType::Utf8, other) | (other, DataType::Utf8) if is_primitive_or_string(other) => {
-            Some(DataType::Utf8)
-        }
-        (DataType::LargeUtf8, other) | (other, DataType::LargeUtf8)
-            if is_primitive_or_string(other) =>
-        {
-            Some(DataType::LargeUtf8)
-        }
-        (left_num, right_num) if is_numeric(left_num) && is_numeric(right_num) => {
-            Some(widen_numeric(left_num, right_num))
-        }
-        (DataType::Boolean, other) | (other, DataType::Boolean)
-            if is_primitive_or_string(other) =>
-        {
-            Some(DataType::Utf8)
-        }
-        _ => None,
+        _ => typed_string_widen(left, right)
+            .or_else(|| {
+                if is_numeric(left) && is_numeric(right) {
+                    widen_numeric(left, right, options)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| match options.string_mode {
+                StringFallbackMode::StrictTyped => None,
+                StringFallbackMode::PrimitiveToStringFallback => {
+                    primitive_string_fallback_type(left, right)
+                }
+            }),
     }
 }
 
@@ -160,17 +270,75 @@ fn push_conflict(conflicts: &mut Vec<String>, path: &str, left: &DataType, right
     ));
 }
 
-fn widen_fields(left: &Field, right: &Field, path: &str, conflicts: &mut Vec<String>) -> Field {
-    let widened =
-        widen_data_type_with_conflicts(path, left.data_type(), right.data_type(), conflicts);
+fn push_metadata_conflict(
+    conflicts: &mut Vec<String>,
+    path: &str,
+    left: &HashMap<String, String>,
+    right: &HashMap<String, String>,
+) {
+    let path_display = if path.is_empty() { "<root>" } else { path };
+    conflicts.push(format!(
+        "field `{path_display}` incompatible metadata for widening: left={left:?}, right={right:?}"
+    ));
+}
+
+fn merge_metadata(
+    left: &Field,
+    right: &Field,
+    path: &str,
+    conflicts: &mut Vec<String>,
+) -> HashMap<String, String> {
+    match (left.metadata().is_empty(), right.metadata().is_empty()) {
+        (true, true) => HashMap::new(),
+        (false, true) => left.metadata().clone(),
+        (true, false) => right.metadata().clone(),
+        (false, false) if left.metadata() == right.metadata() => left.metadata().clone(),
+        (false, false) => {
+            push_metadata_conflict(conflicts, path, left.metadata(), right.metadata());
+            left.metadata().clone()
+        }
+    }
+}
+
+fn make_merged_field(
+    left: &Field,
+    right: &Field,
+    data_type: DataType,
+    nullable: bool,
+    path: &str,
+    conflicts: &mut Vec<String>,
+) -> Field {
+    let mut field = Field::new(left.name(), data_type, nullable);
+    let metadata = merge_metadata(left, right, path, conflicts);
+    if !metadata.is_empty() {
+        field = field.with_metadata(metadata);
+    }
+    field
+}
+
+fn widen_fields(
+    left: &Field,
+    right: &Field,
+    path: &str,
+    options: &WideningOptions,
+    conflicts: &mut Vec<String>,
+) -> Field {
+    let widened = widen_data_type_with_conflicts(
+        path,
+        left.data_type(),
+        right.data_type(),
+        options,
+        conflicts,
+    );
     let nullable = left.is_nullable() || right.is_nullable();
-    Field::new(left.name(), widened, nullable)
+    make_merged_field(left, right, widened, nullable, path, conflicts)
 }
 
 fn widen_struct_fields(
     left: &Fields,
     right: &Fields,
     parent_path: &str,
+    options: &WideningOptions,
     conflicts: &mut Vec<String>,
 ) -> Fields {
     let right_by_name: HashMap<&str, &FieldRef> = right
@@ -193,6 +361,7 @@ fn widen_struct_fields(
                 left_field,
                 right_field,
                 &child_path,
+                options,
                 conflicts,
             )));
         } else {
@@ -213,6 +382,7 @@ fn widen_list_field(
     left: &FieldRef,
     right: &FieldRef,
     parent_path: &str,
+    options: &WideningOptions,
     conflicts: &mut Vec<String>,
 ) -> FieldRef {
     let element_path = if parent_path.is_empty() {
@@ -224,36 +394,45 @@ fn widen_list_field(
         &element_path,
         left.data_type(),
         right.data_type(),
+        options,
         conflicts,
     );
     let nullable = left.is_nullable() || right.is_nullable();
-    Arc::new(Field::new(left.name(), widened_child_type, nullable))
+    Arc::new(make_merged_field(
+        left,
+        right,
+        widened_child_type,
+        nullable,
+        &element_path,
+        conflicts,
+    ))
 }
 
 fn widen_data_type_with_conflicts(
     path: &str,
     left: &DataType,
     right: &DataType,
+    options: &WideningOptions,
     conflicts: &mut Vec<String>,
 ) -> DataType {
-    if let Some(widened) = widen_primitive_or_string(left, right) {
+    if let Some(widened) = widen_primitive_or_string(left, right, options) {
         return widened;
     }
 
     match (left, right) {
         (DataType::Struct(left_fields), DataType::Struct(right_fields)) => DataType::Struct(
-            widen_struct_fields(left_fields, right_fields, path, conflicts),
+            widen_struct_fields(left_fields, right_fields, path, options, conflicts),
         ),
-        (DataType::List(left_field), DataType::List(right_field)) => {
-            DataType::List(widen_list_field(left_field, right_field, path, conflicts))
-        }
-        (DataType::LargeList(left_field), DataType::LargeList(right_field)) => {
-            DataType::LargeList(widen_list_field(left_field, right_field, path, conflicts))
-        }
+        (DataType::List(left_field), DataType::List(right_field)) => DataType::List(
+            widen_list_field(left_field, right_field, path, options, conflicts),
+        ),
+        (DataType::LargeList(left_field), DataType::LargeList(right_field)) => DataType::LargeList(
+            widen_list_field(left_field, right_field, path, options, conflicts),
+        ),
         (DataType::List(left_field), DataType::LargeList(right_field))
-        | (DataType::LargeList(right_field), DataType::List(left_field)) => {
-            DataType::LargeList(widen_list_field(left_field, right_field, path, conflicts))
-        }
+        | (DataType::LargeList(right_field), DataType::List(left_field)) => DataType::LargeList(
+            widen_list_field(left_field, right_field, path, options, conflicts),
+        ),
         _ => {
             push_conflict(conflicts, path, left, right);
             left.clone()
@@ -261,7 +440,25 @@ fn widen_data_type_with_conflicts(
     }
 }
 
-fn merge_schemas_with_widening(left: &Schema, right: &Schema) -> Result<Schema, String> {
+fn widen_data_type(
+    left: &DataType,
+    right: &DataType,
+    options: &WideningOptions,
+) -> Result<DataType, String> {
+    let mut conflicts = Vec::new();
+    let widened = widen_data_type_with_conflicts("", left, right, options, &mut conflicts);
+    if conflicts.is_empty() {
+        Ok(widened)
+    } else {
+        Err(format_conflicts(&conflicts))
+    }
+}
+
+fn merge_schemas_with_widening(
+    left: &Schema,
+    right: &Schema,
+    options: &WideningOptions,
+) -> Result<Schema, String> {
     let right_by_name: HashMap<&str, &FieldRef> = right
         .fields()
         .iter()
@@ -282,6 +479,7 @@ fn merge_schemas_with_widening(left: &Schema, right: &Schema) -> Result<Schema, 
                 left_field,
                 right_field,
                 left_field.name(),
+                options,
                 &mut conflicts,
             )));
         } else {
@@ -629,9 +827,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let schema1 = builder1.schema().clone();
     let schema2 = builder2.schema().clone();
+    let options = WideningOptions::default();
     let merged_schema = Arc::new(merge_schemas_with_widening(
         schema1.as_ref(),
         schema2.as_ref(),
+        &options,
     )?);
     println!("Merged schema with widening created successfully.");
 
@@ -664,15 +864,42 @@ mod tests {
     use super::*;
     use arrow_array::Float32Array;
 
+    fn default_options() -> WideningOptions {
+        WideningOptions::default()
+    }
+
+    fn exact_safe_options() -> WideningOptions {
+        WideningOptions {
+            numeric_mode: NumericWideningMode::ExactSafe,
+            ..WideningOptions::default()
+        }
+    }
+
+    fn fallback_options() -> WideningOptions {
+        WideningOptions {
+            string_mode: StringFallbackMode::PrimitiveToStringFallback,
+            ..WideningOptions::default()
+        }
+    }
+
+    fn exact_safe_fallback_options() -> WideningOptions {
+        WideningOptions {
+            numeric_mode: NumericWideningMode::ExactSafe,
+            string_mode: StringFallbackMode::PrimitiveToStringFallback,
+        }
+    }
+
     #[test]
     fn widens_numeric_primitive_types() {
-        let widened = widen_data_type(&DataType::Int32, &DataType::Float32).unwrap();
+        let widened =
+            widen_data_type(&DataType::Int32, &DataType::Float32, &default_options()).unwrap();
         assert_eq!(widened, DataType::Float64);
     }
 
     #[test]
-    fn widens_primitive_to_string_when_one_side_is_utf8() {
-        let widened = widen_data_type(&DataType::Int32, &DataType::Utf8).unwrap();
+    fn fallback_mode_widens_primitive_to_string_when_one_side_is_utf8() {
+        let widened =
+            widen_data_type(&DataType::Int32, &DataType::Utf8, &fallback_options()).unwrap();
         assert_eq!(widened, DataType::Utf8);
     }
 
@@ -693,7 +920,7 @@ mod tests {
             .into(),
         );
 
-        let widened = widen_data_type(&left, &right).unwrap();
+        let widened = widen_data_type(&left, &right, &default_options()).unwrap();
         match widened {
             DataType::Struct(fields) => {
                 assert_eq!(fields[0].name(), "a");
@@ -712,7 +939,7 @@ mod tests {
         let left = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
         let right = DataType::List(Arc::new(Field::new("item", DataType::Float64, true)));
 
-        let widened = widen_data_type(&left, &right).unwrap();
+        let widened = widen_data_type(&left, &right, &default_options()).unwrap();
         match widened {
             DataType::List(field) => assert_eq!(field.data_type(), &DataType::Float64),
             other => panic!("expected List, got {other:?}"),
@@ -724,7 +951,7 @@ mod tests {
         let left = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
         let right = DataType::LargeList(Arc::new(Field::new("item", DataType::Float64, true)));
 
-        let widened = widen_data_type(&left, &right).unwrap();
+        let widened = widen_data_type(&left, &right, &default_options()).unwrap();
         match widened {
             DataType::LargeList(field) => assert_eq!(field.data_type(), &DataType::Float64),
             other => panic!("expected LargeList, got {other:?}"),
@@ -735,7 +962,7 @@ mod tests {
     fn rejects_primitive_and_struct_conflicts() {
         let struct_type =
             DataType::Struct(vec![Arc::new(Field::new("x", DataType::Int32, true))].into());
-        let error = widen_data_type(&DataType::Utf8, &struct_type).unwrap_err();
+        let error = widen_data_type(&DataType::Utf8, &struct_type, &default_options()).unwrap_err();
         assert!(error.contains("incompatible types"));
         assert!(error.contains("Utf8"));
         assert!(error.contains("Struct"));
@@ -750,7 +977,7 @@ mod tests {
             true,
         )]);
 
-        let error = merge_schemas_with_widening(&left, &right).unwrap_err();
+        let error = merge_schemas_with_widening(&left, &right, &default_options()).unwrap_err();
         assert!(error.contains("field `payload`"));
         assert!(error.contains("Utf8"));
         assert!(error.contains("Struct"));
@@ -776,7 +1003,7 @@ mod tests {
             true,
         )]);
 
-        let error = merge_schemas_with_widening(&left, &right).unwrap_err();
+        let error = merge_schemas_with_widening(&left, &right, &default_options()).unwrap_err();
         assert!(error.contains("field `payload.x`"));
         assert!(error.contains("Int32"));
         assert!(error.contains("Struct"));
@@ -801,7 +1028,7 @@ mod tests {
             ),
         ]);
 
-        let error = merge_schemas_with_widening(&left, &right).unwrap_err();
+        let error = merge_schemas_with_widening(&left, &right, &default_options()).unwrap_err();
         assert!(error.contains("2 conflict(s)"));
         assert!(error.contains("field `a`"));
         assert!(error.contains("field `b`"));
@@ -924,7 +1151,8 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]);
 
-        let merged = merge_schemas_with_widening(&schema_left, &schema_right).unwrap();
+        let merged =
+            merge_schemas_with_widening(&schema_left, &schema_right, &default_options()).unwrap();
         assert_eq!(
             merged.field_with_name("score").unwrap().data_type(),
             &DataType::Float64
@@ -960,5 +1188,130 @@ mod tests {
         let mapping = build_index_mapping(source_schema.as_ref(), target_schema.as_ref());
         let adjusted = adjust_with_mapping(&batch, &target_schema, &mapping).unwrap();
         assert_eq!(adjusted.column(0).data_type(), &DataType::Float64);
+    }
+
+    #[test]
+    fn exact_safe_mode_rejects_int_and_float_widening() {
+        let error = widen_data_type(&DataType::Int32, &DataType::Float32, &exact_safe_options())
+            .unwrap_err();
+        assert!(error.contains("Int32"));
+        assert!(error.contains("Float32"));
+    }
+
+    #[test]
+    fn exact_safe_mode_rejects_non_exact_signed_unsigned_mix() {
+        let error = widen_data_type(&DataType::Int64, &DataType::UInt64, &exact_safe_options())
+            .unwrap_err();
+        assert!(error.contains("Int64"));
+        assert!(error.contains("UInt64"));
+    }
+
+    #[test]
+    fn exact_safe_mode_still_allows_exact_integer_widening() {
+        let widened =
+            widen_data_type(&DataType::Int32, &DataType::UInt8, &exact_safe_options()).unwrap();
+        assert_eq!(widened, DataType::Int32);
+    }
+
+    #[test]
+    fn strict_mode_rejects_numeric_to_string_widening() {
+        let error =
+            widen_data_type(&DataType::Int32, &DataType::Utf8, &default_options()).unwrap_err();
+        assert!(error.contains("Int32"));
+        assert!(error.contains("Utf8"));
+    }
+
+    #[test]
+    fn fallback_mode_widens_boolean_to_string() {
+        let widened =
+            widen_data_type(&DataType::Boolean, &DataType::Utf8, &fallback_options()).unwrap();
+        assert_eq!(widened, DataType::Utf8);
+    }
+
+    #[test]
+    fn exact_safe_numeric_conflict_can_fall_back_to_string() {
+        let widened = widen_data_type(
+            &DataType::Int32,
+            &DataType::Float32,
+            &exact_safe_fallback_options(),
+        )
+        .unwrap();
+        assert_eq!(widened, DataType::Utf8);
+    }
+
+    #[test]
+    fn typed_string_widening_remains_large_utf8_in_both_modes() {
+        let strict =
+            widen_data_type(&DataType::Utf8, &DataType::LargeUtf8, &default_options()).unwrap();
+        let fallback =
+            widen_data_type(&DataType::Utf8, &DataType::LargeUtf8, &fallback_options()).unwrap();
+        assert_eq!(strict, DataType::LargeUtf8);
+        assert_eq!(fallback, DataType::LargeUtf8);
+    }
+
+    #[test]
+    fn structural_mismatch_still_conflicts_in_fallback_mode() {
+        let struct_type =
+            DataType::Struct(vec![Arc::new(Field::new("x", DataType::Int32, true))].into());
+        let error =
+            widen_data_type(&DataType::Utf8, &struct_type, &fallback_options()).unwrap_err();
+        assert!(error.contains("Utf8"));
+        assert!(error.contains("Struct"));
+    }
+
+    #[test]
+    fn merge_schema_preserves_one_sided_metadata() {
+        let left = Schema::new(vec![
+            Field::new("value", DataType::Int32, true)
+                .with_metadata(HashMap::from([("unit".to_string(), "ms".to_string())])),
+        ]);
+        let right = Schema::new(vec![Field::new("value", DataType::Int32, true)]);
+
+        let merged = merge_schemas_with_widening(&left, &right, &default_options()).unwrap();
+        assert_eq!(
+            merged
+                .field_with_name("value")
+                .unwrap()
+                .metadata()
+                .get("unit"),
+            Some(&"ms".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_schema_preserves_identical_metadata() {
+        let metadata = HashMap::from([("source".to_string(), "sensor".to_string())]);
+        let left = Schema::new(vec![
+            Field::new("value", DataType::Int32, true).with_metadata(metadata.clone()),
+        ]);
+        let right = Schema::new(vec![
+            Field::new("value", DataType::Int32, true).with_metadata(metadata),
+        ]);
+
+        let merged = merge_schemas_with_widening(&left, &right, &default_options()).unwrap();
+        assert_eq!(
+            merged
+                .field_with_name("value")
+                .unwrap()
+                .metadata()
+                .get("source"),
+            Some(&"sensor".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_schema_reports_conflicting_metadata() {
+        let left = Schema::new(vec![
+            Field::new("value", DataType::Int32, true)
+                .with_metadata(HashMap::from([("unit".to_string(), "ms".to_string())])),
+        ]);
+        let right = Schema::new(vec![
+            Field::new("value", DataType::Int32, true)
+                .with_metadata(HashMap::from([("unit".to_string(), "s".to_string())])),
+        ]);
+
+        let error = merge_schemas_with_widening(&left, &right, &default_options()).unwrap_err();
+        assert!(error.contains("field `value`"));
+        assert!(error.contains("metadata"));
     }
 }
