@@ -1,19 +1,13 @@
 # Parquet streaming merge example
 
-Fastest of 3 runs (with `--release`, M3 Max MBP):
+Observed across 5 direct `--release` runs on an M3 Max MBP:
 
-Parquet + Arrow crates: `246-616µs`
+- `streaming_merge`: `115-162µs`
+- `async_streaming_merge`: `161-206µs`
+- `async_streaming_merge_widening`: `205-348µs`
+- `async_streaming_merge_payload`: `420-822µs`
 
-Parquet + Arrow crates (async): `550-900us`
-
-Polars: `8.977625ms` 🫣 _I hope this isn't the most efficient way?_
-
-Aisle: `463-820us` (but jumped up to 1ms, more variance)
-
-
-Aisle and parquet async are effectively the same, any difference for this use case is up to error bounds, async scheduling, etc.
-
-Note: with recent rust updates these are much faster now, roughly twice as fast for the parquet + arrow crates on the same machine
+These are the in-program merge timings printed by the examples themselves, not total `cargo run` wall-clock time.
 
 ## Async widening merge example
 
@@ -23,9 +17,9 @@ Run it with:
 
 `cargo run --example async_streaming_merge_widening`
 
-Run the widening tests with:
+Run the library and payload tests with:
 
-`cargo test --example async_streaming_merge_widening`
+`cargo test`
 
 ### Widening behavior
 
@@ -33,3 +27,32 @@ Run the widening tests with:
 - Structured widening is shape-aware: `Struct + Struct` unions fields by name, widens shared children recursively, and makes missing fields nullable.
 - List widening is supported for `List` and `LargeList`, including mixed combinations where the merged type is promoted to `LargeList` when needed.
 - Primitive vs structured conflicts remain strict by default (for example `Utf8` vs `Struct` returns an incompatibility error).
+
+## Payload-native typed merge
+
+The preferred contract in this repo is:
+
+- stable envelope columns at the top level
+- one evolving `payload: Struct<...>` column for queryable business properties
+
+The payload-aware example lives at `examples/async_streaming_merge_payload.rs`.
+
+Run it with:
+
+`cargo run --example async_streaming_merge_payload`
+
+### Payload contract
+
+- Every input file must already contain a top-level `payload` column.
+- `payload` must be an Arrow `Struct`.
+- Non-payload top-level columns are treated as the stable envelope and must match by name and datatype across inputs, though order may differ and nullability may widen.
+- Only the `payload` subtree is widened recursively.
+- Incompatible payload shapes still fail fast; this repo does not use Parquet `VARIANT` as the query contract.
+
+### Query proof
+
+The query-engine proof in this repo is DataFusion nested field access over typed structs, for example:
+
+`SELECT sum(payload['score']) FROM merged_payload`
+
+That keeps nested payload properties first-class and typed in the query engine without depending on Parquet `VARIANT` accessors.
