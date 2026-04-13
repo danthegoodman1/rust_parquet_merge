@@ -14,6 +14,7 @@ datafusion = "49.0.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.142"
 chrono = { version = "0.4.41", features = ["serde"] }
+libc = "0.2.172"
 # polars = { version = "0.48.1", features = ["lazy", "parquet"] }
 
 [[example]]
@@ -35,3 +36,7 @@ path = "examples/async_streaming_merge_widening.rs"
 [[example]]
 name = "async_streaming_merge_payload"
 path = "examples/async_streaming_merge_payload.rs"
+
+[[example]]
+name = "payload_benchmark"
+path = "examples/payload_benchmark.rs"

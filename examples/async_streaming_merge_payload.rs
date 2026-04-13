@@ -1,19 +1,13 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use arrow_array::{ArrayRef, Float64Array, Int32Array, RecordBatch, StringArray, StructArray};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
-use futures_util::StreamExt;
-use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_writer::AsyncArrowWriter;
 use parquet::file::properties::WriterProperties;
-use rust_parquet_merge::{
-    PayloadMergeOptions, adjust_with_mapping, build_index_mapping, merge_payload_schemas,
-};
+use rust_parquet_merge::{PayloadMergeOptions, merge_payload_parquet_files};
 use tokio::fs::File;
-use tokio::io::{AsyncWrite, BufWriter};
 
 fn payload_sample_inputs() -> (SchemaRef, RecordBatch, SchemaRef, RecordBatch) {
     let left_profile_fields: Fields =
@@ -113,41 +107,15 @@ async fn create_sample_file(
     Ok(())
 }
 
-async fn open_parquet_builder(
-    filename: &str,
-) -> Result<ParquetRecordBatchStreamBuilder<File>, Box<dyn std::error::Error>> {
-    let file = File::open(filename).await?;
-    let builder = ParquetRecordBatchStreamBuilder::new(file).await?;
-    Ok(builder)
-}
-
-async fn stream_and_write_from_builder<W>(
-    builder: ParquetRecordBatchStreamBuilder<File>,
-    writer: &mut AsyncArrowWriter<W>,
-    target_schema: &SchemaRef,
-    mapping: &[Option<usize>],
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    W: AsyncWrite + Unpin + Send,
-{
-    let mut stream = builder.build()?;
-    while let Some(batch_result) = stream.next().await {
-        let batch = batch_result?;
-        let adjusted_batch = adjust_with_mapping(&batch, target_schema, mapping)?;
-        writer.write(&adjusted_batch).await?;
-    }
-    Ok(())
-}
-
 async fn read_parquet_batches(
     filename: &str,
 ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
     let file = File::open(filename).await?;
-    let builder = ParquetRecordBatchStreamBuilder::new(file).await?;
+    let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(file).await?;
     let mut stream = builder.build()?;
     let mut batches = Vec::new();
 
-    while let Some(batch_result) = stream.next().await {
+    while let Some(batch_result) = futures_util::StreamExt::next(&mut stream).await {
         batches.push(batch_result?);
     }
 
@@ -164,37 +132,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         create_sample_file("async_payload_file2.parquet", right_schema, right_batch)
     )?;
 
-    let (builder1, builder2) = tokio::try_join!(
-        open_parquet_builder("async_payload_file1.parquet"),
-        open_parquet_builder("async_payload_file2.parquet")
-    )?;
-
-    let schema1 = builder1.schema().clone();
-    let schema2 = builder2.schema().clone();
-    let merged_schema = Arc::new(merge_payload_schemas(
-        schema1.as_ref(),
-        schema2.as_ref(),
+    let report = merge_payload_parquet_files(
+        &[
+            "async_payload_file1.parquet".into(),
+            "async_payload_file2.parquet".into(),
+        ],
+        std::path::Path::new("async_merged_streaming_payload.parquet"),
         &options,
-    )?);
-    println!("Merged payload schema created successfully.");
-
-    let mapping1 = build_index_mapping(schema1.as_ref(), merged_schema.as_ref());
-    let mapping2 = build_index_mapping(schema2.as_ref(), merged_schema.as_ref());
-
-    let output_file = File::create("async_merged_streaming_payload.parquet").await?;
-    let output_file = BufWriter::with_capacity(1 << 20, output_file);
-    let mut writer = AsyncArrowWriter::try_new(output_file, merged_schema.clone(), None)?;
-
-    let merge_start = Instant::now();
-    stream_and_write_from_builder(builder1, &mut writer, &merged_schema, &mapping1).await?;
-    stream_and_write_from_builder(builder2, &mut writer, &merged_schema, &mapping2).await?;
-    writer.close().await?;
+    )
+    .await?;
     println!(
-        "Payload merge wrote async_merged_streaming_payload.parquet in {:?}",
-        merge_start.elapsed()
+        "Payload merge wrote async_merged_streaming_payload.parquet in {:?} \
+         (planning {:?}, rows {})",
+        report.total_duration, report.planning_duration, report.rows,
     );
 
     let merged_batches = read_parquet_batches("async_merged_streaming_payload.parquet").await?;
+    let merged_schema = merged_batches[0].schema();
     let ctx = SessionContext::new();
     let mem_table = MemTable::try_new(merged_schema, vec![merged_batches])?;
     ctx.register_table("merged_payload", Arc::new(mem_table))?;

@@ -1,10 +1,18 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+mod compaction;
+
 use arrow::array::new_null_array;
 use arrow::compute::cast;
 use arrow_array::{Array, ArrayRef, LargeListArray, ListArray, RecordBatch, StructArray};
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
+
+pub use compaction::{
+    CompactionOptions, CompactionReport, CompiledPayloadPlan, CompiledSourceAdapter,
+    ExecutionScratch, build_compiled_payload_plan, compact_ndjson_to_parquet,
+    discover_ndjson_schema_from_paths, merge_payload_parquet_files,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NumericWideningMode {
@@ -529,7 +537,7 @@ fn ensure_struct_field<'a>(field: &'a Field, side: &str) -> Result<&'a Fields, S
     }
 }
 
-pub fn merge_payload_schemas(
+fn merge_payload_schemas_pair(
     left: &Schema,
     right: &Schema,
     options: &PayloadMergeOptions,
@@ -613,6 +621,17 @@ pub fn merge_payload_schemas(
     } else {
         Err(format_conflicts(&conflicts))
     }
+}
+
+pub fn merge_payload_schemas(
+    left: &Schema,
+    right: &Schema,
+    options: &PayloadMergeOptions,
+) -> Result<Schema, String> {
+    Ok(build_compiled_payload_plan([left, right], options)?
+        .output_schema
+        .as_ref()
+        .clone())
 }
 
 /// Build a one-time column index mapping from a source schema to a target schema.

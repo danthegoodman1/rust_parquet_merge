@@ -2325,6 +2325,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "futures-util",
+ "libc",
  "parquet",
  "serde",
  "serde_json",

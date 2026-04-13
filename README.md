@@ -49,6 +49,19 @@ Run it with:
 - Only the `payload` subtree is widened recursively.
 - Incompatible payload shapes still fail fast; this repo does not use Parquet `VARIANT` as the query contract.
 
+### Compiled Engine
+
+The payload path now uses a compiled compaction engine instead of rebuilding name lookups inside the per-batch loop:
+
+- planning computes the output schema once and compiles per-source adapters
+- execution streams batches through cached adapters with an identical-schema fast path
+- nested `Struct` and `List` coercion uses precomputed child indices instead of repeated string lookups
+
+The same engine also powers a two-pass NDJSON compaction flow:
+
+- pass 1 discovers the exact typed payload union schema across all NDJSON inputs
+- pass 2 streams NDJSON into Arrow builders and writes Parquet without buffering the full dataset in memory
+
 ### Query proof
 
 The query-engine proof in this repo is DataFusion nested field access over typed structs, for example:
@@ -56,3 +69,16 @@ The query-engine proof in this repo is DataFusion nested field access over typed
 `SELECT sum(payload['score']) FROM merged_payload`
 
 That keeps nested payload properties first-class and typed in the query engine without depending on Parquet `VARIANT` accessors.
+
+## Benchmarking
+
+Run the compiled payload benchmark with:
+
+`cargo run --example payload_benchmark`
+
+It reports:
+
+- payload-native Parquet merge throughput
+- end-to-end NDJSON compaction throughput
+- compaction-plus-merge throughput
+- planning time, execution time, rows/sec, input MB/sec, and peak RSS
