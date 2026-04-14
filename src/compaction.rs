@@ -1,9 +1,11 @@
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fs::File as StdFile;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use super::{
@@ -15,14 +17,17 @@ use arrow::compute::cast;
 use arrow_array::builder::{
     ArrayBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder,
     Int32Builder, Int64Builder, LargeListBuilder, LargeStringBuilder, ListBuilder, NullBuilder,
-    StringBuilder, StructBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
+    StringBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
 };
 use arrow_array::{Array, ArrayRef, LargeListArray, ListArray, RecordBatch, StructArray};
+use arrow_buffer::NullBufferBuilder;
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use futures_util::StreamExt;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_writer::AsyncArrowWriter;
-use serde_json::{Deserializer, Map, Number, Value};
+use simd_json::borrowed::Value as BorrowedValue;
+use simd_json::prelude::{TypedScalarValue, ValueAsArray, ValueAsObject, ValueAsScalar};
+use simd_json::{Buffers, to_borrowed_value_with_buffers};
 use tokio::fs::File;
 use tokio::io::BufWriter;
 
@@ -32,6 +37,8 @@ pub struct CompactionOptions {
     pub payload_column: String,
     pub widening_options: WideningOptions,
     pub batch_rows: usize,
+    pub scan_parallelism: Option<usize>,
+    pub read_buffer_bytes: usize,
 }
 
 impl Default for CompactionOptions {
@@ -41,6 +48,11 @@ impl Default for CompactionOptions {
             payload_column: "payload".to_string(),
             widening_options: WideningOptions::default(),
             batch_rows: 8_192,
+            scan_parallelism: std::thread::available_parallelism()
+                .ok()
+                .map(std::num::NonZeroUsize::get)
+                .or(Some(1)),
+            read_buffer_bytes: 1 << 20,
         }
     }
 }
@@ -54,6 +66,10 @@ pub struct CompactionReport {
     pub execution_duration: Duration,
     pub total_duration: Duration,
     pub peak_rss_bytes: u64,
+    pub planning_threads_used: usize,
+    pub planning_unique_shapes: u64,
+    pub planning_shape_cache_hits: u64,
+    pub planning_shape_cache_misses: u64,
 }
 
 #[derive(Debug, Default)]
@@ -520,88 +536,212 @@ pub async fn merge_payload_parquet_files(
         execution_duration,
         total_duration: total_start.elapsed(),
         peak_rss_bytes: peak_rss_bytes(),
+        planning_threads_used: 0,
+        planning_unique_shapes: 0,
+        planning_shape_cache_hits: 0,
+        planning_shape_cache_misses: 0,
     })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NdjsonPlanningStats {
+    threads_used: usize,
+    unique_shapes: u64,
+    shape_cache_hits: u64,
+    shape_cache_misses: u64,
+}
+
+#[derive(Clone, Debug)]
+struct NdjsonPlanningResult {
+    schema: SchemaRef,
+    stats: NdjsonPlanningStats,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShapeKey(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiscoveredField {
+    name: String,
+    data_type: DiscoveredType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiscoveredType {
+    nullable: bool,
+    kind: DiscoveredKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DiscoveredKind {
+    Null,
+    Boolean,
+    Int64,
+    UInt64,
+    Float64,
+    Utf8,
+    Struct(Vec<DiscoveredField>),
+    List(Box<DiscoveredType>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CachedDiscovery {
+    envelope_types: Vec<Option<DiscoveredType>>,
+    payload_type: DiscoveredType,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SchemaAccumulator {
+    envelope_types: Vec<Option<DiscoveredType>>,
+    envelope_missing: Vec<bool>,
+    payload_type: Option<DiscoveredType>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FileDiscoveryResult {
+    accumulator: SchemaAccumulator,
+    rows: u64,
+    unique_shapes: u64,
+    shape_cache_hits: u64,
+    shape_cache_misses: u64,
+}
+
+#[derive(Default)]
+struct NdjsonScanState {
+    line_buffer: Vec<u8>,
+    parser_buffers: Buffers,
+    shape_buffer: String,
+}
+
+impl NdjsonScanState {
+    fn with_capacity(read_buffer_bytes: usize) -> Self {
+        Self {
+            line_buffer: Vec::with_capacity(read_buffer_bytes),
+            parser_buffers: Buffers::default(),
+            shape_buffer: String::with_capacity(256),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct NdjsonAppendScratch {
+    seen_buffers: Vec<Vec<bool>>,
+}
+
+impl NdjsonAppendScratch {
+    fn take_seen(&mut self, depth: usize, capacity: usize) -> Vec<bool> {
+        if self.seen_buffers.len() <= depth {
+            self.seen_buffers.resize_with(depth + 1, Vec::new);
+        }
+
+        let mut buffer = std::mem::take(&mut self.seen_buffers[depth]);
+        if buffer.len() < capacity {
+            buffer.resize(capacity, false);
+        } else {
+            buffer.truncate(capacity);
+            buffer.fill(false);
+        }
+        buffer
+    }
+
+    fn return_seen(&mut self, depth: usize, mut buffer: Vec<bool>) {
+        if self.seen_buffers.len() <= depth {
+            self.seen_buffers.resize_with(depth + 1, Vec::new);
+        }
+        buffer.clear();
+        self.seen_buffers[depth] = buffer;
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CompiledNdjsonPlan {
+    envelope_ops: Vec<CompiledNdjsonFieldOp>,
+    payload_op: CompiledNdjsonStructOp,
+    payload_builder_index: usize,
+    top_level_lookup: HashMap<String, RootDispatch>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RootDispatch {
+    Envelope(usize),
+    Payload(usize),
+}
+
+#[derive(Clone, Debug)]
+struct CompiledNdjsonFieldOp {
+    pub name: String,
+    builder_index: usize,
+    value_op: CompiledNdjsonValueOp,
+}
+
+#[derive(Clone, Debug)]
+enum CompiledNdjsonValueOp {
+    Null,
+    Boolean,
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Float32,
+    Float64,
+    Utf8,
+    LargeUtf8,
+    Struct(CompiledNdjsonStructOp),
+    List(Box<CompiledNdjsonValueOp>),
+    LargeList(Box<CompiledNdjsonValueOp>),
+}
+
+#[derive(Clone, Debug)]
+struct CompiledNdjsonStructOp {
+    fields: Vec<CompiledNdjsonFieldOp>,
+    lookup: HashMap<String, usize>,
+}
+
+#[derive(Debug)]
+struct NdjsonBatchBuilder {
+    batch_rows: usize,
+    plan: CompiledNdjsonPlan,
+    root: NdjsonStructBuilder,
+    scratch: NdjsonAppendScratch,
+}
+
+#[derive(Debug)]
+struct NdjsonStructBuilder {
+    fields: Fields,
+    children: Vec<NdjsonValueBuilder>,
+    nulls: NullBufferBuilder,
+}
+
+#[derive(Debug)]
+enum NdjsonValueBuilder {
+    Null(NullBuilder),
+    Boolean(BooleanBuilder),
+    Int8(Int8Builder),
+    Int16(Int16Builder),
+    Int32(Int32Builder),
+    Int64(Int64Builder),
+    UInt8(UInt8Builder),
+    UInt16(UInt16Builder),
+    UInt32(UInt32Builder),
+    UInt64(UInt64Builder),
+    Float32(Float32Builder),
+    Float64(Float64Builder),
+    Utf8(StringBuilder),
+    LargeUtf8(LargeStringBuilder),
+    Struct(NdjsonStructBuilder),
+    List(Box<ListBuilder<NdjsonValueBuilder>>),
+    LargeList(Box<LargeListBuilder<NdjsonValueBuilder>>),
 }
 
 pub fn discover_ndjson_schema_from_paths(
     input_paths: &[PathBuf],
     options: &CompactionOptions,
 ) -> Result<SchemaRef, Box<dyn Error>> {
-    validate_compaction_options(options).map_err(io_error)?;
-    if input_paths.is_empty() {
-        return Err(io_error("at least one NDJSON input path is required").into());
-    }
-
-    let envelope_names: BTreeSet<&str> = options
-        .envelope_fields
-        .iter()
-        .map(|field| field.as_str())
-        .collect();
-    let mut envelope_types: Vec<Option<DataType>> = vec![None; options.envelope_fields.len()];
-    let mut envelope_nullable = vec![false; options.envelope_fields.len()];
-    let mut payload_type: Option<DataType> = None;
-
-    for input_path in input_paths {
-        let reader = BufReader::new(StdFile::open(input_path)?);
-        let stream = Deserializer::from_reader(reader).into_iter::<Value>();
-
-        for value in stream {
-            let value = value?;
-            let object = value.as_object().ok_or_else(|| {
-                io_error(format!(
-                    "NDJSON record in `{}` must be an object",
-                    input_path.display()
-                ))
-            })?;
-
-            for (index, field_name) in options.envelope_fields.iter().enumerate() {
-                match object.get(field_name) {
-                    Some(Value::Null) | None => envelope_nullable[index] = true,
-                    Some(value) => {
-                        let inferred = infer_json_data_type(value, &options.widening_options)?;
-                        if let Some(existing) = &envelope_types[index] {
-                            if existing != &inferred {
-                                return Err(io_error(format!(
-                                    "envelope column `{field_name}` changed types across NDJSON records: left={existing:?}, right={inferred:?}"
-                                ))
-                                .into());
-                            }
-                        } else {
-                            envelope_types[index] = Some(inferred);
-                        }
-                    }
-                }
-            }
-
-            let inferred_payload =
-                infer_payload_type(object, &envelope_names, &options.widening_options)?;
-            payload_type = match payload_type {
-                Some(current) => Some(
-                    widen_data_type(&current, &inferred_payload, &options.widening_options)
-                        .map_err(|error| io_error(prefix_payload_conflicts(&error)))?,
-                ),
-                None => Some(inferred_payload),
-            };
-        }
-    }
-
-    let mut fields = Vec::with_capacity(options.envelope_fields.len() + 1);
-    for (index, field_name) in options.envelope_fields.iter().enumerate() {
-        let data_type = envelope_types[index].clone().unwrap_or(DataType::Null);
-        fields.push(Arc::new(Field::new(
-            field_name,
-            data_type,
-            envelope_nullable[index] || matches!(envelope_types[index], None),
-        )));
-    }
-
-    fields.push(Arc::new(Field::new(
-        &options.payload_column,
-        payload_type.unwrap_or(DataType::Struct(Vec::<FieldRef>::new().into())),
-        true,
-    )));
-
-    Ok(Arc::new(Schema::new(fields)))
+    Ok(discover_ndjson_schema_details_from_paths(input_paths, options)?.schema)
 }
 
 pub async fn compact_ndjson_to_parquet(
@@ -616,7 +756,7 @@ pub async fn compact_ndjson_to_parquet(
 
     let total_start = Instant::now();
     let planning_start = Instant::now();
-    let output_schema = discover_ndjson_schema_from_paths(input_paths, options)?;
+    let planning = discover_ndjson_schema_details_from_paths(input_paths, options)?;
     let planning_duration = planning_start.elapsed();
 
     let execution_start = Instant::now();
@@ -630,28 +770,26 @@ pub async fn compact_ndjson_to_parquet(
 
     let output_file = File::create(output_path).await?;
     let output_file = BufWriter::with_capacity(1 << 20, output_file);
-    let mut writer = AsyncArrowWriter::try_new(output_file, output_schema.clone(), None)?;
-    let mut batch_builder = NdjsonBatchBuilder::new(
-        output_schema.clone(),
-        &options.payload_column,
-        options.batch_rows,
-    );
+    let mut writer = AsyncArrowWriter::try_new(output_file, planning.schema.clone(), None)?;
+    let plan = CompiledNdjsonPlan::compile(planning.schema.as_ref(), options).map_err(io_error)?;
+    let mut batch_builder =
+        NdjsonBatchBuilder::new(planning.schema.clone(), plan, options.batch_rows)
+            .map_err(io_error)?;
     let mut rows = 0_u64;
 
     for input_path in input_paths {
-        let reader = BufReader::new(StdFile::open(input_path)?);
-        let stream = Deserializer::from_reader(reader).into_iter::<Value>();
+        let file = StdFile::open(input_path)?;
+        let mut reader = BufReader::with_capacity(options.read_buffer_bytes, file);
+        let mut scan_state = NdjsonScanState::with_capacity(options.read_buffer_bytes);
 
-        for value in stream {
-            let value = value?;
-            let object = value.as_object().ok_or_else(|| {
-                io_error(format!(
-                    "NDJSON record in `{}` must be an object",
-                    input_path.display()
-                ))
-            })?;
-
-            batch_builder.append_record(object).map_err(io_error)?;
+        while let Some(value) = read_next_ndjson_value(
+            &mut reader,
+            &mut scan_state.line_buffer,
+            &mut scan_state.parser_buffers,
+        )
+        .map_err(io_error)?
+        {
+            batch_builder.append_record(&value).map_err(io_error)?;
             rows += 1;
 
             if batch_builder.is_full() {
@@ -677,71 +815,1557 @@ pub async fn compact_ndjson_to_parquet(
         execution_duration,
         total_duration: total_start.elapsed(),
         peak_rss_bytes: peak_rss_bytes(),
+        planning_threads_used: planning.stats.threads_used,
+        planning_unique_shapes: planning.stats.unique_shapes,
+        planning_shape_cache_hits: planning.stats.shape_cache_hits,
+        planning_shape_cache_misses: planning.stats.shape_cache_misses,
     })
 }
 
-struct NdjsonBatchBuilder {
-    fields: Fields,
-    payload_column: String,
-    batch_rows: usize,
-    builder: StructBuilder,
+fn discover_ndjson_schema_details_from_paths(
+    input_paths: &[PathBuf],
+    options: &CompactionOptions,
+) -> Result<NdjsonPlanningResult, Box<dyn Error>> {
+    discover_ndjson_schema_details_with_settings(input_paths, options, true)
 }
 
-impl NdjsonBatchBuilder {
-    fn new(schema: SchemaRef, payload_column: &str, batch_rows: usize) -> Self {
-        let fields = schema.fields().clone();
-        Self {
-            fields: fields.clone(),
-            payload_column: payload_column.to_string(),
-            batch_rows,
-            builder: StructBuilder::from_fields(fields, batch_rows),
+fn discover_ndjson_schema_details_with_settings(
+    input_paths: &[PathBuf],
+    options: &CompactionOptions,
+    cache_enabled: bool,
+) -> Result<NdjsonPlanningResult, Box<dyn Error>> {
+    validate_compaction_options(options).map_err(io_error)?;
+    if input_paths.is_empty() {
+        return Err(io_error("at least one NDJSON input path is required").into());
+    }
+
+    let thread_target = options
+        .scan_parallelism
+        .unwrap_or_else(default_scan_parallelism)
+        .max(1)
+        .min(input_paths.len().max(1));
+
+    let file_results = if thread_target == 1 || input_paths.len() == 1 {
+        let mut results = Vec::with_capacity(input_paths.len());
+        for path in input_paths {
+            results.push(scan_ndjson_file(path, options, cache_enabled).map_err(io_error)?);
+        }
+        results
+    } else {
+        discover_ndjson_files_in_parallel(input_paths, options, thread_target, cache_enabled)
+            .map_err(io_error)?
+    };
+
+    let schema =
+        Arc::new(reduce_discovery_results(file_results.as_slice(), options).map_err(io_error)?);
+    let stats = NdjsonPlanningStats {
+        threads_used: thread_target,
+        unique_shapes: file_results.iter().map(|result| result.unique_shapes).sum(),
+        shape_cache_hits: file_results
+            .iter()
+            .map(|result| result.shape_cache_hits)
+            .sum(),
+        shape_cache_misses: file_results
+            .iter()
+            .map(|result| result.shape_cache_misses)
+            .sum(),
+    };
+
+    Ok(NdjsonPlanningResult { schema, stats })
+}
+
+fn discover_ndjson_files_in_parallel(
+    input_paths: &[PathBuf],
+    options: &CompactionOptions,
+    thread_target: usize,
+    cache_enabled: bool,
+) -> Result<Vec<FileDiscoveryResult>, String> {
+    let next_index = AtomicUsize::new(0);
+    let results: Mutex<Vec<(usize, Result<FileDiscoveryResult, String>)>> = Mutex::new(Vec::new());
+
+    thread::scope(|scope| {
+        for _ in 0..thread_target {
+            let next_index = &next_index;
+            let results = &results;
+            scope.spawn(move || {
+                loop {
+                    let index = next_index.fetch_add(1, Ordering::SeqCst);
+                    if index >= input_paths.len() {
+                        break;
+                    }
+
+                    let result = scan_ndjson_file(&input_paths[index], options, cache_enabled);
+                    results
+                        .lock()
+                        .expect("results mutex is available")
+                        .push((index, result));
+                }
+            });
+        }
+    });
+
+    let mut ordered = results
+        .into_inner()
+        .map_err(|_| "failed to collect NDJSON discovery results".to_string())?;
+    ordered.sort_unstable_by_key(|(index, _)| *index);
+
+    let mut file_results = Vec::with_capacity(ordered.len());
+    for (_, result) in ordered {
+        file_results.push(result?);
+    }
+    Ok(file_results)
+}
+
+fn scan_ndjson_file(
+    input_path: &Path,
+    options: &CompactionOptions,
+    cache_enabled: bool,
+) -> Result<FileDiscoveryResult, String> {
+    let file = StdFile::open(input_path)
+        .map_err(|error| format!("failed to open `{}`: {error}", input_path.display()))?;
+    let mut reader = BufReader::with_capacity(options.read_buffer_bytes, file);
+    let envelope_lookup: HashMap<&str, usize> = options
+        .envelope_fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| (field.as_str(), index))
+        .collect();
+    let mut scan_state = NdjsonScanState::with_capacity(options.read_buffer_bytes);
+    let mut shape_cache: HashMap<ShapeKey, Arc<CachedDiscovery>> = HashMap::new();
+    let mut result = FileDiscoveryResult {
+        accumulator: SchemaAccumulator {
+            envelope_types: vec![None; options.envelope_fields.len()],
+            envelope_missing: vec![false; options.envelope_fields.len()],
+            payload_type: None,
+        },
+        ..FileDiscoveryResult::default()
+    };
+
+    while let Some(value) = read_next_ndjson_value(
+        &mut reader,
+        &mut scan_state.line_buffer,
+        &mut scan_state.parser_buffers,
+    )
+    .map_err(|error| format!("failed to parse `{}`: {error}", input_path.display()))?
+    {
+        let object = value.as_object().ok_or_else(|| {
+            format!(
+                "NDJSON record in `{}` must be an object",
+                input_path.display()
+            )
+        })?;
+
+        let discovery = if cache_enabled {
+            let shape_key = compute_shape_key(&value, &mut scan_state.shape_buffer);
+            if let Some(cached) = shape_cache.get(&shape_key) {
+                result.shape_cache_hits += 1;
+                cached.clone()
+            } else {
+                result.shape_cache_misses += 1;
+                let discovered = Arc::new(discover_record(object, &envelope_lookup, options)?);
+                shape_cache.insert(shape_key, discovered.clone());
+                discovered
+            }
+        } else {
+            result.shape_cache_misses += 1;
+            Arc::new(discover_record(object, &envelope_lookup, options)?)
+        };
+
+        merge_record_into_accumulator(&mut result.accumulator, &discovery, options)?;
+        result.rows += 1;
+    }
+
+    result.unique_shapes = if cache_enabled {
+        shape_cache.len() as u64
+    } else {
+        result.shape_cache_misses
+    };
+    Ok(result)
+}
+
+fn discover_record(
+    object: &simd_json::borrowed::Object<'_>,
+    envelope_lookup: &HashMap<&str, usize>,
+    options: &CompactionOptions,
+) -> Result<CachedDiscovery, String> {
+    let mut envelope_types = vec![None; envelope_lookup.len()];
+    let mut payload_fields = Vec::new();
+
+    for (key, value) in object.iter() {
+        if let Some(index) = envelope_lookup.get(key.as_ref()) {
+            envelope_types[*index] =
+                Some(discover_borrowed_type(value, &options.widening_options)?);
+        } else {
+            payload_fields.push(DiscoveredField {
+                name: key.to_string(),
+                data_type: discover_borrowed_type(value, &options.widening_options)?,
+            });
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.builder.len() == 0
+    payload_fields.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    Ok(CachedDiscovery {
+        envelope_types,
+        payload_type: DiscoveredType {
+            nullable: false,
+            kind: DiscoveredKind::Struct(payload_fields),
+        },
+    })
+}
+
+fn discover_borrowed_type(
+    value: &BorrowedValue<'_>,
+    options: &WideningOptions,
+) -> Result<DiscoveredType, String> {
+    if value.is_null() {
+        return Ok(DiscoveredType {
+            nullable: true,
+            kind: DiscoveredKind::Null,
+        });
     }
 
-    fn is_full(&self) -> bool {
-        self.builder.len() >= self.batch_rows
+    if value.as_bool().is_some() {
+        return Ok(DiscoveredType {
+            nullable: false,
+            kind: DiscoveredKind::Boolean,
+        });
     }
 
-    fn append_record(&mut self, object: &Map<String, Value>) -> Result<(), String> {
-        let builders = self.builder.field_builders_mut();
-        for (index, field) in self.fields.iter().enumerate() {
-            if field.name() == &self.payload_column {
-                let struct_builder = builders[index]
-                    .as_any_mut()
-                    .downcast_mut::<StructBuilder>()
-                    .ok_or_else(|| {
-                        format!(
-                            "payload column `{}` must be Struct, found {:?}",
-                            field.name(),
-                            field.data_type()
-                        )
-                    })?;
-                let DataType::Struct(payload_fields) = field.data_type() else {
-                    return Err(format!(
-                        "payload column `{}` must be Struct, found {:?}",
-                        field.name(),
-                        field.data_type()
+    if value.as_i64().is_some() {
+        return Ok(DiscoveredType {
+            nullable: false,
+            kind: DiscoveredKind::Int64,
+        });
+    }
+
+    if value.as_u64().is_some() {
+        return Ok(DiscoveredType {
+            nullable: false,
+            kind: DiscoveredKind::UInt64,
+        });
+    }
+
+    if value.as_f64().is_some() {
+        return Ok(DiscoveredType {
+            nullable: false,
+            kind: DiscoveredKind::Float64,
+        });
+    }
+
+    if value.as_str().is_some() {
+        return Ok(DiscoveredType {
+            nullable: false,
+            kind: DiscoveredKind::Utf8,
+        });
+    }
+
+    if let Some(values) = value.as_array() {
+        let mut element_type: Option<DiscoveredType> = None;
+        for element in values.iter() {
+            let discovered = discover_borrowed_type(element, options)?;
+            element_type = Some(match element_type {
+                Some(current) => {
+                    merge_discovered_types("payload[]", &current, &discovered, options)?
+                }
+                None => discovered,
+            });
+        }
+
+        return Ok(DiscoveredType {
+            nullable: false,
+            kind: DiscoveredKind::List(Box::new(element_type.unwrap_or(DiscoveredType {
+                nullable: true,
+                kind: DiscoveredKind::Null,
+            }))),
+        });
+    }
+
+    if let Some(object) = value.as_object() {
+        let mut fields = Vec::with_capacity(object.len());
+        for (key, child) in object.iter() {
+            fields.push(DiscoveredField {
+                name: key.to_string(),
+                data_type: discover_borrowed_type(child, options)?,
+            });
+        }
+        fields.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        return Ok(DiscoveredType {
+            nullable: false,
+            kind: DiscoveredKind::Struct(fields),
+        });
+    }
+
+    Err(format!(
+        "unsupported NDJSON value kind during discovery: {}",
+        borrowed_json_kind(value)
+    ))
+}
+
+fn merge_record_into_accumulator(
+    accumulator: &mut SchemaAccumulator,
+    discovery: &CachedDiscovery,
+    options: &CompactionOptions,
+) -> Result<(), String> {
+    for (index, field_name) in options.envelope_fields.iter().enumerate() {
+        match &discovery.envelope_types[index] {
+            Some(discovered) => {
+                if let Some(existing) = accumulator.envelope_types[index].as_ref() {
+                    let merged = merge_discovered_types(
+                        field_name,
+                        existing,
+                        discovered,
+                        &options.widening_options,
+                    )?;
+                    let merged_nullable = merged.nullable;
+                    accumulator.envelope_types[index] = Some(with_nullable(
+                        merged,
+                        accumulator.envelope_missing[index] || merged_nullable,
                     ));
-                };
-                append_struct_from_object(struct_builder, payload_fields, Some(object))?;
-            } else {
-                append_json_value(
-                    builders[index].as_mut(),
-                    field.data_type(),
-                    object.get(field.name()),
+                } else {
+                    accumulator.envelope_types[index] = Some(with_nullable(
+                        discovered.clone(),
+                        accumulator.envelope_missing[index] || discovered.nullable,
+                    ));
+                }
+            }
+            None => {
+                accumulator.envelope_missing[index] = true;
+                if let Some(existing) = accumulator.envelope_types[index].as_mut() {
+                    existing.nullable = true;
+                }
+            }
+        }
+    }
+
+    accumulator.payload_type = Some(match accumulator.payload_type.as_ref() {
+        Some(existing) => merge_discovered_types(
+            "payload",
+            existing,
+            &discovery.payload_type,
+            &options.widening_options,
+        )?,
+        None => discovery.payload_type.clone(),
+    });
+
+    Ok(())
+}
+
+fn reduce_discovery_results(
+    results: &[FileDiscoveryResult],
+    options: &CompactionOptions,
+) -> Result<Schema, String> {
+    let mut accumulator = SchemaAccumulator {
+        envelope_types: vec![None; options.envelope_fields.len()],
+        envelope_missing: vec![false; options.envelope_fields.len()],
+        payload_type: None,
+    };
+
+    for result in results {
+        merge_accumulators(&mut accumulator, &result.accumulator, options)?;
+    }
+
+    let mut fields = Vec::with_capacity(options.envelope_fields.len() + 1);
+    for (index, field_name) in options.envelope_fields.iter().enumerate() {
+        let discovered = accumulator.envelope_types[index]
+            .clone()
+            .unwrap_or(DiscoveredType {
+                nullable: true,
+                kind: DiscoveredKind::Null,
+            });
+        fields.push(Arc::new(Field::new(
+            field_name,
+            discovered_to_arrow_data_type(&discovered),
+            accumulator.envelope_missing[index] || discovered.nullable,
+        )));
+    }
+
+    let payload = accumulator.payload_type.unwrap_or(DiscoveredType {
+        nullable: false,
+        kind: DiscoveredKind::Struct(Vec::new()),
+    });
+    fields.push(Arc::new(Field::new(
+        &options.payload_column,
+        discovered_to_arrow_data_type(&payload),
+        true,
+    )));
+
+    Ok(Schema::new(fields))
+}
+
+fn merge_accumulators(
+    target: &mut SchemaAccumulator,
+    source: &SchemaAccumulator,
+    options: &CompactionOptions,
+) -> Result<(), String> {
+    for (index, field_name) in options.envelope_fields.iter().enumerate() {
+        match &source.envelope_types[index] {
+            Some(source_type) => {
+                if let Some(existing) = target.envelope_types[index].as_ref() {
+                    let merged = merge_discovered_types(
+                        field_name,
+                        existing,
+                        source_type,
+                        &options.widening_options,
+                    )?;
+                    let merged_nullable = merged.nullable;
+                    target.envelope_types[index] = Some(with_nullable(
+                        merged,
+                        target.envelope_missing[index]
+                            || source.envelope_missing[index]
+                            || merged_nullable,
+                    ));
+                } else {
+                    target.envelope_types[index] = Some(with_nullable(
+                        source_type.clone(),
+                        target.envelope_missing[index]
+                            || source.envelope_missing[index]
+                            || source_type.nullable,
+                    ));
+                }
+            }
+            None => {
+                target.envelope_missing[index] = true;
+                if let Some(existing) = target.envelope_types[index].as_mut() {
+                    existing.nullable = true;
+                }
+            }
+        }
+        target.envelope_missing[index] |= source.envelope_missing[index];
+    }
+
+    if let Some(source_payload) = source.payload_type.as_ref() {
+        target.payload_type = Some(match target.payload_type.as_ref() {
+            Some(existing) => merge_discovered_types(
+                "payload",
+                existing,
+                source_payload,
+                &options.widening_options,
+            )?,
+            None => source_payload.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+fn merge_discovered_types(
+    path: &str,
+    left: &DiscoveredType,
+    right: &DiscoveredType,
+    options: &WideningOptions,
+) -> Result<DiscoveredType, String> {
+    let nullable = left.nullable || right.nullable;
+
+    match (&left.kind, &right.kind) {
+        (DiscoveredKind::Null, _) => Ok(with_nullable(right.clone(), true)),
+        (_, DiscoveredKind::Null) => Ok(with_nullable(left.clone(), true)),
+        (DiscoveredKind::Struct(left_fields), DiscoveredKind::Struct(right_fields)) => {
+            Ok(DiscoveredType {
+                nullable,
+                kind: DiscoveredKind::Struct(merge_discovered_fields(
+                    path,
+                    left_fields,
+                    right_fields,
+                    options,
+                )?),
+            })
+        }
+        (DiscoveredKind::List(left_element), DiscoveredKind::List(right_element)) => {
+            Ok(DiscoveredType {
+                nullable,
+                kind: DiscoveredKind::List(Box::new(merge_discovered_types(
+                    &format!("{path}[]"),
+                    left_element,
+                    right_element,
+                    options,
+                )?)),
+            })
+        }
+        _ if is_discovered_primitive(left) && is_discovered_primitive(right) => {
+            let widened = widen_data_type(
+                &discovered_to_arrow_data_type(left),
+                &discovered_to_arrow_data_type(right),
+                options,
+            )?;
+            Ok(DiscoveredType {
+                nullable,
+                kind: discovered_kind_from_arrow(&widened)?,
+            })
+        }
+        _ => Err(format!(
+            "field `{}` incompatible types for widening: left={:?}, right={:?}",
+            path,
+            discovered_to_arrow_data_type(left),
+            discovered_to_arrow_data_type(right)
+        )),
+    }
+}
+
+fn merge_discovered_fields(
+    path: &str,
+    left: &[DiscoveredField],
+    right: &[DiscoveredField],
+    options: &WideningOptions,
+) -> Result<Vec<DiscoveredField>, String> {
+    let right_by_name: HashMap<&str, &DiscoveredField> = right
+        .iter()
+        .map(|field| (field.name.as_str(), field))
+        .collect();
+    let left_names: BTreeSet<&str> = left.iter().map(|field| field.name.as_str()).collect();
+
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    for left_field in left {
+        let child_path = if path.is_empty() {
+            left_field.name.clone()
+        } else {
+            format!("{path}.{}", left_field.name)
+        };
+
+        if let Some(right_field) = right_by_name.get(left_field.name.as_str()) {
+            merged.push(DiscoveredField {
+                name: left_field.name.clone(),
+                data_type: merge_discovered_types(
+                    &child_path,
+                    &left_field.data_type,
+                    &right_field.data_type,
+                    options,
+                )?,
+            });
+        } else {
+            merged.push(DiscoveredField {
+                name: left_field.name.clone(),
+                data_type: with_nullable(left_field.data_type.clone(), true),
+            });
+        }
+    }
+
+    for right_field in right {
+        if !left_names.contains(right_field.name.as_str()) {
+            merged.push(DiscoveredField {
+                name: right_field.name.clone(),
+                data_type: with_nullable(right_field.data_type.clone(), true),
+            });
+        }
+    }
+
+    merged.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    Ok(merged)
+}
+
+fn discovered_to_arrow_data_type(discovered: &DiscoveredType) -> DataType {
+    match &discovered.kind {
+        DiscoveredKind::Null => DataType::Null,
+        DiscoveredKind::Boolean => DataType::Boolean,
+        DiscoveredKind::Int64 => DataType::Int64,
+        DiscoveredKind::UInt64 => DataType::UInt64,
+        DiscoveredKind::Float64 => DataType::Float64,
+        DiscoveredKind::Utf8 => DataType::Utf8,
+        DiscoveredKind::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .map(|field| {
+                    Arc::new(Field::new(
+                        &field.name,
+                        discovered_to_arrow_data_type(&field.data_type),
+                        field.data_type.nullable,
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        DiscoveredKind::List(element) => DataType::List(Arc::new(Field::new(
+            "item",
+            discovered_to_arrow_data_type(element),
+            element.nullable,
+        ))),
+    }
+}
+
+fn discovered_kind_from_arrow(data_type: &DataType) -> Result<DiscoveredKind, String> {
+    match data_type {
+        DataType::Null => Ok(DiscoveredKind::Null),
+        DataType::Boolean => Ok(DiscoveredKind::Boolean),
+        DataType::Int64 => Ok(DiscoveredKind::Int64),
+        DataType::UInt64 => Ok(DiscoveredKind::UInt64),
+        DataType::Float64 => Ok(DiscoveredKind::Float64),
+        DataType::Utf8 | DataType::LargeUtf8 => Ok(DiscoveredKind::Utf8),
+        other => Err(format!(
+            "unsupported widened discovery type generated from Arrow: {other:?}"
+        )),
+    }
+}
+
+fn with_nullable(mut discovered: DiscoveredType, nullable: bool) -> DiscoveredType {
+    discovered.nullable |= nullable;
+    discovered
+}
+
+fn is_discovered_primitive(discovered: &DiscoveredType) -> bool {
+    matches!(
+        discovered.kind,
+        DiscoveredKind::Null
+            | DiscoveredKind::Boolean
+            | DiscoveredKind::Int64
+            | DiscoveredKind::UInt64
+            | DiscoveredKind::Float64
+            | DiscoveredKind::Utf8
+    )
+}
+
+fn compute_shape_key(value: &BorrowedValue<'_>, buffer: &mut String) -> ShapeKey {
+    buffer.clear();
+    push_shape_key(value, buffer);
+    ShapeKey(buffer.clone())
+}
+
+fn push_shape_key(value: &BorrowedValue<'_>, output: &mut String) {
+    if value.is_null() {
+        output.push('n');
+    } else if value.as_bool().is_some() {
+        output.push('b');
+    } else if value.as_i64().is_some() {
+        output.push('i');
+    } else if value.as_u64().is_some() {
+        output.push('u');
+    } else if value.as_f64().is_some() {
+        output.push('f');
+    } else if value.as_str().is_some() {
+        output.push('s');
+    } else if let Some(array) = value.as_array() {
+        output.push('[');
+        let mut entries = Vec::with_capacity(array.len());
+        for entry in array.iter() {
+            let mut nested = String::new();
+            push_shape_key(entry, &mut nested);
+            entries.push(nested);
+        }
+        entries.sort_unstable();
+        entries.dedup();
+        for entry in entries {
+            output.push_str(&entry);
+            output.push('|');
+        }
+        output.push(']');
+    } else if let Some(object) = value.as_object() {
+        output.push('{');
+        let mut entries = Vec::with_capacity(object.len());
+        for (key, value) in object.iter() {
+            let mut nested = String::new();
+            push_shape_key(value, &mut nested);
+            entries.push((key.to_string(), nested));
+        }
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        for (key, nested) in entries {
+            output.push_str(&key);
+            output.push(':');
+            output.push_str(&nested);
+            output.push(',');
+        }
+        output.push('}');
+    } else {
+        output.push('?');
+    }
+}
+
+fn read_next_ndjson_value<'a>(
+    reader: &mut BufReader<StdFile>,
+    line_buffer: &'a mut Vec<u8>,
+    parser_buffers: &mut Buffers,
+) -> Result<Option<BorrowedValue<'a>>, String> {
+    loop {
+        line_buffer.clear();
+        let bytes_read = reader
+            .read_until(b'\n', line_buffer)
+            .map_err(|error| error.to_string())?;
+        if bytes_read == 0 {
+            return Ok(None);
+        }
+
+        trim_line_endings(line_buffer);
+        if line_buffer.is_empty() {
+            continue;
+        }
+
+        return to_borrowed_value_with_buffers(line_buffer.as_mut_slice(), parser_buffers)
+            .map(Some)
+            .map_err(|error| error.to_string());
+    }
+}
+
+fn trim_line_endings(buffer: &mut Vec<u8>) {
+    while matches!(buffer.last(), Some(b'\n' | b'\r')) {
+        buffer.pop();
+    }
+}
+
+impl CompiledNdjsonPlan {
+    fn compile(schema: &Schema, options: &CompactionOptions) -> Result<Self, String> {
+        let payload_builder_index = schema.index_of(&options.payload_column).map_err(|_| {
+            format!(
+                "output schema is missing payload column `{}`",
+                options.payload_column
+            )
+        })?;
+        let payload_field = schema.field(payload_builder_index);
+        let payload_fields = match payload_field.data_type() {
+            DataType::Struct(fields) => fields,
+            other => {
+                return Err(format!(
+                    "payload column `{}` must be Struct, found {other:?}",
+                    options.payload_column
+                ));
+            }
+        };
+
+        let mut envelope_ops = Vec::new();
+        for (index, field) in schema.fields().iter().enumerate() {
+            if index == payload_builder_index {
+                continue;
+            }
+            envelope_ops.push(CompiledNdjsonFieldOp {
+                name: field.name().to_string(),
+                builder_index: index,
+                value_op: compile_ndjson_value_op(field.data_type())?,
+            });
+        }
+
+        let payload_op = compile_ndjson_struct_op(payload_fields)?;
+        let mut top_level_lookup = HashMap::new();
+        for (index, field_op) in envelope_ops.iter().enumerate() {
+            top_level_lookup.insert(field_op.name.clone(), RootDispatch::Envelope(index));
+        }
+        for (index, field_op) in payload_op.fields.iter().enumerate() {
+            top_level_lookup.insert(field_op.name.clone(), RootDispatch::Payload(index));
+        }
+
+        Ok(Self {
+            envelope_ops,
+            payload_op,
+            payload_builder_index,
+            top_level_lookup,
+        })
+    }
+
+    fn append_record(
+        &self,
+        root_builder: &mut NdjsonStructBuilder,
+        record: &BorrowedValue<'_>,
+        scratch: &mut NdjsonAppendScratch,
+    ) -> Result<(), String> {
+        let object = record
+            .as_object()
+            .ok_or_else(|| "NDJSON record must be an object".to_string())?;
+        let mut seen = scratch.take_seen(0, self.envelope_ops.len() + self.payload_op.fields.len());
+        let (envelope_seen, payload_seen) = seen.split_at_mut(self.envelope_ops.len());
+
+        let (envelope_builders, payload_slice) = root_builder
+            .children
+            .split_at_mut(self.payload_builder_index);
+        let payload_builder = payload_slice
+            .first_mut()
+            .ok_or_else(|| "root payload builder is missing".to_string())?
+            .as_struct_mut()
+            .ok_or_else(|| "root payload builder must be Struct".to_string())?;
+
+        for (key, value) in object.iter() {
+            match self.top_level_lookup.get(key.as_ref()) {
+                Some(RootDispatch::Envelope(index)) => {
+                    if !envelope_seen[*index] {
+                        let op = &self.envelope_ops[*index];
+                        op.append_to(
+                            &mut envelope_builders[op.builder_index],
+                            Some(value),
+                            scratch,
+                            1,
+                        )?;
+                        envelope_seen[*index] = true;
+                    }
+                }
+                Some(RootDispatch::Payload(index)) => {
+                    if !payload_seen[*index] {
+                        let op = &self.payload_op.fields[*index];
+                        op.append_to(
+                            &mut payload_builder.children[op.builder_index],
+                            Some(value),
+                            scratch,
+                            1,
+                        )?;
+                        payload_seen[*index] = true;
+                    }
+                }
+                None => {}
+            }
+        }
+
+        for (index, op) in self.envelope_ops.iter().enumerate() {
+            if !envelope_seen[index] {
+                op.append_to(&mut envelope_builders[op.builder_index], None, scratch, 1)?;
+            }
+        }
+        for (index, op) in self.payload_op.fields.iter().enumerate() {
+            if !payload_seen[index] {
+                op.append_to(
+                    &mut payload_builder.children[op.builder_index],
+                    None,
+                    scratch,
+                    1,
                 )?;
             }
         }
-        self.builder.append(true);
+
+        payload_builder.append(true);
+        root_builder.append(true);
+        scratch.return_seen(0, seen);
         Ok(())
+    }
+}
+
+impl CompiledNdjsonFieldOp {
+    fn append_to(
+        &self,
+        builder: &mut NdjsonValueBuilder,
+        value: Option<&BorrowedValue<'_>>,
+        scratch: &mut NdjsonAppendScratch,
+        depth: usize,
+    ) -> Result<(), String> {
+        self.value_op.append_to(builder, value, scratch, depth)
+    }
+}
+
+impl CompiledNdjsonValueOp {
+    fn append_to(
+        &self,
+        builder: &mut NdjsonValueBuilder,
+        value: Option<&BorrowedValue<'_>>,
+        scratch: &mut NdjsonAppendScratch,
+        depth: usize,
+    ) -> Result<(), String> {
+        match self {
+            Self::Null => {
+                if value.is_some_and(|value| !value.is_null()) {
+                    return Err(format!(
+                        "expected null value for field, found {}",
+                        borrowed_json_kind(value.expect("value exists"))
+                    ));
+                }
+                builder.append_null_value()
+            }
+            Self::Boolean => match value {
+                Some(value) if !value.is_null() => {
+                    let boolean = value.as_bool().ok_or_else(|| {
+                        format!(
+                            "expected boolean for field, found {}",
+                            borrowed_json_kind(value)
+                        )
+                    })?;
+                    builder.append_boolean(boolean)
+                }
+                _ => builder.append_null_value(),
+            },
+            Self::Int8 => append_borrowed_signed(builder, value, "Int8"),
+            Self::Int16 => append_borrowed_signed(builder, value, "Int16"),
+            Self::Int32 => append_borrowed_signed(builder, value, "Int32"),
+            Self::Int64 => append_borrowed_signed(builder, value, "Int64"),
+            Self::UInt8 => append_borrowed_unsigned(builder, value, "UInt8"),
+            Self::UInt16 => append_borrowed_unsigned(builder, value, "UInt16"),
+            Self::UInt32 => append_borrowed_unsigned(builder, value, "UInt32"),
+            Self::UInt64 => append_borrowed_unsigned(builder, value, "UInt64"),
+            Self::Float32 => match value {
+                Some(value) if !value.is_null() => {
+                    let number = borrowed_numeric_to_f64(value).ok_or_else(|| {
+                        format!(
+                            "expected numeric value for Float32, found {}",
+                            borrowed_json_kind(value)
+                        )
+                    })?;
+                    builder.append_float32(number as f32)
+                }
+                _ => builder.append_null_value(),
+            },
+            Self::Float64 => match value {
+                Some(value) if !value.is_null() => {
+                    let number = borrowed_numeric_to_f64(value).ok_or_else(|| {
+                        format!(
+                            "expected numeric value for Float64, found {}",
+                            borrowed_json_kind(value)
+                        )
+                    })?;
+                    builder.append_float64(number)
+                }
+                _ => builder.append_null_value(),
+            },
+            Self::Utf8 | Self::LargeUtf8 => match value {
+                Some(value) if !value.is_null() => {
+                    let rendered = render_borrowed_string(value)?;
+                    if matches!(self, Self::LargeUtf8) {
+                        builder.append_large_string(&rendered)
+                    } else {
+                        builder.append_string(&rendered)
+                    }
+                }
+                _ => builder.append_null_value(),
+            },
+            Self::Struct(struct_op) => struct_op.append_to(builder, value, scratch, depth),
+            Self::List(element_op) => {
+                append_borrowed_list(builder, value, element_op, scratch, depth)
+            }
+            Self::LargeList(element_op) => {
+                append_borrowed_large_list(builder, value, element_op, scratch, depth)
+            }
+        }
+    }
+}
+
+impl CompiledNdjsonStructOp {
+    fn append_to(
+        &self,
+        builder: &mut NdjsonValueBuilder,
+        value: Option<&BorrowedValue<'_>>,
+        scratch: &mut NdjsonAppendScratch,
+        depth: usize,
+    ) -> Result<(), String> {
+        let builder = builder
+            .as_struct_mut()
+            .ok_or_else(|| "compiled NDJSON struct op expected struct builder".to_string())?;
+
+        match value {
+            Some(value) if !value.is_null() => {
+                let object = value.as_object().ok_or_else(|| {
+                    format!(
+                        "expected object for Struct field, found {}",
+                        borrowed_json_kind(value)
+                    )
+                })?;
+                let mut seen = scratch.take_seen(depth, self.fields.len());
+                for (key, child_value) in object.iter() {
+                    if let Some(index) = self.lookup.get(key.as_ref()) {
+                        if !seen[*index] {
+                            let op = &self.fields[*index];
+                            op.append_to(
+                                &mut builder.children[op.builder_index],
+                                Some(child_value),
+                                scratch,
+                                depth + 1,
+                            )?;
+                            seen[*index] = true;
+                        }
+                    }
+                }
+                for (index, op) in self.fields.iter().enumerate() {
+                    if !seen[index] {
+                        op.append_to(
+                            &mut builder.children[op.builder_index],
+                            None,
+                            scratch,
+                            depth + 1,
+                        )?;
+                    }
+                }
+                builder.append(true);
+                scratch.return_seen(depth, seen);
+                Ok(())
+            }
+            _ => {
+                for op in &self.fields {
+                    op.append_to(
+                        &mut builder.children[op.builder_index],
+                        None,
+                        scratch,
+                        depth + 1,
+                    )?;
+                }
+                builder.append(false);
+                Ok(())
+            }
+        }
+    }
+}
+
+impl NdjsonBatchBuilder {
+    fn new(schema: SchemaRef, plan: CompiledNdjsonPlan, batch_rows: usize) -> Result<Self, String> {
+        Ok(Self {
+            batch_rows,
+            plan,
+            root: NdjsonStructBuilder::from_fields(schema.fields().clone(), batch_rows),
+            scratch: NdjsonAppendScratch::default(),
+        })
+    }
+
+    fn append_record(&mut self, record: &BorrowedValue<'_>) -> Result<(), String> {
+        self.plan
+            .append_record(&mut self.root, record, &mut self.scratch)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.root.len() == 0
+    }
+
+    fn is_full(&self) -> bool {
+        self.root.len() >= self.batch_rows
     }
 
     fn finish_batch(&mut self) -> RecordBatch {
-        RecordBatch::from(self.builder.finish())
+        RecordBatch::from(self.root.finish())
+    }
+}
+
+impl NdjsonStructBuilder {
+    fn from_fields(fields: Fields, capacity: usize) -> Self {
+        let children = fields
+            .iter()
+            .map(|field| NdjsonValueBuilder::from_data_type(field.data_type(), capacity))
+            .collect();
+        Self {
+            fields,
+            children,
+            nulls: NullBufferBuilder::new(capacity),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.nulls.len()
+    }
+
+    fn append(&mut self, is_valid: bool) {
+        self.nulls.append(is_valid);
+    }
+
+    fn finish(&mut self) -> StructArray {
+        let arrays = self
+            .children
+            .iter_mut()
+            .map(|child| child.finish())
+            .collect();
+        StructArray::new(self.fields.clone(), arrays, self.nulls.finish())
+    }
+
+    fn finish_cloned(&self) -> StructArray {
+        let arrays = self
+            .children
+            .iter()
+            .map(NdjsonValueBuilder::finish_cloned)
+            .collect();
+        StructArray::new(self.fields.clone(), arrays, self.nulls.finish_cloned())
+    }
+}
+
+impl NdjsonValueBuilder {
+    fn from_data_type(data_type: &DataType, capacity: usize) -> Self {
+        match data_type {
+            DataType::Null => Self::Null(NullBuilder::new()),
+            DataType::Boolean => Self::Boolean(BooleanBuilder::with_capacity(capacity)),
+            DataType::Int8 => Self::Int8(Int8Builder::with_capacity(capacity)),
+            DataType::Int16 => Self::Int16(Int16Builder::with_capacity(capacity)),
+            DataType::Int32 => Self::Int32(Int32Builder::with_capacity(capacity)),
+            DataType::Int64 => Self::Int64(Int64Builder::with_capacity(capacity)),
+            DataType::UInt8 => Self::UInt8(UInt8Builder::with_capacity(capacity)),
+            DataType::UInt16 => Self::UInt16(UInt16Builder::with_capacity(capacity)),
+            DataType::UInt32 => Self::UInt32(UInt32Builder::with_capacity(capacity)),
+            DataType::UInt64 => Self::UInt64(UInt64Builder::with_capacity(capacity)),
+            DataType::Float32 => Self::Float32(Float32Builder::with_capacity(capacity)),
+            DataType::Float64 => Self::Float64(Float64Builder::with_capacity(capacity)),
+            DataType::Utf8 => Self::Utf8(StringBuilder::with_capacity(capacity, capacity * 16)),
+            DataType::LargeUtf8 => {
+                Self::LargeUtf8(LargeStringBuilder::with_capacity(capacity, capacity * 16))
+            }
+            DataType::Struct(fields) => {
+                Self::Struct(NdjsonStructBuilder::from_fields(fields.clone(), capacity))
+            }
+            DataType::List(field) => Self::List(Box::new(
+                ListBuilder::with_capacity(
+                    NdjsonValueBuilder::from_data_type(field.data_type(), capacity),
+                    capacity,
+                )
+                .with_field(field.clone()),
+            )),
+            DataType::LargeList(field) => Self::LargeList(Box::new(
+                LargeListBuilder::with_capacity(
+                    NdjsonValueBuilder::from_data_type(field.data_type(), capacity),
+                    capacity,
+                )
+                .with_field(field.clone()),
+            )),
+            other => panic!("unsupported NDJSON builder type: {other:?}"),
+        }
+    }
+
+    fn append_null_value(&mut self) -> Result<(), String> {
+        match self {
+            Self::Null(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::Boolean(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::Int8(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::Int16(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::Int32(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::Int64(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::UInt8(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::UInt16(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::UInt32(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::UInt64(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::Float32(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::Float64(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::Utf8(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::LargeUtf8(builder) => {
+                builder.append_null();
+                Ok(())
+            }
+            Self::Struct(builder) => {
+                for child in &mut builder.children {
+                    child.append_null_value()?;
+                }
+                builder.append(false);
+                Ok(())
+            }
+            Self::List(builder) => {
+                builder.append(false);
+                Ok(())
+            }
+            Self::LargeList(builder) => {
+                builder.append(false);
+                Ok(())
+            }
+        }
+    }
+
+    fn append_boolean(&mut self, value: bool) -> Result<(), String> {
+        match self {
+            Self::Boolean(builder) => {
+                builder.append_value(value);
+                Ok(())
+            }
+            _ => Err("expected boolean builder".to_string()),
+        }
+    }
+
+    fn append_i64(&mut self, type_name: &str, value: i64) -> Result<(), String> {
+        match (self, type_name) {
+            (Self::Int8(builder), "Int8") => {
+                builder.append_value(
+                    i8::try_from(value)
+                        .map_err(|_| format!("value `{value}` is out of range for Int8"))?,
+                );
+                Ok(())
+            }
+            (Self::Int16(builder), "Int16") => {
+                builder.append_value(
+                    i16::try_from(value)
+                        .map_err(|_| format!("value `{value}` is out of range for Int16"))?,
+                );
+                Ok(())
+            }
+            (Self::Int32(builder), "Int32") => {
+                builder.append_value(
+                    i32::try_from(value)
+                        .map_err(|_| format!("value `{value}` is out of range for Int32"))?,
+                );
+                Ok(())
+            }
+            (Self::Int64(builder), "Int64") => {
+                builder.append_value(value);
+                Ok(())
+            }
+            _ => Err(format!("expected signed builder for {type_name}")),
+        }
+    }
+
+    fn append_u64(&mut self, type_name: &str, value: u64) -> Result<(), String> {
+        match (self, type_name) {
+            (Self::UInt8(builder), "UInt8") => {
+                builder.append_value(
+                    u8::try_from(value)
+                        .map_err(|_| format!("value `{value}` is out of range for UInt8"))?,
+                );
+                Ok(())
+            }
+            (Self::UInt16(builder), "UInt16") => {
+                builder.append_value(
+                    u16::try_from(value)
+                        .map_err(|_| format!("value `{value}` is out of range for UInt16"))?,
+                );
+                Ok(())
+            }
+            (Self::UInt32(builder), "UInt32") => {
+                builder.append_value(
+                    u32::try_from(value)
+                        .map_err(|_| format!("value `{value}` is out of range for UInt32"))?,
+                );
+                Ok(())
+            }
+            (Self::UInt64(builder), "UInt64") => {
+                builder.append_value(value);
+                Ok(())
+            }
+            _ => Err(format!("expected unsigned builder for {type_name}")),
+        }
+    }
+
+    fn append_float32(&mut self, value: f32) -> Result<(), String> {
+        match self {
+            Self::Float32(builder) => {
+                builder.append_value(value);
+                Ok(())
+            }
+            _ => Err("expected Float32 builder".to_string()),
+        }
+    }
+
+    fn append_float64(&mut self, value: f64) -> Result<(), String> {
+        match self {
+            Self::Float64(builder) => {
+                builder.append_value(value);
+                Ok(())
+            }
+            _ => Err("expected Float64 builder".to_string()),
+        }
+    }
+
+    fn append_string(&mut self, value: &str) -> Result<(), String> {
+        match self {
+            Self::Utf8(builder) => {
+                builder.append_value(value);
+                Ok(())
+            }
+            _ => Err("expected Utf8 builder".to_string()),
+        }
+    }
+
+    fn append_large_string(&mut self, value: &str) -> Result<(), String> {
+        match self {
+            Self::LargeUtf8(builder) => {
+                builder.append_value(value);
+                Ok(())
+            }
+            _ => Err("expected LargeUtf8 builder".to_string()),
+        }
+    }
+
+    fn as_struct_mut(&mut self) -> Option<&mut NdjsonStructBuilder> {
+        match self {
+            Self::Struct(builder) => Some(builder),
+            _ => None,
+        }
+    }
+
+    fn as_list_mut(&mut self) -> Option<&mut ListBuilder<NdjsonValueBuilder>> {
+        match self {
+            Self::List(builder) => Some(builder.as_mut()),
+            _ => None,
+        }
+    }
+
+    fn as_large_list_mut(&mut self) -> Option<&mut LargeListBuilder<NdjsonValueBuilder>> {
+        match self {
+            Self::LargeList(builder) => Some(builder.as_mut()),
+            _ => None,
+        }
+    }
+}
+
+impl ArrayBuilder for NdjsonValueBuilder {
+    fn len(&self) -> usize {
+        match self {
+            Self::Null(builder) => builder.len(),
+            Self::Boolean(builder) => builder.len(),
+            Self::Int8(builder) => builder.len(),
+            Self::Int16(builder) => builder.len(),
+            Self::Int32(builder) => builder.len(),
+            Self::Int64(builder) => builder.len(),
+            Self::UInt8(builder) => builder.len(),
+            Self::UInt16(builder) => builder.len(),
+            Self::UInt32(builder) => builder.len(),
+            Self::UInt64(builder) => builder.len(),
+            Self::Float32(builder) => builder.len(),
+            Self::Float64(builder) => builder.len(),
+            Self::Utf8(builder) => builder.len(),
+            Self::LargeUtf8(builder) => builder.len(),
+            Self::Struct(builder) => builder.len(),
+            Self::List(builder) => builder.len(),
+            Self::LargeList(builder) => builder.len(),
+        }
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        match self {
+            Self::Null(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::Boolean(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::Int8(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::Int16(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::Int32(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::Int64(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::UInt8(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::UInt16(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::UInt32(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::UInt64(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::Float32(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::Float64(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::Utf8(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::LargeUtf8(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::Struct(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::List(builder) => Arc::new(builder.finish()) as ArrayRef,
+            Self::LargeList(builder) => Arc::new(builder.finish()) as ArrayRef,
+        }
+    }
+
+    fn finish_cloned(&self) -> ArrayRef {
+        match self {
+            Self::Null(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::Boolean(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::Int8(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::Int16(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::Int32(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::Int64(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::UInt8(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::UInt16(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::UInt32(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::UInt64(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::Float32(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::Float64(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::Utf8(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::LargeUtf8(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::Struct(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::List(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+            Self::LargeList(builder) => Arc::new(builder.finish_cloned()) as ArrayRef,
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn into_box_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+fn compile_ndjson_struct_op(fields: &Fields) -> Result<CompiledNdjsonStructOp, String> {
+    let mut field_ops = Vec::with_capacity(fields.len());
+    let mut lookup = HashMap::with_capacity(fields.len());
+    for (index, field) in fields.iter().enumerate() {
+        let field_op = CompiledNdjsonFieldOp {
+            name: field.name().to_string(),
+            builder_index: index,
+            value_op: compile_ndjson_value_op(field.data_type())?,
+        };
+        lookup.insert(field_op.name.clone(), index);
+        field_ops.push(field_op);
+    }
+    Ok(CompiledNdjsonStructOp {
+        fields: field_ops,
+        lookup,
+    })
+}
+
+fn compile_ndjson_value_op(data_type: &DataType) -> Result<CompiledNdjsonValueOp, String> {
+    match data_type {
+        DataType::Null => Ok(CompiledNdjsonValueOp::Null),
+        DataType::Boolean => Ok(CompiledNdjsonValueOp::Boolean),
+        DataType::Int8 => Ok(CompiledNdjsonValueOp::Int8),
+        DataType::Int16 => Ok(CompiledNdjsonValueOp::Int16),
+        DataType::Int32 => Ok(CompiledNdjsonValueOp::Int32),
+        DataType::Int64 => Ok(CompiledNdjsonValueOp::Int64),
+        DataType::UInt8 => Ok(CompiledNdjsonValueOp::UInt8),
+        DataType::UInt16 => Ok(CompiledNdjsonValueOp::UInt16),
+        DataType::UInt32 => Ok(CompiledNdjsonValueOp::UInt32),
+        DataType::UInt64 => Ok(CompiledNdjsonValueOp::UInt64),
+        DataType::Float32 => Ok(CompiledNdjsonValueOp::Float32),
+        DataType::Float64 => Ok(CompiledNdjsonValueOp::Float64),
+        DataType::Utf8 => Ok(CompiledNdjsonValueOp::Utf8),
+        DataType::LargeUtf8 => Ok(CompiledNdjsonValueOp::LargeUtf8),
+        DataType::Struct(fields) => Ok(CompiledNdjsonValueOp::Struct(compile_ndjson_struct_op(
+            fields,
+        )?)),
+        DataType::List(field) => Ok(CompiledNdjsonValueOp::List(Box::new(
+            compile_ndjson_value_op(field.data_type())?,
+        ))),
+        DataType::LargeList(field) => Ok(CompiledNdjsonValueOp::LargeList(Box::new(
+            compile_ndjson_value_op(field.data_type())?,
+        ))),
+        other => Err(format!(
+            "NDJSON compaction does not yet support target type {other:?}"
+        )),
+    }
+}
+
+fn append_borrowed_signed(
+    builder: &mut NdjsonValueBuilder,
+    value: Option<&BorrowedValue<'_>>,
+    type_name: &str,
+) -> Result<(), String> {
+    match value {
+        Some(value) if !value.is_null() => {
+            let number = value.as_i64().ok_or_else(|| {
+                format!(
+                    "expected integer value for {type_name}, found {}",
+                    borrowed_json_kind(value)
+                )
+            })?;
+            builder.append_i64(type_name, number)
+        }
+        _ => builder.append_null_value(),
+    }
+}
+
+fn append_borrowed_unsigned(
+    builder: &mut NdjsonValueBuilder,
+    value: Option<&BorrowedValue<'_>>,
+    type_name: &str,
+) -> Result<(), String> {
+    match value {
+        Some(value) if !value.is_null() => {
+            let number = value.as_u64().ok_or_else(|| {
+                format!(
+                    "expected unsigned integer value for {type_name}, found {}",
+                    borrowed_json_kind(value)
+                )
+            })?;
+            builder.append_u64(type_name, number)
+        }
+        _ => builder.append_null_value(),
+    }
+}
+
+fn append_borrowed_list(
+    builder: &mut NdjsonValueBuilder,
+    value: Option<&BorrowedValue<'_>>,
+    element_op: &CompiledNdjsonValueOp,
+    scratch: &mut NdjsonAppendScratch,
+    depth: usize,
+) -> Result<(), String> {
+    match value {
+        Some(value) if !value.is_null() => {
+            let values = value.as_array().ok_or_else(|| {
+                format!(
+                    "expected array for List field, found {}",
+                    borrowed_json_kind(value)
+                )
+            })?;
+            let builder = builder
+                .as_list_mut()
+                .ok_or_else(|| "compiled NDJSON list op expected List builder".to_string())?;
+            for value in values.iter() {
+                element_op.append_to(builder.values(), Some(value), scratch, depth + 1)?;
+            }
+            builder.append(true);
+            Ok(())
+        }
+        _ => builder.append_null_value(),
+    }
+}
+
+fn append_borrowed_large_list(
+    builder: &mut NdjsonValueBuilder,
+    value: Option<&BorrowedValue<'_>>,
+    element_op: &CompiledNdjsonValueOp,
+    scratch: &mut NdjsonAppendScratch,
+    depth: usize,
+) -> Result<(), String> {
+    match value {
+        Some(value) if !value.is_null() => {
+            let values = value.as_array().ok_or_else(|| {
+                format!(
+                    "expected array for LargeList field, found {}",
+                    borrowed_json_kind(value)
+                )
+            })?;
+            let builder = builder.as_large_list_mut().ok_or_else(|| {
+                "compiled NDJSON large-list op expected LargeList builder".to_string()
+            })?;
+            for value in values.iter() {
+                element_op.append_to(builder.values(), Some(value), scratch, depth + 1)?;
+            }
+            builder.append(true);
+            Ok(())
+        }
+        _ => builder.append_null_value(),
+    }
+}
+
+fn render_borrowed_string(value: &BorrowedValue<'_>) -> Result<String, String> {
+    if let Some(string) = value.as_str() {
+        return Ok(string.to_owned());
+    }
+    if let Some(boolean) = value.as_bool() {
+        return Ok(boolean.to_string());
+    }
+    if let Some(number) = value.as_i64() {
+        return Ok(number.to_string());
+    }
+    if let Some(number) = value.as_u64() {
+        return Ok(number.to_string());
+    }
+    if let Some(number) = value.as_f64() {
+        return Ok(number.to_string());
+    }
+    Err(format!(
+        "expected primitive or string value for string field, found {}",
+        borrowed_json_kind(value)
+    ))
+}
+
+fn borrowed_numeric_to_f64(value: &BorrowedValue<'_>) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|number| number as f64))
+        .or_else(|| value.as_u64().map(|number| number as f64))
+}
+
+fn borrowed_json_kind(value: &BorrowedValue<'_>) -> &'static str {
+    if value.is_null() {
+        "null"
+    } else if value.as_bool().is_some() {
+        "bool"
+    } else if value.as_i64().is_some() || value.as_u64().is_some() || value.as_f64().is_some() {
+        "number"
+    } else if value.as_str().is_some() {
+        "string"
+    } else if value.as_array().is_some() {
+        "array"
+    } else if value.as_object().is_some() {
+        "object"
+    } else {
+        "unknown"
     }
 }
 
@@ -860,491 +2484,6 @@ fn compile_type_adapter(
     }
 }
 
-fn infer_payload_type(
-    object: &Map<String, Value>,
-    envelope_names: &BTreeSet<&str>,
-    options: &WideningOptions,
-) -> Result<DataType, String> {
-    let mut payload_names: Vec<&str> = object
-        .keys()
-        .map(String::as_str)
-        .filter(|name| !envelope_names.contains(name))
-        .collect();
-    payload_names.sort_unstable();
-
-    let mut fields = Vec::with_capacity(payload_names.len());
-    for name in payload_names {
-        let value = object
-            .get(name)
-            .ok_or_else(|| format!("payload field `{name}` missing during schema inference"))?;
-        fields.push(Arc::new(Field::new(
-            name,
-            infer_json_data_type(value, options)?,
-            matches!(value, Value::Null),
-        )));
-    }
-
-    Ok(DataType::Struct(fields.into()))
-}
-
-fn infer_json_data_type(value: &Value, options: &WideningOptions) -> Result<DataType, String> {
-    match value {
-        Value::Null => Ok(DataType::Null),
-        Value::Bool(_) => Ok(DataType::Boolean),
-        Value::Number(number) => infer_number_type(number),
-        Value::String(_) => Ok(DataType::Utf8),
-        Value::Array(values) => {
-            let mut element_type: Option<DataType> = None;
-            for value in values {
-                let inferred = infer_json_data_type(value, options)?;
-                element_type = match element_type {
-                    Some(current) => Some(widen_data_type(&current, &inferred, options)?),
-                    None => Some(inferred),
-                };
-            }
-
-            Ok(DataType::List(Arc::new(Field::new(
-                "item",
-                element_type.unwrap_or(DataType::Null),
-                true,
-            ))))
-        }
-        Value::Object(object) => {
-            let mut names: Vec<&str> = object.keys().map(String::as_str).collect();
-            names.sort_unstable();
-
-            let mut fields = Vec::with_capacity(names.len());
-            for name in names {
-                let value = object.get(name).ok_or_else(|| {
-                    format!("object field `{name}` missing during schema inference")
-                })?;
-                fields.push(Arc::new(Field::new(
-                    name,
-                    infer_json_data_type(value, options)?,
-                    matches!(value, Value::Null),
-                )));
-            }
-            Ok(DataType::Struct(fields.into()))
-        }
-    }
-}
-
-fn infer_number_type(number: &Number) -> Result<DataType, String> {
-    if number.is_i64() {
-        Ok(DataType::Int64)
-    } else if number.is_u64() {
-        Ok(DataType::UInt64)
-    } else if number.is_f64() {
-        Ok(DataType::Float64)
-    } else {
-        Err(format!("unsupported JSON number `{number}`"))
-    }
-}
-
-fn append_struct_from_object(
-    builder: &mut StructBuilder,
-    target_fields: &Fields,
-    object: Option<&Map<String, Value>>,
-) -> Result<(), String> {
-    let child_builders = builder.field_builders_mut();
-    for (index, field) in target_fields.iter().enumerate() {
-        let value = object.and_then(|object| object.get(field.name()));
-        append_json_value(child_builders[index].as_mut(), field.data_type(), value)?;
-    }
-    builder.append(object.is_some());
-    Ok(())
-}
-
-fn append_json_value(
-    builder: &mut dyn ArrayBuilder,
-    target_type: &DataType,
-    value: Option<&Value>,
-) -> Result<(), String> {
-    match target_type {
-        DataType::Null => {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<NullBuilder>()
-                .ok_or_else(|| "failed to downcast NullBuilder".to_string())?;
-            match value {
-                Some(Value::Null) | None => builder.append_null(),
-                Some(other) => {
-                    return Err(format!(
-                        "expected null value for Null field, found {}",
-                        json_kind(other)
-                    ));
-                }
-            }
-            Ok(())
-        }
-        DataType::Boolean => {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<BooleanBuilder>()
-                .ok_or_else(|| "failed to downcast BooleanBuilder".to_string())?;
-            match value {
-                Some(Value::Bool(value)) => builder.append_value(*value),
-                Some(Value::Null) | None => builder.append_null(),
-                Some(other) => {
-                    return Err(format!(
-                        "expected boolean for Boolean field, found {}",
-                        json_kind(other)
-                    ));
-                }
-            }
-            Ok(())
-        }
-        DataType::Int8 => append_signed_json(builder, value, "Int8", |builder, value| {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<Int8Builder>()
-                .ok_or_else(|| "failed to downcast Int8Builder".to_string())?;
-            builder.append_value(value);
-            Ok(())
-        }),
-        DataType::Int16 => append_signed_json(builder, value, "Int16", |builder, value| {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<Int16Builder>()
-                .ok_or_else(|| "failed to downcast Int16Builder".to_string())?;
-            builder.append_value(value);
-            Ok(())
-        }),
-        DataType::Int32 => append_signed_json(builder, value, "Int32", |builder, value| {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<Int32Builder>()
-                .ok_or_else(|| "failed to downcast Int32Builder".to_string())?;
-            builder.append_value(value);
-            Ok(())
-        }),
-        DataType::Int64 => append_signed_json(builder, value, "Int64", |builder, value| {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<Int64Builder>()
-                .ok_or_else(|| "failed to downcast Int64Builder".to_string())?;
-            builder.append_value(value);
-            Ok(())
-        }),
-        DataType::UInt8 => append_unsigned_json(builder, value, "UInt8", |builder, value| {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<UInt8Builder>()
-                .ok_or_else(|| "failed to downcast UInt8Builder".to_string())?;
-            builder.append_value(value);
-            Ok(())
-        }),
-        DataType::UInt16 => append_unsigned_json(builder, value, "UInt16", |builder, value| {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<UInt16Builder>()
-                .ok_or_else(|| "failed to downcast UInt16Builder".to_string())?;
-            builder.append_value(value);
-            Ok(())
-        }),
-        DataType::UInt32 => append_unsigned_json(builder, value, "UInt32", |builder, value| {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<UInt32Builder>()
-                .ok_or_else(|| "failed to downcast UInt32Builder".to_string())?;
-            builder.append_value(value);
-            Ok(())
-        }),
-        DataType::UInt64 => append_unsigned_json(builder, value, "UInt64", |builder, value| {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<UInt64Builder>()
-                .ok_or_else(|| "failed to downcast UInt64Builder".to_string())?;
-            builder.append_value(value);
-            Ok(())
-        }),
-        DataType::Float16 => {
-            Err("NDJSON compaction does not yet support Float16 output".to_string())
-        }
-        DataType::Float32 => {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<Float32Builder>()
-                .ok_or_else(|| "failed to downcast Float32Builder".to_string())?;
-            match value {
-                Some(Value::Null) | None => builder.append_null(),
-                Some(Value::Number(number)) => {
-                    let number = number.as_f64().ok_or_else(|| {
-                        format!("expected numeric value for Float32, found `{number}`")
-                    })?;
-                    builder.append_value(number as f32);
-                }
-                Some(other) => {
-                    return Err(format!(
-                        "expected numeric value for Float32, found {}",
-                        json_kind(other)
-                    ));
-                }
-            }
-            Ok(())
-        }
-        DataType::Float64 => {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<Float64Builder>()
-                .ok_or_else(|| "failed to downcast Float64Builder".to_string())?;
-            match value {
-                Some(Value::Null) | None => builder.append_null(),
-                Some(Value::Number(number)) => {
-                    let number = number.as_f64().ok_or_else(|| {
-                        format!("expected numeric value for Float64, found `{number}`")
-                    })?;
-                    builder.append_value(number);
-                }
-                Some(other) => {
-                    return Err(format!(
-                        "expected numeric value for Float64, found {}",
-                        json_kind(other)
-                    ));
-                }
-            }
-            Ok(())
-        }
-        DataType::Utf8 => append_string_json(builder, value, false),
-        DataType::LargeUtf8 => append_string_json(builder, value, true),
-        DataType::Struct(fields) => {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<StructBuilder>()
-                .ok_or_else(|| "failed to downcast StructBuilder".to_string())?;
-            match value {
-                Some(Value::Object(object)) => {
-                    append_struct_from_object(builder, fields, Some(object))
-                }
-                Some(Value::Null) | None => append_struct_from_object(builder, fields, None),
-                Some(other) => Err(format!(
-                    "expected object for Struct field, found {}",
-                    json_kind(other)
-                )),
-            }
-        }
-        DataType::List(field) => {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
-                .ok_or_else(|| "failed to downcast ListBuilder".to_string())?;
-            match value {
-                Some(Value::Array(values)) => {
-                    for value in values {
-                        append_json_value(
-                            builder.values().as_mut(),
-                            field.data_type(),
-                            Some(value),
-                        )?;
-                    }
-                    builder.append(true);
-                    Ok(())
-                }
-                Some(Value::Null) | None => {
-                    builder.append(false);
-                    Ok(())
-                }
-                Some(other) => Err(format!(
-                    "expected array for List field, found {}",
-                    json_kind(other)
-                )),
-            }
-        }
-        DataType::LargeList(field) => {
-            let builder = builder
-                .as_any_mut()
-                .downcast_mut::<LargeListBuilder<Box<dyn ArrayBuilder>>>()
-                .ok_or_else(|| "failed to downcast LargeListBuilder".to_string())?;
-            match value {
-                Some(Value::Array(values)) => {
-                    for value in values {
-                        append_json_value(
-                            builder.values().as_mut(),
-                            field.data_type(),
-                            Some(value),
-                        )?;
-                    }
-                    builder.append(true);
-                    Ok(())
-                }
-                Some(Value::Null) | None => {
-                    builder.append(false);
-                    Ok(())
-                }
-                Some(other) => Err(format!(
-                    "expected array for LargeList field, found {}",
-                    json_kind(other)
-                )),
-            }
-        }
-        other => Err(format!(
-            "NDJSON compaction does not yet support target type {other:?}"
-        )),
-    }
-}
-
-fn append_signed_json<T, F>(
-    builder: &mut dyn ArrayBuilder,
-    value: Option<&Value>,
-    type_name: &str,
-    mut append: F,
-) -> Result<(), String>
-where
-    T: TryFrom<i64>,
-    <T as TryFrom<i64>>::Error: std::fmt::Debug,
-    F: FnMut(&mut dyn ArrayBuilder, T) -> Result<(), String>,
-{
-    match value {
-        Some(Value::Null) | None => append_null_to_signed(builder, type_name),
-        Some(Value::Number(number)) => {
-            let number = number.as_i64().ok_or_else(|| {
-                format!("expected integer value for {type_name}, found `{number}`")
-            })?;
-            let converted = T::try_from(number)
-                .map_err(|_| format!("value `{number}` is out of range for {type_name}"))?;
-            append(builder, converted)
-        }
-        Some(other) => Err(format!(
-            "expected integer value for {type_name}, found {}",
-            json_kind(other)
-        )),
-    }
-}
-
-fn append_unsigned_json<T, F>(
-    builder: &mut dyn ArrayBuilder,
-    value: Option<&Value>,
-    type_name: &str,
-    mut append: F,
-) -> Result<(), String>
-where
-    T: TryFrom<u64>,
-    <T as TryFrom<u64>>::Error: std::fmt::Debug,
-    F: FnMut(&mut dyn ArrayBuilder, T) -> Result<(), String>,
-{
-    match value {
-        Some(Value::Null) | None => append_null_to_unsigned(builder, type_name),
-        Some(Value::Number(number)) => {
-            let number = number.as_u64().ok_or_else(|| {
-                format!("expected unsigned integer value for {type_name}, found `{number}`")
-            })?;
-            let converted = T::try_from(number)
-                .map_err(|_| format!("value `{number}` is out of range for {type_name}"))?;
-            append(builder, converted)
-        }
-        Some(other) => Err(format!(
-            "expected unsigned integer value for {type_name}, found {}",
-            json_kind(other)
-        )),
-    }
-}
-
-fn append_null_to_signed(builder: &mut dyn ArrayBuilder, type_name: &str) -> Result<(), String> {
-    match type_name {
-        "Int8" => builder
-            .as_any_mut()
-            .downcast_mut::<Int8Builder>()
-            .ok_or_else(|| "failed to downcast Int8Builder".to_string())?
-            .append_null(),
-        "Int16" => builder
-            .as_any_mut()
-            .downcast_mut::<Int16Builder>()
-            .ok_or_else(|| "failed to downcast Int16Builder".to_string())?
-            .append_null(),
-        "Int32" => builder
-            .as_any_mut()
-            .downcast_mut::<Int32Builder>()
-            .ok_or_else(|| "failed to downcast Int32Builder".to_string())?
-            .append_null(),
-        "Int64" => builder
-            .as_any_mut()
-            .downcast_mut::<Int64Builder>()
-            .ok_or_else(|| "failed to downcast Int64Builder".to_string())?
-            .append_null(),
-        _ => return Err(format!("unsupported signed type `{type_name}`")),
-    }
-    Ok(())
-}
-
-fn append_null_to_unsigned(builder: &mut dyn ArrayBuilder, type_name: &str) -> Result<(), String> {
-    match type_name {
-        "UInt8" => builder
-            .as_any_mut()
-            .downcast_mut::<UInt8Builder>()
-            .ok_or_else(|| "failed to downcast UInt8Builder".to_string())?
-            .append_null(),
-        "UInt16" => builder
-            .as_any_mut()
-            .downcast_mut::<UInt16Builder>()
-            .ok_or_else(|| "failed to downcast UInt16Builder".to_string())?
-            .append_null(),
-        "UInt32" => builder
-            .as_any_mut()
-            .downcast_mut::<UInt32Builder>()
-            .ok_or_else(|| "failed to downcast UInt32Builder".to_string())?
-            .append_null(),
-        "UInt64" => builder
-            .as_any_mut()
-            .downcast_mut::<UInt64Builder>()
-            .ok_or_else(|| "failed to downcast UInt64Builder".to_string())?
-            .append_null(),
-        _ => return Err(format!("unsupported unsigned type `{type_name}`")),
-    }
-    Ok(())
-}
-
-fn append_string_json(
-    builder: &mut dyn ArrayBuilder,
-    value: Option<&Value>,
-    is_large: bool,
-) -> Result<(), String> {
-    match value {
-        Some(Value::Null) | None => {
-            if is_large {
-                builder
-                    .as_any_mut()
-                    .downcast_mut::<LargeStringBuilder>()
-                    .ok_or_else(|| "failed to downcast LargeStringBuilder".to_string())?
-                    .append_null();
-            } else {
-                builder
-                    .as_any_mut()
-                    .downcast_mut::<StringBuilder>()
-                    .ok_or_else(|| "failed to downcast StringBuilder".to_string())?
-                    .append_null();
-            }
-            Ok(())
-        }
-        Some(value @ (Value::String(_) | Value::Number(_) | Value::Bool(_))) => {
-            let rendered = match value {
-                Value::String(string) => string.to_string(),
-                Value::Number(number) => number.to_string(),
-                Value::Bool(boolean) => boolean.to_string(),
-                _ => unreachable!(),
-            };
-
-            if is_large {
-                builder
-                    .as_any_mut()
-                    .downcast_mut::<LargeStringBuilder>()
-                    .ok_or_else(|| "failed to downcast LargeStringBuilder".to_string())?
-                    .append_value(rendered);
-            } else {
-                builder
-                    .as_any_mut()
-                    .downcast_mut::<StringBuilder>()
-                    .ok_or_else(|| "failed to downcast StringBuilder".to_string())?
-                    .append_value(rendered);
-            }
-            Ok(())
-        }
-        Some(other) => Err(format!(
-            "expected primitive or string value for string field, found {}",
-            json_kind(other)
-        )),
-    }
-}
-
 fn validate_compaction_options(options: &CompactionOptions) -> Result<(), String> {
     if options.payload_column.trim().is_empty() {
         return Err("payload_column must not be empty".to_string());
@@ -1367,6 +2506,12 @@ fn validate_compaction_options(options: &CompactionOptions) -> Result<(), String
     }
 
     Ok(())
+}
+
+fn default_scan_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
 }
 
 fn schema_fingerprint(schema: &Schema) -> String {
@@ -1432,23 +2577,8 @@ fn data_type_fingerprint(data_type: &DataType) -> String {
     }
 }
 
-fn json_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
 fn io_error(message: impl Into<String>) -> std::io::Error {
     std::io::Error::other(message.into())
-}
-
-fn prefix_payload_conflicts(message: &str) -> String {
-    message.replace("field `", "field `payload.")
 }
 
 fn peak_rss_bytes() -> u64 {
@@ -1478,7 +2608,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use arrow_array::{Float64Array, Int32Array, StringArray};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn payload_schema_options() -> PayloadMergeOptions {
         PayloadMergeOptions::default()
@@ -1490,7 +2620,15 @@ mod tests {
             payload_column: "payload".to_string(),
             widening_options: WideningOptions::default(),
             batch_rows: 2,
+            scan_parallelism: Some(1),
+            read_buffer_bytes: 1 << 20,
         }
+    }
+
+    fn compaction_options_with_parallelism(parallelism: usize) -> CompactionOptions {
+        let mut options = compaction_options();
+        options.scan_parallelism = Some(parallelism);
+        options
     }
 
     fn unique_path(prefix: &str, extension: &str) -> PathBuf {
@@ -1828,6 +2966,245 @@ mod tests {
 
         std::fs::remove_file(left_path)?;
         std::fs::remove_file(right_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn discover_ndjson_shape_cache_matches_uncached_schema() -> Result<(), Box<dyn Error>> {
+        let left_path = unique_path("discover_cache_left", "ndjson");
+        let right_path = unique_path("discover_cache_right", "ndjson");
+        write_ndjson(
+            &left_path,
+            &[
+                json!({
+                    "event_id": 1,
+                    "org_id": 10,
+                    "score": 1,
+                    "profile": { "name": "Alice" },
+                    "scores": [1, 2]
+                }),
+                json!({
+                    "event_id": 2,
+                    "org_id": 10,
+                    "score": 2,
+                    "profile": { "name": "Bob" },
+                    "scores": [3, 4]
+                }),
+            ],
+        )?;
+        write_ndjson(
+            &right_path,
+            &[
+                json!({
+                    "event_id": 3,
+                    "org_id": 20,
+                    "score": 4.5,
+                    "profile": { "tier": "gold" },
+                    "scores": [1.5],
+                    "amount": 9
+                }),
+                json!({
+                    "event_id": 4,
+                    "org_id": 20,
+                    "score": 5.5,
+                    "profile": { "tier": "silver" },
+                    "scores": [2.5],
+                    "amount": 11
+                }),
+            ],
+        )?;
+
+        let cached = discover_ndjson_schema_details_with_settings(
+            &[left_path.clone(), right_path.clone()],
+            &compaction_options(),
+            true,
+        )?;
+        let uncached = discover_ndjson_schema_details_with_settings(
+            &[left_path.clone(), right_path.clone()],
+            &compaction_options(),
+            false,
+        )?;
+
+        assert_eq!(cached.schema, uncached.schema);
+        assert!(cached.stats.shape_cache_hits > 0);
+        assert_eq!(uncached.stats.shape_cache_hits, 0);
+        assert!(cached.stats.shape_cache_misses > 0);
+
+        std::fs::remove_file(left_path)?;
+        std::fs::remove_file(right_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn discover_ndjson_parallel_reduction_is_deterministic() -> Result<(), Box<dyn Error>> {
+        let left_path = unique_path("discover_parallel_left", "ndjson");
+        let right_path = unique_path("discover_parallel_right", "ndjson");
+        write_ndjson(
+            &left_path,
+            &[
+                json!({
+                    "event_id": 1,
+                    "org_id": 10,
+                    "score": 1,
+                    "profile": { "name": "Alice" },
+                    "scores": [1, 2]
+                }),
+                json!({
+                    "event_id": 2,
+                    "org_id": 10,
+                    "score": 2,
+                    "profile": { "name": "Bob" },
+                    "scores": [3, 4],
+                    "tags": ["a", "b"]
+                }),
+            ],
+        )?;
+        write_ndjson(
+            &right_path,
+            &[
+                json!({
+                    "event_id": 3,
+                    "org_id": 20,
+                    "score": 4.5,
+                    "profile": { "tier": "gold" },
+                    "scores": [1.5],
+                    "amount": 9
+                }),
+                json!({
+                    "event_id": 4,
+                    "org_id": 20,
+                    "score": 5.5,
+                    "profile": { "tier": "silver" },
+                    "scores": [2.5],
+                    "amount": 11,
+                    "tags": ["c"]
+                }),
+            ],
+        )?;
+
+        let single = discover_ndjson_schema_from_paths(
+            &[left_path.clone(), right_path.clone()],
+            &compaction_options_with_parallelism(1),
+        )?;
+        let parallel = discover_ndjson_schema_from_paths(
+            &[left_path.clone(), right_path.clone()],
+            &compaction_options_with_parallelism(2),
+        )?;
+        let reversed = discover_ndjson_schema_from_paths(
+            &[right_path.clone(), left_path.clone()],
+            &compaction_options_with_parallelism(2),
+        )?;
+
+        assert_eq!(single, parallel);
+        assert_eq!(single, reversed);
+
+        std::fs::remove_file(left_path)?;
+        std::fs::remove_file(right_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compiled_ndjson_plan_null_fills_missing_payload_fields() -> Result<(), Box<dyn Error>> {
+        let payload_fields: Fields = vec![
+            Arc::new(Field::new("amount", DataType::Int64, true)),
+            Arc::new(Field::new(
+                "profile",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("name", DataType::Utf8, true)),
+                        Arc::new(Field::new("tier", DataType::Utf8, true)),
+                    ]
+                    .into(),
+                ),
+                true,
+            )),
+            Arc::new(Field::new("score", DataType::Float64, true)),
+            Arc::new(Field::new(
+                "scores",
+                DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+                true,
+            )),
+        ]
+        .into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int64, true),
+            Field::new("org_id", DataType::Int64, true),
+            Field::new("payload", DataType::Struct(payload_fields.clone()), true),
+        ]));
+        let plan = CompiledNdjsonPlan::compile(schema.as_ref(), &compaction_options())?;
+        let mut batch_builder = NdjsonBatchBuilder::new(schema.clone(), plan, 8)?;
+
+        let mut first_line =
+            br#"{"event_id":1,"org_id":10,"score":1,"profile":{"name":"Alice"},"scores":[1,2]}"#
+                .to_vec();
+        let mut first_buffers = Buffers::default();
+        let first_value =
+            to_borrowed_value_with_buffers(first_line.as_mut_slice(), &mut first_buffers)?;
+        batch_builder.append_record(&first_value)?;
+
+        let mut second_line =
+            br#"{"event_id":2,"org_id":20,"score":4.5,"amount":9,"profile":{"tier":"gold"}}"#
+                .to_vec();
+        let mut second_buffers = Buffers::default();
+        let second_value =
+            to_borrowed_value_with_buffers(second_line.as_mut_slice(), &mut second_buffers)?;
+        batch_builder.append_record(&second_value)?;
+
+        let batch = batch_builder.finish_batch();
+        let event_ids = batch
+            .column(batch.schema().index_of("event_id")?)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("event_id is Int64");
+        assert_eq!(event_ids.value(0), 1);
+        assert_eq!(event_ids.value(1), 2);
+
+        let payload = batch
+            .column(batch.schema().index_of("payload")?)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("payload is Struct");
+        let score_array = payload
+            .column_by_name("score")
+            .expect("score exists")
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("score is Float64");
+        assert_eq!(score_array.value(0), 1.0);
+        assert_eq!(score_array.value(1), 4.5);
+
+        let amount_array = payload
+            .column_by_name("amount")
+            .expect("amount exists")
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("amount is Int64");
+        assert!(amount_array.is_null(0));
+        assert_eq!(amount_array.value(1), 9);
+
+        let profile = payload
+            .column_by_name("profile")
+            .expect("profile exists")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("profile is Struct");
+        let name_array = profile
+            .column_by_name("name")
+            .expect("name exists")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name is Utf8");
+        let tier_array = profile
+            .column_by_name("tier")
+            .expect("tier exists")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("tier is Utf8");
+        assert_eq!(name_array.value(0), "Alice");
+        assert!(name_array.is_null(1));
+        assert!(tier_array.is_null(0));
+        assert_eq!(tier_array.value(1), "gold");
+
         Ok(())
     }
 

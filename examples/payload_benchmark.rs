@@ -16,7 +16,7 @@ use rust_parquet_merge::{
     CompactionOptions, CompactionReport, PayloadMergeOptions, compact_ndjson_to_parquet,
     merge_payload_parquet_files,
 };
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use tokio::fs;
 
 #[derive(Clone, Copy)]
@@ -303,12 +303,44 @@ fn write_ndjson_file(
     Ok(())
 }
 
+fn write_unique_shape_ndjson_file(
+    path: &Path,
+    rows: usize,
+    start_event_id: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = StdFile::create(path)?;
+    for index in 0..rows {
+        let mut object = Map::new();
+        object.insert("event_id".to_string(), json!(start_event_id + index as i32));
+        object.insert("org_id".to_string(), json!(3_000 + (index % 8) as i32));
+        object.insert(
+            format!("metric_{}", start_event_id + index as i32),
+            json!((index as i64) * 11),
+        );
+        object.insert(
+            "profile".to_string(),
+            json!({
+                "name": format!("unique_user_{start_event_id}_{index}"),
+                "bucket": format!("bucket_{}", index % 17),
+            }),
+        );
+        writeln!(file, "{}", Value::Object(object))?;
+    }
+    Ok(())
+}
+
 fn print_report(label: &str, report: &CompactionReport) {
     let seconds = report.total_duration.as_secs_f64().max(f64::EPSILON);
     let rows_per_second = report.rows as f64 / seconds;
     let mb_per_second = report.input_bytes as f64 / 1_000_000.0 / seconds;
+    let cache_lookups = report.planning_shape_cache_hits + report.planning_shape_cache_misses;
+    let hit_rate = if cache_lookups == 0 {
+        0.0
+    } else {
+        report.planning_shape_cache_hits as f64 / cache_lookups as f64
+    };
     println!(
-        "{label}: rows={}, input={:.2} MB, output={:.2} MB, total={:?}, planning={:?}, exec={:?}, rows/sec={:.0}, input MB/sec={:.2}, peak RSS={:.2} MB",
+        "{label}: rows={}, input={:.2} MB, output={:.2} MB, total={:?}, planning={:?}, exec={:?}, rows/sec={:.0}, input MB/sec={:.2}, peak RSS={:.2} MB, planning_threads={}, unique_shapes={}, shape_cache_hits={}, shape_cache_misses={}, shape_cache_hit_rate={:.1}%",
         report.rows,
         report.input_bytes as f64 / 1_000_000.0,
         report.output_bytes as f64 / 1_000_000.0,
@@ -318,7 +350,22 @@ fn print_report(label: &str, report: &CompactionReport) {
         rows_per_second,
         mb_per_second,
         report.peak_rss_bytes as f64 / 1_000_000.0,
+        report.planning_threads_used,
+        report.planning_unique_shapes,
+        report.planning_shape_cache_hits,
+        report.planning_shape_cache_misses,
+        hit_rate * 100.0,
     );
+}
+
+fn ndjson_options(payload_merge_options: &PayloadMergeOptions) -> CompactionOptions {
+    CompactionOptions {
+        envelope_fields: vec!["event_id".to_string(), "org_id".to_string()],
+        payload_column: "payload".to_string(),
+        widening_options: payload_merge_options.widening_options,
+        batch_rows: 4_096,
+        ..CompactionOptions::default()
+    }
 }
 
 #[tokio::main]
@@ -326,17 +373,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     const ROWS_PER_PARQUET_FILE: usize = 20_000;
     const PARQUET_FILE_COUNT: usize = 6;
     const NDJSON_ROWS_PER_FILE: usize = 25_000;
+    const UNIQUE_SHAPE_ROWS_PER_FILE: usize = 2_000;
 
     let benchmark_dir = unique_benchmark_dir();
     fs::create_dir_all(&benchmark_dir).await?;
 
     let payload_merge_options = PayloadMergeOptions::default();
-    let ndjson_options = CompactionOptions {
-        envelope_fields: vec!["event_id".to_string(), "org_id".to_string()],
-        payload_column: "payload".to_string(),
-        widening_options: payload_merge_options.widening_options,
-        batch_rows: 4_096,
-    };
+    let ndjson_options = ndjson_options(&payload_merge_options);
 
     let mut parquet_inputs = Vec::new();
     for file_index in 0..PARQUET_FILE_COUNT {
@@ -386,7 +429,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &ndjson_options,
     )
     .await?;
-    print_report("NDJSON Compaction", &ndjson_compaction_report);
+    print_report("NDJSON Compaction (Mixed Drift)", &ndjson_compaction_report);
+
+    let repeated_shape_left = benchmark_dir.join("payload_repeated_left.ndjson");
+    let repeated_shape_right = benchmark_dir.join("payload_repeated_right.ndjson");
+    write_ndjson_file(
+        &repeated_shape_left,
+        NDJSON_ROWS_PER_FILE,
+        400_000,
+        SchemaFamily::Left,
+    )?;
+    write_ndjson_file(
+        &repeated_shape_right,
+        NDJSON_ROWS_PER_FILE,
+        500_000,
+        SchemaFamily::Left,
+    )?;
+    let repeated_shape_output = benchmark_dir.join("payload_repeated_shape.parquet");
+    let repeated_shape_report = compact_ndjson_to_parquet(
+        &[repeated_shape_left, repeated_shape_right],
+        &repeated_shape_output,
+        &ndjson_options,
+    )
+    .await?;
+    print_report("NDJSON Compaction (Repeated Shape)", &repeated_shape_report);
+
+    let unique_shape_left = benchmark_dir.join("payload_unique_left.ndjson");
+    let unique_shape_right = benchmark_dir.join("payload_unique_right.ndjson");
+    write_unique_shape_ndjson_file(&unique_shape_left, UNIQUE_SHAPE_ROWS_PER_FILE, 600_000)?;
+    write_unique_shape_ndjson_file(&unique_shape_right, UNIQUE_SHAPE_ROWS_PER_FILE, 700_000)?;
+    let unique_shape_output = benchmark_dir.join("payload_unique_shape.parquet");
+    let unique_shape_report = compact_ndjson_to_parquet(
+        &[unique_shape_left, unique_shape_right],
+        &unique_shape_output,
+        &ndjson_options,
+    )
+    .await?;
+    print_report(
+        "NDJSON Compaction (Unique Shape Stress)",
+        &unique_shape_report,
+    );
 
     let (partner_schema, partner_batch) =
         payload_batch_with_int64_envelope(SchemaFamily::Right, NDJSON_ROWS_PER_FILE, 300_000);

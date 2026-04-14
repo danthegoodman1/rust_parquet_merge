@@ -74,11 +74,12 @@ That keeps nested payload properties first-class and typed in the query engine w
 
 Run the compiled payload benchmark with:
 
-`cargo run --example payload_benchmark`
+`cargo run --release --example payload_benchmark`
 
 It reports:
 
 - payload-native Parquet merge throughput
-- end-to-end NDJSON compaction throughput
+- NDJSON compaction throughput for mixed-drift, repeated-shape, and unique-shape workloads
 - compaction-plus-merge throughput
 - planning time, execution time, rows/sec, input MB/sec, and peak RSS
+- planning threads used, unique shapes discovered, and shape-cache hit/miss counts
