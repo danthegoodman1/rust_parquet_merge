@@ -340,13 +340,14 @@ fn print_report(label: &str, report: &CompactionReport) {
         report.planning_shape_cache_hits as f64 / cache_lookups as f64
     };
     println!(
-        "{label}: rows={}, input={:.2} MB, output={:.2} MB, total={:?}, planning={:?}, exec={:?}, rows/sec={:.0}, input MB/sec={:.2}, peak RSS={:.2} MB, planning_threads={}, unique_shapes={}, shape_cache_hits={}, shape_cache_misses={}, shape_cache_hit_rate={:.1}%",
+        "{label}: rows={}, input={:.2} MB, output={:.2} MB, total={:?}, planning={:?}, exec={:?}, sorting={:?}, rows/sec={:.0}, input MB/sec={:.2}, peak RSS={:.2} MB, planning_threads={}, unique_shapes={}, shape_cache_hits={}, shape_cache_misses={}, shape_cache_hit_rate={:.1}%",
         report.rows,
         report.input_bytes as f64 / 1_000_000.0,
         report.output_bytes as f64 / 1_000_000.0,
         report.total_duration,
         report.planning_duration,
         report.execution_duration,
+        report.sorting_duration,
         rows_per_second,
         mb_per_second,
         report.peak_rss_bytes as f64 / 1_000_000.0,
@@ -430,6 +431,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     print_report("NDJSON Compaction (Mixed Drift)", &ndjson_compaction_report);
+
+    let sorted_ndjson_output = benchmark_dir.join("payload_compacted_sorted.parquet");
+    let sorted_ndjson_report = compact_ndjson_to_parquet(
+        &[ndjson_right.clone(), ndjson_left.clone()],
+        &sorted_ndjson_output,
+        &CompactionOptions {
+            sort_field: Some("event_id".to_string()),
+            ..ndjson_options.clone()
+        },
+    )
+    .await?;
+    print_report(
+        "NDJSON Compaction (Mixed Drift, Sorted)",
+        &sorted_ndjson_report,
+    );
 
     let repeated_shape_left = benchmark_dir.join("payload_repeated_left.ndjson");
     let repeated_shape_right = benchmark_dir.join("payload_repeated_right.ndjson");

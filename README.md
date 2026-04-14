@@ -61,6 +61,15 @@ The same engine also powers a two-pass NDJSON compaction flow:
 
 - pass 1 discovers the exact typed payload union schema across all NDJSON inputs
 - pass 2 streams NDJSON into Arrow builders and writes Parquet without buffering the full dataset in memory
+- optional in-memory sorting can reorder NDJSON output by one envelope field before Parquet write
+
+### NDJSON sorting
+
+- `CompactionOptions.sort_field` enables ascending stable sort with `NULLS LAST` before Parquet write.
+- The sort field must also be listed in `envelope_fields`.
+- Supported sort-key types are `Int64`, `UInt64`, `Float64`, `Utf8`, and `LargeUtf8`.
+- Sorting uses the typed Arrow output columns, not raw JSON text.
+- `CompactionOptions.sort_max_rows_in_memory` defaults to `262_144`; jobs above that cap fail clearly because external spill sort is not implemented yet.
 
 ### Query proof
 
@@ -79,7 +88,8 @@ Run the compiled payload benchmark with:
 It reports:
 
 - payload-native Parquet merge throughput
-- NDJSON compaction throughput for mixed-drift, repeated-shape, and unique-shape workloads
+- NDJSON compaction throughput for mixed-drift, sorted mixed-drift, repeated-shape, and unique-shape workloads
 - compaction-plus-merge throughput
-- planning time, execution time, rows/sec, input MB/sec, and peak RSS
+- planning time, execution time, sorting time, rows/sec, input MB/sec, and peak RSS
 - planning threads used, unique shapes discovered, and shape-cache hit/miss counts
+- peak RSS is process high-water mark, so later benchmark lines reflect the highest peak reached anywhere in the run

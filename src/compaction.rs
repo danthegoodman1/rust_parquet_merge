@@ -1,6 +1,9 @@
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fs::File as StdFile;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,13 +16,16 @@ use super::{
     to_parquet_error, widen_data_type,
 };
 use arrow::array::new_null_array;
-use arrow::compute::cast;
+use arrow::compute::{cast, concat_batches, take_record_batch};
 use arrow_array::builder::{
     ArrayBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder,
     Int32Builder, Int64Builder, LargeListBuilder, LargeStringBuilder, ListBuilder, NullBuilder,
     StringBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
 };
-use arrow_array::{Array, ArrayRef, LargeListArray, ListArray, RecordBatch, StructArray};
+use arrow_array::{
+    Array, ArrayRef, Float64Array, Int64Array, LargeListArray, LargeStringArray, ListArray,
+    RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array,
+};
 use arrow_buffer::NullBufferBuilder;
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use futures_util::StreamExt;
@@ -39,6 +45,8 @@ pub struct CompactionOptions {
     pub batch_rows: usize,
     pub scan_parallelism: Option<usize>,
     pub read_buffer_bytes: usize,
+    pub sort_field: Option<String>,
+    pub sort_max_rows_in_memory: usize,
 }
 
 impl Default for CompactionOptions {
@@ -53,6 +61,8 @@ impl Default for CompactionOptions {
                 .map(std::num::NonZeroUsize::get)
                 .or(Some(1)),
             read_buffer_bytes: 1 << 20,
+            sort_field: None,
+            sort_max_rows_in_memory: 262_144,
         }
     }
 }
@@ -64,12 +74,36 @@ pub struct CompactionReport {
     pub output_bytes: u64,
     pub planning_duration: Duration,
     pub execution_duration: Duration,
+    pub sorting_duration: Duration,
     pub total_duration: Duration,
     pub peak_rss_bytes: u64,
     pub planning_threads_used: usize,
     pub planning_unique_shapes: u64,
     pub planning_shape_cache_hits: u64,
     pub planning_shape_cache_misses: u64,
+}
+
+type InternedFieldName = Arc<str>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ShapeSignature(u64);
+
+#[derive(Debug, Default)]
+struct FieldInterner {
+    names: HashMap<String, InternedFieldName>,
+}
+
+impl FieldInterner {
+    fn intern(&mut self, name: &str) -> InternedFieldName {
+        if let Some(existing) = self.names.get(name) {
+            return existing.clone();
+        }
+
+        let owned = name.to_string();
+        let interned: InternedFieldName = Arc::from(owned.as_str());
+        self.names.insert(owned, interned.clone());
+        interned
+    }
 }
 
 #[derive(Debug, Default)]
@@ -534,6 +568,7 @@ pub async fn merge_payload_parquet_files(
         output_bytes,
         planning_duration,
         execution_duration,
+        sorting_duration: Duration::default(),
         total_duration: total_start.elapsed(),
         peak_rss_bytes: peak_rss_bytes(),
         planning_threads_used: 0,
@@ -557,12 +592,9 @@ struct NdjsonPlanningResult {
     stats: NdjsonPlanningStats,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ShapeKey(String);
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DiscoveredField {
-    name: String,
+    name: InternedFieldName,
     data_type: DiscoveredType,
 }
 
@@ -610,7 +642,7 @@ struct FileDiscoveryResult {
 struct NdjsonScanState {
     line_buffer: Vec<u8>,
     parser_buffers: Buffers,
-    shape_buffer: String,
+    field_interner: FieldInterner,
 }
 
 impl NdjsonScanState {
@@ -618,7 +650,7 @@ impl NdjsonScanState {
         Self {
             line_buffer: Vec::with_capacity(read_buffer_bytes),
             parser_buffers: Buffers::default(),
-            shape_buffer: String::with_capacity(256),
+            field_interner: FieldInterner::default(),
         }
     }
 }
@@ -707,6 +739,7 @@ struct NdjsonBatchBuilder {
     plan: CompiledNdjsonPlan,
     root: NdjsonStructBuilder,
     scratch: NdjsonAppendScratch,
+    append_shape_cache: HashMap<ShapeSignature, Arc<CompiledNdjsonRecordShapeAdapter>>,
 }
 
 #[derive(Debug)]
@@ -737,6 +770,65 @@ enum NdjsonValueBuilder {
     LargeList(Box<LargeListBuilder<NdjsonValueBuilder>>),
 }
 
+#[derive(Clone, Debug)]
+struct CompiledNdjsonRecordShapeAdapter {
+    ordered_present: Vec<CompiledNdjsonPresentRootField>,
+    envelope_missing: Vec<CompiledNdjsonMissingField>,
+    payload_missing: Vec<CompiledNdjsonMissingField>,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledNdjsonPresentRootField {
+    target: RootFieldTarget,
+    adapter: CompiledNdjsonValueShapeAdapter,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RootFieldTarget {
+    Envelope(usize),
+    Payload(usize),
+}
+
+#[derive(Clone, Debug)]
+struct CompiledNdjsonStructShapeAdapter {
+    present: Vec<CompiledNdjsonPresentField>,
+    missing: Vec<CompiledNdjsonMissingField>,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledNdjsonPresentField {
+    builder_index: usize,
+    adapter: CompiledNdjsonValueShapeAdapter,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledNdjsonMissingField {
+    builder_index: usize,
+    op: CompiledNdjsonValueOp,
+}
+
+#[derive(Clone, Debug)]
+enum CompiledNdjsonValueShapeAdapter {
+    Generic(CompiledNdjsonValueOp),
+    Struct(CompiledNdjsonStructShapeAdapter),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortKeyType {
+    Int64,
+    UInt64,
+    Float64,
+    Utf8,
+    LargeUtf8,
+}
+
+#[derive(Clone, Debug)]
+struct NdjsonSortPlan {
+    field_name: String,
+    field_index: usize,
+    key_type: SortKeyType,
+}
+
 pub fn discover_ndjson_schema_from_paths(
     input_paths: &[PathBuf],
     options: &CompactionOptions,
@@ -757,9 +849,9 @@ pub async fn compact_ndjson_to_parquet(
     let total_start = Instant::now();
     let planning_start = Instant::now();
     let planning = discover_ndjson_schema_details_from_paths(input_paths, options)?;
+    let sort_plan = build_ndjson_sort_plan(planning.schema.as_ref(), options).map_err(io_error)?;
     let planning_duration = planning_start.elapsed();
 
-    let execution_start = Instant::now();
     let input_bytes = input_paths
         .iter()
         .map(std::fs::metadata)
@@ -776,6 +868,9 @@ pub async fn compact_ndjson_to_parquet(
         NdjsonBatchBuilder::new(planning.schema.clone(), plan, options.batch_rows)
             .map_err(io_error)?;
     let mut rows = 0_u64;
+    let execution_start = Instant::now();
+    let mut buffered_batches = Vec::new();
+    let mut buffered_rows = 0_usize;
 
     for input_path in input_paths {
         let file = StdFile::open(input_path)?;
@@ -793,18 +888,57 @@ pub async fn compact_ndjson_to_parquet(
             rows += 1;
 
             if batch_builder.is_full() {
-                writer.write(&batch_builder.finish_batch()).await?;
+                let batch = batch_builder.finish_batch();
+                if sort_plan.is_some() {
+                    buffered_rows += batch.num_rows();
+                    ensure_sort_row_limit(buffered_rows, options).map_err(io_error)?;
+                    buffered_batches.push(batch);
+                } else {
+                    writer.write(&batch).await?;
+                }
             }
         }
     }
 
     if !batch_builder.is_empty() {
-        writer.write(&batch_builder.finish_batch()).await?;
+        let batch = batch_builder.finish_batch();
+        if sort_plan.is_some() {
+            buffered_rows += batch.num_rows();
+            ensure_sort_row_limit(buffered_rows, options).map_err(io_error)?;
+            buffered_batches.push(batch);
+        } else {
+            writer.write(&batch).await?;
+        }
+    }
+
+    let accumulation_duration = execution_start.elapsed();
+    let mut sorting_duration = Duration::default();
+    let mut post_sort_write_duration = Duration::default();
+    if let Some(sort_plan) = sort_plan.as_ref() {
+        let sorting_start = Instant::now();
+        let sorted_batch = if buffered_batches.is_empty() {
+            RecordBatch::new_empty(planning.schema.clone())
+        } else {
+            let combined =
+                concat_batches(&planning.schema, buffered_batches.iter()).map_err(|error| {
+                    io_error(format!(
+                        "failed to concatenate buffered NDJSON batches: {error}"
+                    ))
+                })?;
+            stable_sort_record_batch(&combined, sort_plan).map_err(io_error)?
+        };
+        sorting_duration = sorting_start.elapsed();
+
+        if sorted_batch.num_rows() > 0 {
+            let write_start = Instant::now();
+            writer.write(&sorted_batch).await?;
+            post_sort_write_duration = write_start.elapsed();
+        }
     }
 
     writer.close().await?;
 
-    let execution_duration = execution_start.elapsed();
+    let execution_duration = accumulation_duration + post_sort_write_duration;
     let output_bytes = std::fs::metadata(output_path)?.len();
 
     Ok(CompactionReport {
@@ -813,6 +947,7 @@ pub async fn compact_ndjson_to_parquet(
         output_bytes,
         planning_duration,
         execution_duration,
+        sorting_duration,
         total_duration: total_start.elapsed(),
         peak_rss_bytes: peak_rss_bytes(),
         planning_threads_used: planning.stats.threads_used,
@@ -931,7 +1066,7 @@ fn scan_ndjson_file(
         .map(|(index, field)| (field.as_str(), index))
         .collect();
     let mut scan_state = NdjsonScanState::with_capacity(options.read_buffer_bytes);
-    let mut shape_cache: HashMap<ShapeKey, Arc<CachedDiscovery>> = HashMap::new();
+    let mut shape_cache: HashMap<ShapeSignature, Arc<CachedDiscovery>> = HashMap::new();
     let mut result = FileDiscoveryResult {
         accumulator: SchemaAccumulator {
             envelope_types: vec![None; options.envelope_fields.len()],
@@ -956,19 +1091,29 @@ fn scan_ndjson_file(
         })?;
 
         let discovery = if cache_enabled {
-            let shape_key = compute_shape_key(&value, &mut scan_state.shape_buffer);
+            let shape_key = compute_canonical_shape_signature(&value);
             if let Some(cached) = shape_cache.get(&shape_key) {
                 result.shape_cache_hits += 1;
                 cached.clone()
             } else {
                 result.shape_cache_misses += 1;
-                let discovered = Arc::new(discover_record(object, &envelope_lookup, options)?);
+                let discovered = Arc::new(discover_record(
+                    object,
+                    &envelope_lookup,
+                    &mut scan_state.field_interner,
+                    options,
+                )?);
                 shape_cache.insert(shape_key, discovered.clone());
                 discovered
             }
         } else {
             result.shape_cache_misses += 1;
-            Arc::new(discover_record(object, &envelope_lookup, options)?)
+            Arc::new(discover_record(
+                object,
+                &envelope_lookup,
+                &mut scan_state.field_interner,
+                options,
+            )?)
         };
 
         merge_record_into_accumulator(&mut result.accumulator, &discovery, options)?;
@@ -986,6 +1131,7 @@ fn scan_ndjson_file(
 fn discover_record(
     object: &simd_json::borrowed::Object<'_>,
     envelope_lookup: &HashMap<&str, usize>,
+    field_interner: &mut FieldInterner,
     options: &CompactionOptions,
 ) -> Result<CachedDiscovery, String> {
     let mut envelope_types = vec![None; envelope_lookup.len()];
@@ -993,12 +1139,19 @@ fn discover_record(
 
     for (key, value) in object.iter() {
         if let Some(index) = envelope_lookup.get(key.as_ref()) {
-            envelope_types[*index] =
-                Some(discover_borrowed_type(value, &options.widening_options)?);
+            envelope_types[*index] = Some(discover_borrowed_type(
+                value,
+                field_interner,
+                &options.widening_options,
+            )?);
         } else {
             payload_fields.push(DiscoveredField {
-                name: key.to_string(),
-                data_type: discover_borrowed_type(value, &options.widening_options)?,
+                name: field_interner.intern(key.as_ref()),
+                data_type: discover_borrowed_type(
+                    value,
+                    field_interner,
+                    &options.widening_options,
+                )?,
             });
         }
     }
@@ -1015,6 +1168,7 @@ fn discover_record(
 
 fn discover_borrowed_type(
     value: &BorrowedValue<'_>,
+    field_interner: &mut FieldInterner,
     options: &WideningOptions,
 ) -> Result<DiscoveredType, String> {
     if value.is_null() {
@@ -1062,7 +1216,7 @@ fn discover_borrowed_type(
     if let Some(values) = value.as_array() {
         let mut element_type: Option<DiscoveredType> = None;
         for element in values.iter() {
-            let discovered = discover_borrowed_type(element, options)?;
+            let discovered = discover_borrowed_type(element, field_interner, options)?;
             element_type = Some(match element_type {
                 Some(current) => {
                     merge_discovered_types("payload[]", &current, &discovered, options)?
@@ -1084,8 +1238,8 @@ fn discover_borrowed_type(
         let mut fields = Vec::with_capacity(object.len());
         for (key, child) in object.iter() {
             fields.push(DiscoveredField {
-                name: key.to_string(),
-                data_type: discover_borrowed_type(child, options)?,
+                name: field_interner.intern(key.as_ref()),
+                data_type: discover_borrowed_type(child, field_interner, options)?,
             });
         }
         fields.sort_unstable_by(|left, right| left.name.cmp(&right.name));
@@ -1309,19 +1463,19 @@ fn merge_discovered_fields(
 ) -> Result<Vec<DiscoveredField>, String> {
     let right_by_name: HashMap<&str, &DiscoveredField> = right
         .iter()
-        .map(|field| (field.name.as_str(), field))
+        .map(|field| (field.name.as_ref(), field))
         .collect();
-    let left_names: BTreeSet<&str> = left.iter().map(|field| field.name.as_str()).collect();
+    let left_names: BTreeSet<&str> = left.iter().map(|field| field.name.as_ref()).collect();
 
     let mut merged = Vec::with_capacity(left.len() + right.len());
     for left_field in left {
         let child_path = if path.is_empty() {
-            left_field.name.clone()
+            left_field.name.as_ref().to_string()
         } else {
             format!("{path}.{}", left_field.name)
         };
 
-        if let Some(right_field) = right_by_name.get(left_field.name.as_str()) {
+        if let Some(right_field) = right_by_name.get(left_field.name.as_ref()) {
             merged.push(DiscoveredField {
                 name: left_field.name.clone(),
                 data_type: merge_discovered_types(
@@ -1340,7 +1494,7 @@ fn merge_discovered_fields(
     }
 
     for right_field in right {
-        if !left_names.contains(right_field.name.as_str()) {
+        if !left_names.contains(right_field.name.as_ref()) {
             merged.push(DiscoveredField {
                 name: right_field.name.clone(),
                 data_type: with_nullable(right_field.data_type.clone(), true),
@@ -1365,7 +1519,7 @@ fn discovered_to_arrow_data_type(discovered: &DiscoveredType) -> DataType {
                 .iter()
                 .map(|field| {
                     Arc::new(Field::new(
-                        &field.name,
+                        field.name.as_ref(),
                         discovered_to_arrow_data_type(&field.data_type),
                         field.data_type.nullable,
                     ))
@@ -1412,58 +1566,88 @@ fn is_discovered_primitive(discovered: &DiscoveredType) -> bool {
     )
 }
 
-fn compute_shape_key(value: &BorrowedValue<'_>, buffer: &mut String) -> ShapeKey {
-    buffer.clear();
-    push_shape_key(value, buffer);
-    ShapeKey(buffer.clone())
+fn compute_canonical_shape_signature(value: &BorrowedValue<'_>) -> ShapeSignature {
+    let mut hasher = DefaultHasher::new();
+    hash_canonical_shape(value, &mut hasher);
+    ShapeSignature(hasher.finish())
 }
 
-fn push_shape_key(value: &BorrowedValue<'_>, output: &mut String) {
+fn hash_canonical_shape(value: &BorrowedValue<'_>, hasher: &mut DefaultHasher) {
     if value.is_null() {
-        output.push('n');
+        0_u8.hash(hasher);
     } else if value.as_bool().is_some() {
-        output.push('b');
+        1_u8.hash(hasher);
     } else if value.as_i64().is_some() {
-        output.push('i');
+        2_u8.hash(hasher);
     } else if value.as_u64().is_some() {
-        output.push('u');
+        3_u8.hash(hasher);
     } else if value.as_f64().is_some() {
-        output.push('f');
+        4_u8.hash(hasher);
     } else if value.as_str().is_some() {
-        output.push('s');
+        5_u8.hash(hasher);
     } else if let Some(array) = value.as_array() {
-        output.push('[');
-        let mut entries = Vec::with_capacity(array.len());
-        for entry in array.iter() {
-            let mut nested = String::new();
-            push_shape_key(entry, &mut nested);
-            entries.push(nested);
-        }
-        entries.sort_unstable();
+        6_u8.hash(hasher);
+        let mut entries = array
+            .iter()
+            .map(compute_canonical_shape_signature)
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|signature| signature.0);
         entries.dedup();
+        entries.len().hash(hasher);
         for entry in entries {
-            output.push_str(&entry);
-            output.push('|');
+            entry.hash(hasher);
         }
-        output.push(']');
     } else if let Some(object) = value.as_object() {
-        output.push('{');
-        let mut entries = Vec::with_capacity(object.len());
-        for (key, value) in object.iter() {
-            let mut nested = String::new();
-            push_shape_key(value, &mut nested);
-            entries.push((key.to_string(), nested));
-        }
-        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        7_u8.hash(hasher);
+        let mut entries = object
+            .iter()
+            .map(|(key, value)| (key.as_ref(), compute_canonical_shape_signature(value)))
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        entries.len().hash(hasher);
         for (key, nested) in entries {
-            output.push_str(&key);
-            output.push(':');
-            output.push_str(&nested);
-            output.push(',');
+            key.hash(hasher);
+            nested.hash(hasher);
         }
-        output.push('}');
     } else {
-        output.push('?');
+        255_u8.hash(hasher);
+    }
+}
+
+fn compute_execution_shape_signature(value: &BorrowedValue<'_>) -> ShapeSignature {
+    let mut hasher = DefaultHasher::new();
+    hash_execution_shape(value, &mut hasher);
+    ShapeSignature(hasher.finish())
+}
+
+fn hash_execution_shape(value: &BorrowedValue<'_>, hasher: &mut DefaultHasher) {
+    if value.is_null() {
+        0_u8.hash(hasher);
+    } else if value.as_bool().is_some() {
+        1_u8.hash(hasher);
+    } else if value.as_i64().is_some() {
+        2_u8.hash(hasher);
+    } else if value.as_u64().is_some() {
+        3_u8.hash(hasher);
+    } else if value.as_f64().is_some() {
+        4_u8.hash(hasher);
+    } else if value.as_str().is_some() {
+        5_u8.hash(hasher);
+    } else if let Some(array) = value.as_array() {
+        6_u8.hash(hasher);
+        array.len().hash(hasher);
+        for entry in array.iter() {
+            hash_execution_shape(entry, hasher);
+        }
+    } else if let Some(object) = value.as_object() {
+        7_u8.hash(hasher);
+        object.len().hash(hasher);
+        for (key, entry) in object.iter() {
+            key.as_ref().hash(hasher);
+            hash_execution_shape(entry, hasher);
+        }
+    } else {
+        255_u8.hash(hasher);
     }
 }
 
@@ -1617,6 +1801,290 @@ impl CompiledNdjsonPlan {
         root_builder.append(true);
         scratch.return_seen(0, seen);
         Ok(())
+    }
+
+    fn compile_record_shape_adapter(
+        &self,
+        record: &BorrowedValue<'_>,
+    ) -> Result<Option<CompiledNdjsonRecordShapeAdapter>, String> {
+        let object = record
+            .as_object()
+            .ok_or_else(|| "NDJSON record must be an object".to_string())?;
+        let mut ordered_present = Vec::with_capacity(object.len());
+        let mut envelope_seen = vec![false; self.envelope_ops.len()];
+        let mut payload_seen = vec![false; self.payload_op.fields.len()];
+
+        for (key, value) in object.iter() {
+            match self.top_level_lookup.get(key.as_ref()) {
+                Some(RootDispatch::Envelope(index)) => {
+                    if envelope_seen[*index] {
+                        return Ok(None);
+                    }
+                    envelope_seen[*index] = true;
+                    ordered_present.push(CompiledNdjsonPresentRootField {
+                        target: RootFieldTarget::Envelope(self.envelope_ops[*index].builder_index),
+                        adapter: compile_value_shape_adapter(
+                            &self.envelope_ops[*index].value_op,
+                            value,
+                        )?,
+                    });
+                }
+                Some(RootDispatch::Payload(index)) => {
+                    if payload_seen[*index] {
+                        return Ok(None);
+                    }
+                    payload_seen[*index] = true;
+                    ordered_present.push(CompiledNdjsonPresentRootField {
+                        target: RootFieldTarget::Payload(
+                            self.payload_op.fields[*index].builder_index,
+                        ),
+                        adapter: compile_value_shape_adapter(
+                            &self.payload_op.fields[*index].value_op,
+                            value,
+                        )?,
+                    });
+                }
+                None => return Ok(None),
+            }
+        }
+
+        let envelope_missing = self
+            .envelope_ops
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !envelope_seen[*index])
+            .map(|(_, op)| CompiledNdjsonMissingField {
+                builder_index: op.builder_index,
+                op: op.value_op.clone(),
+            })
+            .collect();
+        let payload_missing = self
+            .payload_op
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !payload_seen[*index])
+            .map(|(_, op)| CompiledNdjsonMissingField {
+                builder_index: op.builder_index,
+                op: op.value_op.clone(),
+            })
+            .collect();
+
+        Ok(Some(CompiledNdjsonRecordShapeAdapter {
+            ordered_present,
+            envelope_missing,
+            payload_missing,
+        }))
+    }
+}
+
+fn compile_value_shape_adapter(
+    op: &CompiledNdjsonValueOp,
+    value: &BorrowedValue<'_>,
+) -> Result<CompiledNdjsonValueShapeAdapter, String> {
+    match (op, value.as_object()) {
+        (CompiledNdjsonValueOp::Struct(struct_op), Some(object)) if !value.is_null() => {
+            if let Some(adapter) = compile_struct_shape_adapter(struct_op, object)? {
+                Ok(CompiledNdjsonValueShapeAdapter::Struct(adapter))
+            } else {
+                Ok(CompiledNdjsonValueShapeAdapter::Generic(op.clone()))
+            }
+        }
+        _ => Ok(CompiledNdjsonValueShapeAdapter::Generic(op.clone())),
+    }
+}
+
+fn compile_struct_shape_adapter(
+    struct_op: &CompiledNdjsonStructOp,
+    object: &simd_json::borrowed::Object<'_>,
+) -> Result<Option<CompiledNdjsonStructShapeAdapter>, String> {
+    let mut present = Vec::with_capacity(object.len());
+    let mut seen = vec![false; struct_op.fields.len()];
+
+    for (key, value) in object.iter() {
+        let Some(index) = struct_op.lookup.get(key.as_ref()) else {
+            return Ok(None);
+        };
+        if seen[*index] {
+            return Ok(None);
+        }
+        seen[*index] = true;
+        let field_op = &struct_op.fields[*index];
+        present.push(CompiledNdjsonPresentField {
+            builder_index: field_op.builder_index,
+            adapter: compile_value_shape_adapter(&field_op.value_op, value)?,
+        });
+    }
+
+    let missing = struct_op
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !seen[*index])
+        .map(|(_, field_op)| CompiledNdjsonMissingField {
+            builder_index: field_op.builder_index,
+            op: field_op.value_op.clone(),
+        })
+        .collect();
+
+    Ok(Some(CompiledNdjsonStructShapeAdapter { present, missing }))
+}
+
+impl CompiledNdjsonRecordShapeAdapter {
+    fn can_apply(&self, record: &BorrowedValue<'_>) -> bool {
+        record
+            .as_object()
+            .is_some_and(|object| object.len() == self.ordered_present.len())
+    }
+
+    fn apply(
+        &self,
+        plan: &CompiledNdjsonPlan,
+        root_builder: &mut NdjsonStructBuilder,
+        record: &BorrowedValue<'_>,
+        scratch: &mut NdjsonAppendScratch,
+    ) -> Result<(), String> {
+        let object = record
+            .as_object()
+            .ok_or_else(|| "NDJSON record must be an object".to_string())?;
+        if object.len() != self.ordered_present.len() {
+            return plan.append_record(root_builder, record, scratch);
+        }
+
+        let (envelope_builders, payload_slice) = root_builder
+            .children
+            .split_at_mut(plan.payload_builder_index);
+        let payload_builder = payload_slice
+            .first_mut()
+            .ok_or_else(|| "root payload builder is missing".to_string())?
+            .as_struct_mut()
+            .ok_or_else(|| "root payload builder must be Struct".to_string())?;
+
+        for ((_, value), present) in object.iter().zip(self.ordered_present.iter()) {
+            match present.target {
+                RootFieldTarget::Envelope(builder_index) => {
+                    present.adapter.apply(
+                        &mut envelope_builders[builder_index],
+                        Some(value),
+                        scratch,
+                        1,
+                    )?;
+                }
+                RootFieldTarget::Payload(builder_index) => {
+                    present.adapter.apply(
+                        &mut payload_builder.children[builder_index],
+                        Some(value),
+                        scratch,
+                        1,
+                    )?;
+                }
+            }
+        }
+
+        for missing in &self.envelope_missing {
+            missing.op.append_to(
+                &mut envelope_builders[missing.builder_index],
+                None,
+                scratch,
+                1,
+            )?;
+        }
+        for missing in &self.payload_missing {
+            missing.op.append_to(
+                &mut payload_builder.children[missing.builder_index],
+                None,
+                scratch,
+                1,
+            )?;
+        }
+
+        payload_builder.append(true);
+        root_builder.append(true);
+        Ok(())
+    }
+}
+
+impl CompiledNdjsonValueShapeAdapter {
+    fn apply(
+        &self,
+        builder: &mut NdjsonValueBuilder,
+        value: Option<&BorrowedValue<'_>>,
+        scratch: &mut NdjsonAppendScratch,
+        depth: usize,
+    ) -> Result<(), String> {
+        match self {
+            Self::Generic(op) => op.append_to(builder, value, scratch, depth),
+            Self::Struct(adapter) => adapter.apply(builder, value, scratch, depth),
+        }
+    }
+}
+
+impl CompiledNdjsonStructShapeAdapter {
+    fn apply(
+        &self,
+        builder: &mut NdjsonValueBuilder,
+        value: Option<&BorrowedValue<'_>>,
+        scratch: &mut NdjsonAppendScratch,
+        depth: usize,
+    ) -> Result<(), String> {
+        let builder = builder.as_struct_mut().ok_or_else(|| {
+            "compiled NDJSON struct shape adapter expected struct builder".to_string()
+        })?;
+
+        match value {
+            Some(value) if !value.is_null() => {
+                let object = value.as_object().ok_or_else(|| {
+                    format!(
+                        "expected object for Struct field, found {}",
+                        borrowed_json_kind(value)
+                    )
+                })?;
+                if object.len() != self.present.len() {
+                    return Err(
+                        "cached struct shape adapter does not match object shape".to_string()
+                    );
+                }
+
+                for ((_, child_value), present) in object.iter().zip(self.present.iter()) {
+                    present.adapter.apply(
+                        &mut builder.children[present.builder_index],
+                        Some(child_value),
+                        scratch,
+                        depth + 1,
+                    )?;
+                }
+                for missing in &self.missing {
+                    missing.op.append_to(
+                        &mut builder.children[missing.builder_index],
+                        None,
+                        scratch,
+                        depth + 1,
+                    )?;
+                }
+                builder.append(true);
+                Ok(())
+            }
+            _ => {
+                for present in &self.present {
+                    present.adapter.apply(
+                        &mut builder.children[present.builder_index],
+                        None,
+                        scratch,
+                        depth + 1,
+                    )?;
+                }
+                for missing in &self.missing {
+                    missing.op.append_to(
+                        &mut builder.children[missing.builder_index],
+                        None,
+                        scratch,
+                        depth + 1,
+                    )?;
+                }
+                builder.append(false);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1788,10 +2256,25 @@ impl NdjsonBatchBuilder {
             plan,
             root: NdjsonStructBuilder::from_fields(schema.fields().clone(), batch_rows),
             scratch: NdjsonAppendScratch::default(),
+            append_shape_cache: HashMap::new(),
         })
     }
 
     fn append_record(&mut self, record: &BorrowedValue<'_>) -> Result<(), String> {
+        let shape_signature = compute_execution_shape_signature(record);
+        if let Some(adapter) = self.append_shape_cache.get(&shape_signature) {
+            if adapter.can_apply(record) {
+                return adapter.apply(&self.plan, &mut self.root, record, &mut self.scratch);
+            }
+        }
+
+        if let Some(adapter) = self.plan.compile_record_shape_adapter(record)? {
+            let adapter = Arc::new(adapter);
+            let result = adapter.apply(&self.plan, &mut self.root, record, &mut self.scratch);
+            self.append_shape_cache.insert(shape_signature, adapter);
+            return result;
+        }
+
         self.plan
             .append_record(&mut self.root, record, &mut self.scratch)
     }
@@ -2369,6 +2852,181 @@ fn borrowed_json_kind(value: &BorrowedValue<'_>) -> &'static str {
     }
 }
 
+fn build_ndjson_sort_plan(
+    schema: &Schema,
+    options: &CompactionOptions,
+) -> Result<Option<NdjsonSortPlan>, String> {
+    let Some(sort_field) = options.sort_field.as_ref() else {
+        return Ok(None);
+    };
+
+    let field_index = schema
+        .index_of(sort_field)
+        .map_err(|_| format!("sort field `{sort_field}` is missing from the output schema"))?;
+    let field = schema.field(field_index);
+    let key_type = match field.data_type() {
+        DataType::Int64 => SortKeyType::Int64,
+        DataType::UInt64 => SortKeyType::UInt64,
+        DataType::Float64 => SortKeyType::Float64,
+        DataType::Utf8 => SortKeyType::Utf8,
+        DataType::LargeUtf8 => SortKeyType::LargeUtf8,
+        other => {
+            return Err(format!(
+                "sort field `{sort_field}` has unsupported type {other:?}; supported types are Int64, UInt64, Float64, Utf8, and LargeUtf8"
+            ));
+        }
+    };
+
+    Ok(Some(NdjsonSortPlan {
+        field_name: sort_field.clone(),
+        field_index,
+        key_type,
+    }))
+}
+
+fn ensure_sort_row_limit(row_count: usize, options: &CompactionOptions) -> Result<(), String> {
+    if row_count > options.sort_max_rows_in_memory {
+        return Err(format!(
+            "NDJSON sort requires buffering {row_count} rows, which exceeds sort_max_rows_in_memory={}; external spill sort is not implemented",
+            options.sort_max_rows_in_memory
+        ));
+    }
+    Ok(())
+}
+
+fn stable_sort_record_batch(
+    batch: &RecordBatch,
+    sort_plan: &NdjsonSortPlan,
+) -> Result<RecordBatch, String> {
+    let column = batch.column(sort_plan.field_index);
+    let mut indices = (0..batch.num_rows() as u32).collect::<Vec<_>>();
+
+    match sort_plan.key_type {
+        SortKeyType::Int64 => {
+            let array = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    format!(
+                        "sort field `{}` is not Int64 at runtime",
+                        sort_plan.field_name
+                    )
+                })?;
+            indices.sort_by(|left, right| {
+                compare_int64_values(array, *left as usize, *right as usize)
+            });
+        }
+        SortKeyType::UInt64 => {
+            let array = column
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    format!(
+                        "sort field `{}` is not UInt64 at runtime",
+                        sort_plan.field_name
+                    )
+                })?;
+            indices.sort_by(|left, right| {
+                compare_uint64_values(array, *left as usize, *right as usize)
+            });
+        }
+        SortKeyType::Float64 => {
+            let array = column
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    format!(
+                        "sort field `{}` is not Float64 at runtime",
+                        sort_plan.field_name
+                    )
+                })?;
+            indices.sort_by(|left, right| {
+                compare_float64_values(array, *left as usize, *right as usize)
+            });
+        }
+        SortKeyType::Utf8 => {
+            let array = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    format!(
+                        "sort field `{}` is not Utf8 at runtime",
+                        sort_plan.field_name
+                    )
+                })?;
+            indices.sort_by(|left, right| {
+                compare_string_values(array, *left as usize, *right as usize)
+            });
+        }
+        SortKeyType::LargeUtf8 => {
+            let array = column
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    format!(
+                        "sort field `{}` is not LargeUtf8 at runtime",
+                        sort_plan.field_name
+                    )
+                })?;
+            indices.sort_by(|left, right| {
+                compare_large_string_values(array, *left as usize, *right as usize)
+            });
+        }
+    }
+
+    let indices = UInt32Array::from(indices);
+    take_record_batch(batch, &indices).map_err(|error| {
+        format!(
+            "failed to apply stable sort permutation for `{}`: {error}",
+            sort_plan.field_name
+        )
+    })
+}
+
+fn compare_null_flags(left_null: bool, right_null: bool) -> Option<CmpOrdering> {
+    match (left_null, right_null) {
+        (true, true) => Some(CmpOrdering::Equal),
+        (true, false) => Some(CmpOrdering::Greater),
+        (false, true) => Some(CmpOrdering::Less),
+        (false, false) => None,
+    }
+}
+
+fn compare_int64_values(array: &Int64Array, left: usize, right: usize) -> CmpOrdering {
+    if let Some(ordering) = compare_null_flags(array.is_null(left), array.is_null(right)) {
+        return ordering;
+    }
+    array.value(left).cmp(&array.value(right))
+}
+
+fn compare_uint64_values(array: &UInt64Array, left: usize, right: usize) -> CmpOrdering {
+    if let Some(ordering) = compare_null_flags(array.is_null(left), array.is_null(right)) {
+        return ordering;
+    }
+    array.value(left).cmp(&array.value(right))
+}
+
+fn compare_float64_values(array: &Float64Array, left: usize, right: usize) -> CmpOrdering {
+    if let Some(ordering) = compare_null_flags(array.is_null(left), array.is_null(right)) {
+        return ordering;
+    }
+    array.value(left).total_cmp(&array.value(right))
+}
+
+fn compare_string_values(array: &StringArray, left: usize, right: usize) -> CmpOrdering {
+    if let Some(ordering) = compare_null_flags(array.is_null(left), array.is_null(right)) {
+        return ordering;
+    }
+    array.value(left).cmp(array.value(right))
+}
+
+fn compare_large_string_values(array: &LargeStringArray, left: usize, right: usize) -> CmpOrdering {
+    if let Some(ordering) = compare_null_flags(array.is_null(left), array.is_null(right)) {
+        return ordering;
+    }
+    array.value(left).cmp(array.value(right))
+}
+
 fn merge_payload_schemas_many<'a, I>(
     schemas: I,
     options: &PayloadMergeOptions,
@@ -2491,6 +3149,9 @@ fn validate_compaction_options(options: &CompactionOptions) -> Result<(), String
     if options.batch_rows == 0 {
         return Err("batch_rows must be greater than zero".to_string());
     }
+    if options.sort_max_rows_in_memory == 0 {
+        return Err("sort_max_rows_in_memory must be greater than zero".to_string());
+    }
 
     let mut seen = BTreeSet::new();
     for field in &options.envelope_fields {
@@ -2502,6 +3163,21 @@ fn validate_compaction_options(options: &CompactionOptions) -> Result<(), String
         }
         if !seen.insert(field.clone()) {
             return Err(format!("duplicate envelope field `{field}`"));
+        }
+    }
+
+    if let Some(sort_field) = options.sort_field.as_ref() {
+        if sort_field.trim().is_empty() {
+            return Err("sort_field must not be empty when provided".to_string());
+        }
+        if !options
+            .envelope_fields
+            .iter()
+            .any(|field| field == sort_field)
+        {
+            return Err(format!(
+                "sort_field `{sort_field}` must also be listed in envelope_fields"
+            ));
         }
     }
 
@@ -2622,12 +3298,24 @@ mod tests {
             batch_rows: 2,
             scan_parallelism: Some(1),
             read_buffer_bytes: 1 << 20,
+            sort_field: None,
+            sort_max_rows_in_memory: 262_144,
         }
     }
 
     fn compaction_options_with_parallelism(parallelism: usize) -> CompactionOptions {
         let mut options = compaction_options();
         options.scan_parallelism = Some(parallelism);
+        options
+    }
+
+    fn compaction_options_with_sort(
+        sort_field: &str,
+        sort_max_rows_in_memory: usize,
+    ) -> CompactionOptions {
+        let mut options = compaction_options();
+        options.sort_field = Some(sort_field.to_string());
+        options.sort_max_rows_in_memory = sort_max_rows_in_memory;
         options
     }
 
@@ -3208,6 +3896,101 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn compiled_ndjson_plan_reuses_shape_cache_for_repeated_records() -> Result<(), Box<dyn Error>>
+    {
+        let payload_fields: Fields = vec![
+            Arc::new(Field::new("score", DataType::Float64, true)),
+            Arc::new(Field::new(
+                "profile",
+                DataType::Struct(vec![Arc::new(Field::new("name", DataType::Utf8, true))].into()),
+                true,
+            )),
+        ]
+        .into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int64, true),
+            Field::new("org_id", DataType::Int64, true),
+            Field::new("payload", DataType::Struct(payload_fields), true),
+        ]));
+        let plan = CompiledNdjsonPlan::compile(schema.as_ref(), &compaction_options())?;
+        let mut batch_builder = NdjsonBatchBuilder::new(schema, plan, 8)?;
+
+        let mut first_line =
+            br#"{"event_id":1,"org_id":10,"score":1,"profile":{"name":"Alice"}}"#.to_vec();
+        let mut first_buffers = Buffers::default();
+        let first_value =
+            to_borrowed_value_with_buffers(first_line.as_mut_slice(), &mut first_buffers)?;
+        batch_builder.append_record(&first_value)?;
+
+        let mut second_line =
+            br#"{"event_id":2,"org_id":20,"score":2,"profile":{"name":"Bob"}}"#.to_vec();
+        let mut second_buffers = Buffers::default();
+        let second_value =
+            to_borrowed_value_with_buffers(second_line.as_mut_slice(), &mut second_buffers)?;
+        batch_builder.append_record(&second_value)?;
+
+        assert_eq!(batch_builder.append_shape_cache.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn discover_ndjson_schema_rejects_sort_field_outside_envelope() -> Result<(), Box<dyn Error>> {
+        let path = unique_path("discover_sort_field_validation", "ndjson");
+        write_ndjson(
+            &path,
+            &[json!({
+                "event_id": 1,
+                "org_id": 10,
+                "event_time": "2026-04-13T00:00:00Z",
+                "score": 1
+            })],
+        )?;
+
+        let error = discover_ndjson_schema_from_paths(
+            &[path.clone()],
+            &CompactionOptions {
+                sort_field: Some("event_time".to_string()),
+                ..compaction_options()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("sort_field `event_time` must also be listed in envelope_fields"));
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn discover_ndjson_schema_rejects_zero_sort_buffer() -> Result<(), Box<dyn Error>> {
+        let path = unique_path("discover_sort_buffer_validation", "ndjson");
+        write_ndjson(
+            &path,
+            &[json!({
+                "event_id": 1,
+                "org_id": 10,
+                "score": 1
+            })],
+        )?;
+
+        let error = discover_ndjson_schema_from_paths(
+            &[path.clone()],
+            &CompactionOptions {
+                sort_max_rows_in_memory: 0,
+                ..compaction_options()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("sort_max_rows_in_memory must be greater than zero"));
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn compact_ndjson_to_parquet_writes_union_payload_schema() -> Result<(), Box<dyn Error>> {
         let left_path = unique_path("compact_left", "ndjson");
@@ -3299,6 +4082,198 @@ mod tests {
         let _ = tokio::fs::remove_file(left_path).await;
         let _ = tokio::fs::remove_file(right_path).await;
         let _ = tokio::fs::remove_file(output_path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_ndjson_to_parquet_sorts_numeric_field_stably_with_nulls_last()
+    -> Result<(), Box<dyn Error>> {
+        let input_path = unique_path("compact_sort_numeric", "ndjson");
+        let output_path = unique_path("compact_sort_numeric_output", "parquet");
+        write_ndjson(
+            &input_path,
+            &[
+                json!({ "event_id": 2, "org_id": 10, "score": 20 }),
+                json!({ "event_id": null, "org_id": 11, "score": 99 }),
+                json!({ "event_id": 1, "org_id": 12, "score": 10 }),
+                json!({ "event_id": 1, "org_id": 13, "score": 11 }),
+            ],
+        )?;
+
+        let report = compact_ndjson_to_parquet(
+            &[input_path.clone()],
+            &output_path,
+            &compaction_options_with_sort("event_id", 16),
+        )
+        .await?;
+        assert_eq!(report.rows, 4);
+        assert!(report.sorting_duration <= report.total_duration);
+
+        let batches = read_parquet_batches(&output_path).await?;
+        let batch = batches.first().expect("sorted parquet has a batch");
+        let event_ids = batch
+            .column(batch.schema().index_of("event_id")?)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("event_id is Int64");
+        let org_ids = batch
+            .column(batch.schema().index_of("org_id")?)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("org_id is Int64");
+        assert_eq!(event_ids.value(0), 1);
+        assert_eq!(event_ids.value(1), 1);
+        assert_eq!(event_ids.value(2), 2);
+        assert!(event_ids.is_null(3));
+        assert_eq!(org_ids.value(0), 12);
+        assert_eq!(org_ids.value(1), 13);
+
+        let _ = tokio::fs::remove_file(input_path).await;
+        let _ = tokio::fs::remove_file(output_path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_ndjson_to_parquet_sorts_string_field_and_is_file_order_independent()
+    -> Result<(), Box<dyn Error>> {
+        let left_path = unique_path("compact_sort_string_left", "ndjson");
+        let right_path = unique_path("compact_sort_string_right", "ndjson");
+        let forward_output = unique_path("compact_sort_string_forward", "parquet");
+        let reverse_output = unique_path("compact_sort_string_reverse", "parquet");
+        write_ndjson(
+            &left_path,
+            &[
+                json!({ "event_time": "2026-04-13T01:00:00Z", "org_id": 10, "score": 1 }),
+                json!({ "event_time": "2026-04-13T03:00:00Z", "org_id": 11, "score": 3 }),
+            ],
+        )?;
+        write_ndjson(
+            &right_path,
+            &[
+                json!({ "event_time": "2026-04-13T00:00:00Z", "org_id": 20, "score": 0 }),
+                json!({ "event_time": null, "org_id": 21, "score": 9 }),
+            ],
+        )?;
+
+        let sort_options = CompactionOptions {
+            envelope_fields: vec!["event_time".to_string(), "org_id".to_string()],
+            sort_field: Some("event_time".to_string()),
+            ..compaction_options()
+        };
+
+        compact_ndjson_to_parquet(
+            &[left_path.clone(), right_path.clone()],
+            &forward_output,
+            &sort_options,
+        )
+        .await?;
+        compact_ndjson_to_parquet(
+            &[right_path.clone(), left_path.clone()],
+            &reverse_output,
+            &sort_options,
+        )
+        .await?;
+
+        let forward_batches = read_parquet_batches(&forward_output).await?;
+        let reverse_batches = read_parquet_batches(&reverse_output).await?;
+        let forward = forward_batches.first().expect("forward output has a batch");
+        let reverse = reverse_batches.first().expect("reverse output has a batch");
+
+        let forward_times = forward
+            .column(forward.schema().index_of("event_time")?)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("event_time is Utf8");
+        let reverse_times = reverse
+            .column(reverse.schema().index_of("event_time")?)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("event_time is Utf8");
+        let forward_org_ids = forward
+            .column(forward.schema().index_of("org_id")?)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("org_id is Int64");
+        let reverse_org_ids = reverse
+            .column(reverse.schema().index_of("org_id")?)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("org_id is Int64");
+
+        assert_eq!(forward_times.value(0), "2026-04-13T00:00:00Z");
+        assert_eq!(forward_times.value(1), "2026-04-13T01:00:00Z");
+        assert_eq!(forward_times.value(2), "2026-04-13T03:00:00Z");
+        assert!(forward_times.is_null(3));
+        assert_eq!(
+            forward_org_ids.iter().collect::<Vec<_>>(),
+            reverse_org_ids.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(forward_times.value(0), reverse_times.value(0));
+        assert_eq!(forward_times.value(1), reverse_times.value(1));
+        assert_eq!(forward_times.value(2), reverse_times.value(2));
+        assert!(reverse_times.is_null(3));
+
+        let _ = tokio::fs::remove_file(left_path).await;
+        let _ = tokio::fs::remove_file(right_path).await;
+        let _ = tokio::fs::remove_file(forward_output).await;
+        let _ = tokio::fs::remove_file(reverse_output).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_ndjson_to_parquet_rejects_unsupported_sort_type() -> Result<(), Box<dyn Error>>
+    {
+        let input_path = unique_path("compact_sort_boolean", "ndjson");
+        let output_path = unique_path("compact_sort_boolean_output", "parquet");
+        write_ndjson(
+            &input_path,
+            &[json!({ "is_active": true, "org_id": 10, "score": 1 })],
+        )?;
+
+        let error = compact_ndjson_to_parquet(
+            &[input_path.clone()],
+            &output_path,
+            &CompactionOptions {
+                envelope_fields: vec!["is_active".to_string(), "org_id".to_string()],
+                sort_field: Some("is_active".to_string()),
+                ..compaction_options()
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("unsupported type Boolean"));
+
+        let _ = tokio::fs::remove_file(input_path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_ndjson_to_parquet_rejects_sort_jobs_above_memory_cap()
+    -> Result<(), Box<dyn Error>> {
+        let input_path = unique_path("compact_sort_cap", "ndjson");
+        let output_path = unique_path("compact_sort_cap_output", "parquet");
+        write_ndjson(
+            &input_path,
+            &[
+                json!({ "event_id": 2, "org_id": 10, "score": 20 }),
+                json!({ "event_id": 1, "org_id": 11, "score": 10 }),
+            ],
+        )?;
+
+        let error = compact_ndjson_to_parquet(
+            &[input_path.clone()],
+            &output_path,
+            &compaction_options_with_sort("event_id", 1),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("external spill sort is not implemented"));
+
+        let _ = tokio::fs::remove_file(input_path).await;
         Ok(())
     }
 
