@@ -57,6 +57,14 @@ The payload path now uses a compiled compaction engine instead of rebuilding nam
 - execution streams batches through cached adapters with an identical-schema fast path
 - nested `Struct` and `List` coercion uses precomputed child indices instead of repeated string lookups
 
+It also now supports an ordered Parquet merge path:
+
+- `merge_payload_parquet_files_with_execution(...)` accepts `ParquetMergeExecutionOptions`
+- ordered mode performs a true k-way merge over inputs already sorted by one top-level envelope column
+- output ordering is ascending with `NULLS LAST` and stable tie-breaking by input-file order
+- supported ordered-merge key types are `Int64`, `UInt64`, `Float64`, `Utf8`, `LargeUtf8`, `Date32`, `Date64`, and `Timestamp(_, _)`
+- ordered mode validates that each input file is itself sorted on the chosen envelope column
+
 The same engine also powers a two-pass NDJSON compaction flow:
 
 - pass 1 discovers the exact typed payload union schema across all NDJSON inputs
@@ -93,3 +101,15 @@ It reports:
 - planning time, execution time, sorting time, rows/sec, input MB/sec, and peak RSS
 - planning threads used, unique shapes discovered, and shape-cache hit/miss counts
 - peak RSS is process high-water mark, so later benchmark lines reflect the highest peak reached anywhere in the run
+
+Run the dedicated Parquet merge benchmark with:
+
+`cargo run --release --example parquet_merge_benchmark`
+
+It reports:
+
+- unordered payload merge baseline throughput
+- ordered k-way merge throughput for identical-schema and alternating-schema payload inputs
+- ordered merge throughput for a few huge files with many row groups
+- ordered merge throughput for many smaller sorted files
+- planning time, execution time, ordered-merge time, rows/sec, input MB/sec, input/output batch counts, adapter cache hits/misses, and peak RSS

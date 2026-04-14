@@ -10,8 +10,9 @@ use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 
 pub use compaction::{
     CompactionOptions, CompactionReport, CompiledPayloadPlan, CompiledSourceAdapter,
-    ExecutionScratch, build_compiled_payload_plan, compact_ndjson_to_parquet,
-    discover_ndjson_schema_from_paths, merge_payload_parquet_files,
+    ExecutionScratch, ParquetMergeExecutionOptions, build_compiled_payload_plan,
+    compact_ndjson_to_parquet, discover_ndjson_schema_from_paths, merge_payload_parquet_files,
+    merge_payload_parquet_files_with_execution,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -42,3 +42,7 @@ path = "examples/async_streaming_merge_payload.rs"
 [[example]]
 name = "payload_benchmark"
 path = "examples/payload_benchmark.rs"
+
+[[example]]
+name = "parquet_merge_benchmark"
+path = "examples/parquet_merge_benchmark.rs"
