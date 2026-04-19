@@ -113,3 +113,22 @@ It reports:
 - ordered merge throughput for a few huge files with many row groups
 - ordered merge throughput for many smaller sorted files
 - planning time, execution time, ordered-merge time, rows/sec, input MB/sec, input/output batch counts, adapter cache hits/misses, and peak RSS
+
+Run the Rust-vs-DuckDB comparison benchmark with:
+
+`cargo run --release --example rust_vs_duckdb_benchmark`
+
+It reports:
+
+- one strict top-level merge workload using the new top-level merge path
+- one nested payload merge workload using the payload-aware merge path
+- side-by-side Rust and DuckDB timings for the exact same Parquet inputs
+- row-count and merged-schema validation before timings are accepted
+- a JSON summary written into the benchmark artifact directory
+
+Observed in one local `--release` run on April 19, 2026 on an M3 Max MBP:
+
+- `top_level_pragmatic`: Rust `14 ms`, DuckDB `30 ms`
+- `nested_payload_pragmatic`: Rust `31 ms`, DuckDB `45 ms`
+
+Important: the comparison should be run in `--release`. A debug-mode `cargo run` makes the Rust merge path look artificially slow and is not a fair comparison against the optimized DuckDB CLI binary.

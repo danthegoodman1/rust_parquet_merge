@@ -46,3 +46,7 @@ path = "examples/payload_benchmark.rs"
 [[example]]
 name = "parquet_merge_benchmark"
 path = "examples/parquet_merge_benchmark.rs"
+
+[[example]]
+name = "rust_vs_duckdb_benchmark"
+path = "examples/rust_vs_duckdb_benchmark.rs"

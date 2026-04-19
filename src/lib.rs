@@ -12,7 +12,7 @@ pub use compaction::{
     CompactionOptions, CompactionReport, CompiledPayloadPlan, CompiledSourceAdapter,
     ExecutionScratch, ParquetMergeExecutionOptions, build_compiled_payload_plan,
     compact_ndjson_to_parquet, discover_ndjson_schema_from_paths, merge_payload_parquet_files,
-    merge_payload_parquet_files_with_execution,
+    merge_payload_parquet_files_with_execution, merge_top_level_parquet_files,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +58,11 @@ impl Default for PayloadMergeOptions {
             widening_options: WideningOptions::default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TopLevelMergeOptions {
+    pub numeric_mode: NumericWideningMode,
 }
 
 fn to_parquet_error(message: impl Into<String>) -> parquet::errors::ParquetError {
@@ -624,6 +629,112 @@ fn merge_payload_schemas_pair(
     }
 }
 
+fn top_level_widening_options(options: &TopLevelMergeOptions) -> WideningOptions {
+    WideningOptions {
+        numeric_mode: options.numeric_mode,
+        string_mode: StringFallbackMode::StrictTyped,
+    }
+}
+
+fn merge_top_level_field(
+    left: &Field,
+    right: &Field,
+    options: &TopLevelMergeOptions,
+    conflicts: &mut Vec<String>,
+) -> Field {
+    let data_type = if left.data_type() == right.data_type() {
+        left.data_type().clone()
+    } else {
+        match widen_primitive_or_string(
+            left.data_type(),
+            right.data_type(),
+            &top_level_widening_options(options),
+        ) {
+            Some(widened) => widened,
+            None => {
+                push_conflict(conflicts, left.name(), left.data_type(), right.data_type());
+                left.data_type().clone()
+            }
+        }
+    };
+
+    let nullable = left.is_nullable() || right.is_nullable();
+    make_merged_field(left, right, data_type, nullable, left.name(), conflicts)
+}
+
+fn merge_top_level_schemas_pair(
+    left: &Schema,
+    right: &Schema,
+    options: &TopLevelMergeOptions,
+) -> Result<Schema, String> {
+    let right_by_name: HashMap<&str, &FieldRef> = right
+        .fields()
+        .iter()
+        .map(|field| (field.name().as_str(), field))
+        .collect();
+    let left_names: BTreeSet<&str> = left
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect();
+
+    let mut merged_fields: Vec<FieldRef> = Vec::new();
+    let mut conflicts = Vec::new();
+
+    for left_field in left.fields() {
+        if let Some(right_field) = right_by_name.get(left_field.name().as_str()) {
+            merged_fields.push(Arc::new(merge_top_level_field(
+                left_field,
+                right_field,
+                options,
+                &mut conflicts,
+            )));
+        } else {
+            merged_fields.push(Arc::new(make_nullable(left_field, true)));
+        }
+    }
+
+    for right_field in right.fields() {
+        if !left_names.contains(right_field.name().as_str()) {
+            merged_fields.push(Arc::new(make_nullable(right_field, true)));
+        }
+    }
+
+    if conflicts.is_empty() {
+        Ok(Schema::new(merged_fields))
+    } else {
+        Err(format_conflicts(&conflicts))
+    }
+}
+
+pub(crate) fn merge_top_level_schemas_many<'a, I>(
+    schemas: I,
+    options: &TopLevelMergeOptions,
+) -> Result<Schema, String>
+where
+    I: IntoIterator<Item = &'a Schema>,
+{
+    let mut schemas = schemas.into_iter();
+    let first = schemas
+        .next()
+        .ok_or_else(|| "at least one schema is required to build a top-level plan".to_string())?;
+    let mut merged = first.clone();
+
+    for schema in schemas {
+        merged = merge_top_level_schemas_pair(&merged, schema, options)?;
+    }
+
+    Ok(merged)
+}
+
+pub fn merge_top_level_schemas(
+    left: &Schema,
+    right: &Schema,
+    options: &TopLevelMergeOptions,
+) -> Result<Schema, String> {
+    merge_top_level_schemas_pair(left, right, options)
+}
+
 pub fn merge_payload_schemas(
     left: &Schema,
     right: &Schema,
@@ -1089,6 +1200,54 @@ mod tests {
         PayloadMergeOptions::default()
     }
 
+    fn top_level_pragmatic_options() -> TopLevelMergeOptions {
+        TopLevelMergeOptions::default()
+    }
+
+    fn top_level_exact_safe_options() -> TopLevelMergeOptions {
+        TopLevelMergeOptions {
+            numeric_mode: NumericWideningMode::ExactSafe,
+        }
+    }
+
+    fn top_level_sample_inputs() -> (SchemaRef, RecordBatch, SchemaRef, RecordBatch) {
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int32, false),
+            Field::new("score", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("alice"),
+                    Some("bob"),
+                    Some("carol"),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("score", DataType::Float64, true),
+            Field::new("event_id", DataType::Int32, false),
+            Field::new("age", DataType::Int32, true),
+        ]));
+        let right_batch = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(vec![Some(44.5), Some(8.25)])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![4, 5])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(40), None])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        (left_schema, left_batch, right_schema, right_batch)
+    }
+
     fn assert_close(left: f64, right: f64) {
         let delta = (left - right).abs();
         assert!(delta < 1e-9, "{left} != {right} (delta={delta})");
@@ -1521,6 +1680,147 @@ mod tests {
     }
 
     #[test]
+    fn top_level_merge_allows_added_removed_columns_and_null_fills() {
+        let (left_schema, _, right_schema, _) = top_level_sample_inputs();
+        let merged = merge_top_level_schemas(
+            left_schema.as_ref(),
+            right_schema.as_ref(),
+            &top_level_pragmatic_options(),
+        )
+        .unwrap();
+
+        assert_eq!(merged.fields()[0].name(), "event_id");
+        assert_eq!(merged.fields()[1].name(), "score");
+        assert_eq!(merged.fields()[2].name(), "name");
+        assert_eq!(merged.fields()[3].name(), "age");
+        assert_eq!(
+            merged.field_with_name("score").unwrap().data_type(),
+            &DataType::Float64
+        );
+        assert!(merged.field_with_name("name").unwrap().is_nullable());
+        assert!(merged.field_with_name("age").unwrap().is_nullable());
+    }
+
+    #[test]
+    fn top_level_merge_exact_safe_allows_lossless_numeric_widening() {
+        let left = Schema::new(vec![Field::new("value", DataType::Int32, true)]);
+        let right = Schema::new(vec![Field::new("value", DataType::UInt8, true)]);
+
+        let merged =
+            merge_top_level_schemas(&left, &right, &top_level_exact_safe_options()).unwrap();
+        assert_eq!(
+            merged.field_with_name("value").unwrap().data_type(),
+            &DataType::Int32
+        );
+    }
+
+    #[test]
+    fn top_level_merge_exact_safe_rejects_int_and_float_drift() {
+        let left = Schema::new(vec![Field::new("value", DataType::Int32, true)]);
+        let right = Schema::new(vec![Field::new("value", DataType::Float32, true)]);
+
+        let error =
+            merge_top_level_schemas(&left, &right, &top_level_exact_safe_options()).unwrap_err();
+        assert!(error.contains("field `value`"));
+        assert!(error.contains("Int32"));
+        assert!(error.contains("Float32"));
+    }
+
+    #[test]
+    fn top_level_merge_pragmatic_promotes_numeric_columns() {
+        let left = Schema::new(vec![Field::new("value", DataType::Int32, true)]);
+        let right = Schema::new(vec![Field::new("value", DataType::Float32, true)]);
+
+        let merged =
+            merge_top_level_schemas(&left, &right, &top_level_pragmatic_options()).unwrap();
+        assert_eq!(
+            merged.field_with_name("value").unwrap().data_type(),
+            &DataType::Float64
+        );
+    }
+
+    #[test]
+    fn top_level_merge_widens_utf8_to_large_utf8() {
+        let left = Schema::new(vec![Field::new("value", DataType::Utf8, true)]);
+        let right = Schema::new(vec![Field::new("value", DataType::LargeUtf8, true)]);
+
+        let merged =
+            merge_top_level_schemas(&left, &right, &top_level_pragmatic_options()).unwrap();
+        assert_eq!(
+            merged.field_with_name("value").unwrap().data_type(),
+            &DataType::LargeUtf8
+        );
+    }
+
+    #[test]
+    fn top_level_merge_rejects_incompatible_primitive_drift() {
+        let left = Schema::new(vec![Field::new("value", DataType::Int32, true)]);
+        let right = Schema::new(vec![Field::new("value", DataType::Utf8, true)]);
+
+        let error =
+            merge_top_level_schemas(&left, &right, &top_level_pragmatic_options()).unwrap_err();
+        assert!(error.contains("field `value`"));
+        assert!(error.contains("Int32"));
+        assert!(error.contains("Utf8"));
+    }
+
+    #[test]
+    fn top_level_merge_rejects_nested_drift() {
+        let left = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(vec![Arc::new(Field::new("score", DataType::Int32, true))].into()),
+            true,
+        )]);
+        let right = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(vec![Arc::new(Field::new("score", DataType::Float64, true))].into()),
+            true,
+        )]);
+
+        let error =
+            merge_top_level_schemas(&left, &right, &top_level_pragmatic_options()).unwrap_err();
+        assert!(error.contains("field `payload`"));
+        assert!(error.contains("Struct"));
+    }
+
+    #[test]
+    fn top_level_merge_preserves_one_sided_metadata() {
+        let left = Schema::new(vec![
+            Field::new("value", DataType::Int32, true)
+                .with_metadata(HashMap::from([("unit".to_string(), "ms".to_string())])),
+        ]);
+        let right = Schema::new(vec![Field::new("value", DataType::Int32, true)]);
+
+        let merged =
+            merge_top_level_schemas(&left, &right, &top_level_pragmatic_options()).unwrap();
+        assert_eq!(
+            merged
+                .field_with_name("value")
+                .unwrap()
+                .metadata()
+                .get("unit"),
+            Some(&"ms".to_string())
+        );
+    }
+
+    #[test]
+    fn top_level_merge_reports_conflicting_metadata() {
+        let left = Schema::new(vec![
+            Field::new("value", DataType::Int32, true)
+                .with_metadata(HashMap::from([("unit".to_string(), "ms".to_string())])),
+        ]);
+        let right = Schema::new(vec![
+            Field::new("value", DataType::Int32, true)
+                .with_metadata(HashMap::from([("unit".to_string(), "s".to_string())])),
+        ]);
+
+        let error =
+            merge_top_level_schemas(&left, &right, &top_level_pragmatic_options()).unwrap_err();
+        assert!(error.contains("field `value`"));
+        assert!(error.contains("metadata"));
+    }
+
+    #[test]
     fn payload_merge_allows_matching_envelope_columns_with_order_differences() {
         let (left_schema, _, right_schema, _) = payload_sample_inputs();
         let merged = merge_payload_schemas(
@@ -1761,6 +2061,84 @@ mod tests {
         let _ = tokio::fs::remove_file(&left_path).await;
         let _ = tokio::fs::remove_file(&right_path).await;
         let _ = tokio::fs::remove_file(&output_path).await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn top_level_merge_end_to_end_writes_typed_merged_output() -> Result<(), Box<dyn Error>> {
+        let (left_schema, left_batch, right_schema, right_batch) = top_level_sample_inputs();
+        let repeat_batch = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![6, 7])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(11), Some(12)])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("dave"), Some("erin")])) as ArrayRef,
+            ],
+        )?;
+
+        let left_path = unique_parquet_path("top_level_left");
+        let right_path = unique_parquet_path("top_level_right");
+        let repeat_path = unique_parquet_path("top_level_repeat");
+        let output_path = unique_parquet_path("top_level_merged");
+
+        create_sample_file(&left_path, left_schema.clone(), left_batch).await?;
+        create_sample_file(&right_path, right_schema.clone(), right_batch).await?;
+        create_sample_file(&repeat_path, left_schema.clone(), repeat_batch).await?;
+
+        let report = merge_top_level_parquet_files(
+            &[left_path.clone(), right_path.clone(), repeat_path.clone()],
+            &output_path,
+            &top_level_pragmatic_options(),
+        )
+        .await?;
+
+        assert_eq!(report.adapter_cache_hits, 1);
+        assert_eq!(report.adapter_cache_misses, 2);
+
+        let merged_batches = read_parquet_batches(&output_path).await?;
+        assert!(!merged_batches.is_empty());
+        let merged_schema = merged_batches[0].schema();
+        let merged_batch = arrow::compute::concat_batches(&merged_schema, &merged_batches)?;
+        assert_eq!(merged_batch.num_rows(), 7);
+
+        assert_eq!(merged_schema.field(0).name(), "event_id");
+        assert_eq!(merged_schema.field(1).name(), "score");
+        assert_eq!(merged_schema.field(2).name(), "name");
+        assert_eq!(merged_schema.field(3).name(), "age");
+        assert_eq!(merged_schema.field(1).data_type(), &DataType::Float64);
+
+        let merged_score = merged_batch
+            .column(merged_schema.index_of("score")?)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("merged score column should be a Float64Array");
+        assert_close(merged_score.value(0), 10.0);
+        assert!(merged_score.is_null(1));
+        assert_close(merged_score.value(2), 30.0);
+        assert_close(merged_score.value(3), 44.5);
+        assert_close(merged_score.value(4), 8.25);
+
+        let merged_name = merged_batch
+            .column(merged_schema.index_of("name")?)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("merged name column should be a StringArray");
+        assert_eq!(merged_name.value(0), "alice");
+        assert!(merged_name.is_null(3));
+        assert!(merged_name.is_null(4));
+        assert_eq!(merged_name.value(5), "dave");
+        assert_eq!(merged_name.value(6), "erin");
+
+        let merged_age = merged_batch
+            .column(merged_schema.index_of("age")?)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("merged age column should be an Int32Array");
+        assert!(merged_age.is_null(0));
+        assert!(merged_age.is_null(2));
+        assert_eq!(merged_age.value(3), 40);
+        assert!(merged_age.is_null(4));
 
         Ok(())
     }

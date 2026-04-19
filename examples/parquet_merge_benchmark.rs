@@ -238,8 +238,14 @@ fn print_report(label: &str, report: &CompactionReport) {
     let seconds = report.total_duration.as_secs_f64().max(f64::EPSILON);
     let rows_per_second = report.rows as f64 / seconds;
     let mb_per_second = report.input_bytes as f64 / 1_000_000.0 / seconds;
+    let total_batch_segments = report.fast_path_batches + report.fallback_batches;
+    let fast_path_hit_rate = if total_batch_segments == 0 {
+        0.0
+    } else {
+        report.fast_path_batches as f64 / total_batch_segments as f64 * 100.0
+    };
     println!(
-        "{label}: rows={}, input={:.2} MB, output={:.2} MB, total={:?}, planning={:?}, exec={:?}, ordered_merge={:?}, rows/sec={:.0}, input MB/sec={:.2}, input_batches={}, output_batches={}, adapter_cache_hits={}, adapter_cache_misses={}, peak RSS={:.2} MB",
+        "{label}: rows={}, input={:.2} MB, output={:.2} MB, total={:?}, planning={:?}, exec={:?}, ordered_merge={:?}, stats_fast_path={:?}, rows/sec={:.0}, input MB/sec={:.2}, input_batches={}, output_batches={}, adapter_cache_hits={}, adapter_cache_misses={}, fast_path_row_groups={}, fast_path_batches={}, fallback_batches={}, fast_path_hit_rate={:.1}%, peak RSS={:.2} MB",
         report.rows,
         report.input_bytes as f64 / 1_000_000.0,
         report.output_bytes as f64 / 1_000_000.0,
@@ -247,12 +253,17 @@ fn print_report(label: &str, report: &CompactionReport) {
         report.planning_duration,
         report.execution_duration,
         report.ordered_merge_duration,
+        report.stats_fast_path_duration,
         rows_per_second,
         mb_per_second,
         report.input_batches,
         report.output_batches,
         report.adapter_cache_hits,
         report.adapter_cache_misses,
+        report.fast_path_row_groups,
+        report.fast_path_batches,
+        report.fallback_batches,
+        fast_path_hit_rate,
         report.peak_rss_bytes as f64 / 1_000_000.0,
     );
 }
@@ -275,6 +286,114 @@ async fn write_input_family(
             file_index as i64,
             event_step,
             10_000 + ((file_index as i64) * 100),
+        );
+        let path = benchmark_dir.join(format!("{prefix}_{file_index}.parquet"));
+        write_parquet_file(&path, schema, batch, input_row_group_rows).await?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+async fn write_non_overlapping_input_family(
+    benchmark_dir: &Path,
+    prefix: &str,
+    file_count: usize,
+    rows_per_file: usize,
+    input_row_group_rows: usize,
+    family_for_index: impl Fn(usize) -> SchemaFamily,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut paths = Vec::with_capacity(file_count);
+    for file_index in 0..file_count {
+        let family = family_for_index(file_index);
+        let (schema, batch) = payload_batch(
+            family,
+            rows_per_file,
+            (file_index * rows_per_file) as i64,
+            1,
+            20_000 + ((file_index as i64) * 100),
+        );
+        let path = benchmark_dir.join(format!("{prefix}_{file_index}.parquet"));
+        write_parquet_file(&path, schema, batch, input_row_group_rows).await?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+async fn write_partially_overlapping_input_family(
+    benchmark_dir: &Path,
+    prefix: &str,
+    file_count: usize,
+    rows_per_file: usize,
+    input_row_group_rows: usize,
+    family_for_index: impl Fn(usize) -> SchemaFamily,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut paths = Vec::with_capacity(file_count);
+    let overlap_stride = (rows_per_file / 2).max(1) as i64;
+    for file_index in 0..file_count {
+        let family = family_for_index(file_index);
+        let (schema, batch) = payload_batch(
+            family,
+            rows_per_file,
+            file_index as i64 * overlap_stride,
+            1,
+            30_000 + ((file_index as i64) * 100),
+        );
+        let path = benchmark_dir.join(format!("{prefix}_{file_index}.parquet"));
+        write_parquet_file(&path, schema, batch, input_row_group_rows).await?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+fn string_key_batch(rows: usize, start_hour: usize, org_base: i64) -> (SchemaRef, RecordBatch) {
+    let payload_fields: Fields = vec![Arc::new(Field::new("score", DataType::Int32, true))].into();
+    let payload = Arc::new(StructArray::new(
+        payload_fields.clone(),
+        vec![Arc::new(Int32Array::from(
+            (0..rows)
+                .map(|index| Some(index as i32))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef],
+        None,
+    )) as ArrayRef;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("event_time", DataType::Utf8, false),
+        Field::new("org_id", DataType::Int64, false),
+        Field::new("payload", DataType::Struct(payload_fields), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                (0..rows)
+                    .map(|index| Some(format!("ts-{:08}", start_hour + index)))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Int64Array::from(
+                (0..rows)
+                    .map(|index| org_base + index as i64)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            payload,
+        ],
+    )
+    .unwrap();
+    (schema, batch)
+}
+
+async fn write_string_key_inputs(
+    benchmark_dir: &Path,
+    prefix: &str,
+    file_count: usize,
+    rows_per_file: usize,
+    input_row_group_rows: usize,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut paths = Vec::with_capacity(file_count);
+    for file_index in 0..file_count {
+        let (schema, batch) = string_key_batch(
+            rows_per_file,
+            file_index * rows_per_file,
+            40_000 + ((file_index as i64) * 100),
         );
         let path = benchmark_dir.join(format!("{prefix}_{file_index}.parquet"));
         write_parquet_file(&path, schema, batch, input_row_group_rows).await?;
@@ -317,14 +436,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ordered_identical_inputs = write_input_family(
         &benchmark_dir,
-        "ordered_identical",
+        "ordered_fully_overlapping",
         4,
         40_000,
         16_384,
         |_| SchemaFamily::Left,
     )
     .await?;
-    let ordered_identical_output = benchmark_dir.join("ordered_identical_output.parquet");
+    let ordered_identical_output = benchmark_dir.join("ordered_fully_overlapping_output.parquet");
     let ordered_identical_report = merge_payload_parquet_files_with_execution(
         &ordered_identical_inputs,
         &ordered_identical_output,
@@ -333,7 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     print_report(
-        "Ordered Merge (Identical Schemas)",
+        "Ordered Merge (Fully Overlapping Baseline)",
         &ordered_identical_report,
     );
 
@@ -365,24 +484,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &ordered_alternating_report,
     );
 
-    let huge_sorted_inputs =
-        write_input_family(&benchmark_dir, "ordered_huge", 4, 120_000, 8_192, |index| {
+    let partial_overlap_inputs = write_partially_overlapping_input_family(
+        &benchmark_dir,
+        "ordered_partial_overlap",
+        4,
+        80_000,
+        8_192,
+        |index| {
             if index % 2 == 0 {
                 SchemaFamily::Left
             } else {
                 SchemaFamily::Right
             }
-        })
-        .await?;
-    let huge_sorted_output = benchmark_dir.join("ordered_huge_output.parquet");
-    let huge_sorted_report = merge_payload_parquet_files_with_execution(
-        &huge_sorted_inputs,
-        &huge_sorted_output,
+        },
+    )
+    .await?;
+    let partial_overlap_output = benchmark_dir.join("ordered_partial_overlap_output.parquet");
+    let partial_overlap_report = merge_payload_parquet_files_with_execution(
+        &partial_overlap_inputs,
+        &partial_overlap_output,
         &payload_merge_options,
         &ordered_execution,
     )
     .await?;
-    print_report("Ordered Merge (Few Huge Files)", &huge_sorted_report);
+    print_report(
+        "Ordered Merge (Partially Overlapping Row Groups)",
+        &partial_overlap_report,
+    );
+
+    let non_overlapping_inputs = write_non_overlapping_input_family(
+        &benchmark_dir,
+        "ordered_non_overlapping",
+        4,
+        120_000,
+        8_192,
+        |index| {
+            if index % 2 == 0 {
+                SchemaFamily::Left
+            } else {
+                SchemaFamily::Right
+            }
+        },
+    )
+    .await?;
+    let non_overlapping_output = benchmark_dir.join("ordered_non_overlapping_output.parquet");
+    let non_overlapping_report = merge_payload_parquet_files_with_execution(
+        &non_overlapping_inputs,
+        &non_overlapping_output,
+        &payload_merge_options,
+        &ordered_execution,
+    )
+    .await?;
+    print_report(
+        "Ordered Merge (Non-Overlapping Huge Files)",
+        &non_overlapping_report,
+    );
+
+    let string_key_inputs =
+        write_string_key_inputs(&benchmark_dir, "ordered_string_keys", 4, 12_000, 4_096).await?;
+    let string_key_output = benchmark_dir.join("ordered_string_keys_output.parquet");
+    let string_key_report = merge_payload_parquet_files_with_execution(
+        &string_key_inputs,
+        &string_key_output,
+        &payload_merge_options,
+        &ParquetMergeExecutionOptions {
+            ordering_field: Some("event_time".to_string()),
+            ..ParquetMergeExecutionOptions::default()
+        },
+    )
+    .await?;
+    print_report("Ordered Merge (String Keys)", &string_key_report);
 
     let many_small_inputs = write_input_family(
         &benchmark_dir,
