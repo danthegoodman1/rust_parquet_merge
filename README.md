@@ -126,9 +126,28 @@ It reports:
 - row-count and merged-schema validation before timings are accepted
 - a JSON summary written into the benchmark artifact directory
 
+Useful env vars:
+
+- `RPM_BENCH_SCENARIO=top_level_pragmatic`, `nested_payload_pragmatic`, or `all`
+- `RPM_BENCH_TARGET_INPUT_GIB=<float>` to scale generated input size by approximate total GiB
+- `RPM_BENCH_FILE_COUNT=<int>` to change the number of input files
+- `RPM_BENCH_MEASURED_RUNS=<int>` to reduce or increase measured repetitions
+
 Observed in one local `--release` run on April 19, 2026 on an M3 Max MBP:
 
 - `top_level_pragmatic`: Rust `14 ms`, DuckDB `30 ms`
 - `nested_payload_pragmatic`: Rust `31 ms`, DuckDB `45 ms`
 
+Observed in one larger local `--release` top-level run on April 19, 2026 using:
+
+`RPM_BENCH_SCENARIO=top_level_pragmatic RPM_BENCH_TARGET_INPUT_GIB=1 RPM_BENCH_MEASURED_RUNS=1 cargo run --release --example rust_vs_duckdb_benchmark`
+
+- total input: `1031.70 MiB`
+- Rust `5535 ms`
+- DuckDB `1150 ms`
+
 Important: the comparison should be run in `--release`. A debug-mode `cargo run` makes the Rust merge path look artificially slow and is not a fair comparison against the optimized DuckDB CLI binary.
+
+For a much larger startup-latency-insensitive run, a 10 GiB target is:
+
+`RPM_BENCH_SCENARIO=top_level_pragmatic RPM_BENCH_TARGET_INPUT_GIB=10 RPM_BENCH_MEASURED_RUNS=1 cargo run --release --example rust_vs_duckdb_benchmark`

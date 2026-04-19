@@ -1,3 +1,4 @@
+use std::env;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,11 +20,12 @@ use serde::Serialize;
 use tokio::fs::{self, File};
 use tokio::process::Command;
 
-const FILE_COUNT: usize = 6;
-const ROWS_PER_FILE: usize = 20_000;
-const MEASURED_RUNS: usize = 5;
+const DEFAULT_FILE_COUNT: usize = 6;
+const DEFAULT_ROWS_PER_FILE: usize = 20_000;
+const DEFAULT_MEASURED_RUNS: usize = 5;
+const DEFAULT_GENERATION_BATCH_ROWS: usize = 50_000;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 enum Scenario {
     TopLevelPragmatic,
     NestedPayloadPragmatic,
@@ -34,6 +36,35 @@ impl Scenario {
         match self {
             Self::TopLevelPragmatic => "top_level_pragmatic",
             Self::NestedPayloadPragmatic => "nested_payload_pragmatic",
+        }
+    }
+
+    fn parse_many(value: &str) -> Result<Vec<Self>, String> {
+        let normalized = value.trim();
+        if normalized.is_empty() || normalized.eq_ignore_ascii_case("all") {
+            return Ok(vec![Self::TopLevelPragmatic, Self::NestedPayloadPragmatic]);
+        }
+
+        let mut scenarios = Vec::new();
+        for part in normalized.split(',') {
+            let scenario = match part.trim() {
+                "top_level_pragmatic" => Self::TopLevelPragmatic,
+                "nested_payload_pragmatic" => Self::NestedPayloadPragmatic,
+                other => {
+                    return Err(format!(
+                        "unsupported RPM_BENCH_SCENARIO value `{other}`; expected `top_level_pragmatic`, `nested_payload_pragmatic`, or `all`"
+                    ));
+                }
+            };
+            if !scenarios.contains(&scenario) {
+                scenarios.push(scenario);
+            }
+        }
+
+        if scenarios.is_empty() {
+            Ok(vec![Self::TopLevelPragmatic, Self::NestedPayloadPragmatic])
+        } else {
+            Ok(scenarios)
         }
     }
 }
@@ -50,16 +81,35 @@ enum Engine {
     DuckDb,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct BenchmarkConfig {
+    file_count: usize,
+    rows_per_file: usize,
+    measured_runs: usize,
+    generation_batch_rows: usize,
+    target_input_bytes: Option<u64>,
+    scenarios: Vec<Scenario>,
+}
+
+#[derive(Debug)]
+struct GeneratedScenarioData {
+    input_paths: Vec<PathBuf>,
+    rows_per_file: usize,
+    input_bytes: u64,
+}
+
 #[derive(Serialize)]
 struct BenchmarkSummary {
     duckdb_version: String,
     benchmark_dir: String,
+    config: BenchmarkConfig,
     scenarios: Vec<ScenarioSummary>,
 }
 
 #[derive(Serialize)]
 struct ScenarioSummary {
     name: String,
+    rows_per_file: usize,
     expected_rows: u64,
     input_bytes: u64,
     validation: ValidationSummary,
@@ -98,10 +148,73 @@ fn unique_benchmark_dir() -> PathBuf {
     ))
 }
 
+fn parse_env_usize(name: &str, default: usize) -> Result<usize, Box<dyn Error>> {
+    match env::var(name) {
+        Ok(value) => Ok(value
+            .parse::<usize>()
+            .map_err(|error| format!("failed to parse {name}=`{value}` as usize: {error}"))?),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(format!("failed reading {name}: {error}").into()),
+    }
+}
+
+fn parse_env_gib(name: &str) -> Result<Option<u64>, Box<dyn Error>> {
+    match env::var(name) {
+        Ok(value) => {
+            let gib = value
+                .parse::<f64>()
+                .map_err(|error| format!("failed to parse {name}=`{value}` as f64: {error}"))?;
+            if gib <= 0.0 {
+                return Err(format!("{name} must be > 0, got {gib}").into());
+            }
+            Ok(Some((gib * 1024.0 * 1024.0 * 1024.0) as u64))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("failed reading {name}: {error}").into()),
+    }
+}
+
+fn load_config() -> Result<BenchmarkConfig, Box<dyn Error>> {
+    let file_count = parse_env_usize("RPM_BENCH_FILE_COUNT", DEFAULT_FILE_COUNT)?;
+    let rows_per_file = parse_env_usize("RPM_BENCH_ROWS_PER_FILE", DEFAULT_ROWS_PER_FILE)?;
+    let measured_runs = parse_env_usize("RPM_BENCH_MEASURED_RUNS", DEFAULT_MEASURED_RUNS)?;
+    let generation_batch_rows = parse_env_usize(
+        "RPM_BENCH_GENERATION_BATCH_ROWS",
+        DEFAULT_GENERATION_BATCH_ROWS,
+    )?;
+    let target_input_bytes = parse_env_gib("RPM_BENCH_TARGET_INPUT_GIB")?;
+    let scenarios = Scenario::parse_many(
+        &env::var("RPM_BENCH_SCENARIO").unwrap_or_else(|_| "all".to_string()),
+    )?;
+
+    if file_count == 0 {
+        return Err("RPM_BENCH_FILE_COUNT must be > 0".into());
+    }
+    if rows_per_file == 0 {
+        return Err("RPM_BENCH_ROWS_PER_FILE must be > 0".into());
+    }
+    if measured_runs == 0 {
+        return Err("RPM_BENCH_MEASURED_RUNS must be > 0".into());
+    }
+    if generation_batch_rows == 0 {
+        return Err("RPM_BENCH_GENERATION_BATCH_ROWS must be > 0".into());
+    }
+
+    Ok(BenchmarkConfig {
+        file_count,
+        rows_per_file,
+        measured_runs,
+        generation_batch_rows,
+        target_input_bytes,
+        scenarios,
+    })
+}
+
 fn top_level_batch(
     schema_family: SchemaFamily,
     rows: usize,
     start_event_id: i32,
+    row_offset: usize,
 ) -> (SchemaRef, RecordBatch) {
     match schema_family {
         SchemaFamily::Left => {
@@ -115,16 +228,17 @@ fn top_level_batch(
                 vec![
                     Arc::new(Int32Array::from(
                         (0..rows)
-                            .map(|index| start_event_id + index as i32)
+                            .map(|index| start_event_id + (row_offset + index) as i32)
                             .collect::<Vec<_>>(),
                     )) as ArrayRef,
                     Arc::new(Int32Array::from(
                         (0..rows)
                             .map(|index| {
-                                if index % 11 == 0 {
+                                let global_index = row_offset + index;
+                                if global_index % 11 == 0 {
                                     None
                                 } else {
-                                    Some(((index * 3) % 100) as i32)
+                                    Some(((global_index * 3) % 100) as i32)
                                 }
                             })
                             .collect::<Vec<_>>(),
@@ -132,10 +246,11 @@ fn top_level_batch(
                     Arc::new(StringArray::from(
                         (0..rows)
                             .map(|index| {
-                                if index % 13 == 0 {
+                                let global_index = row_offset + index;
+                                if global_index % 13 == 0 {
                                     None
                                 } else {
-                                    Some(format!("user_{start_event_id}_{index}"))
+                                    Some(format!("user_{}_{}", start_event_id, global_index))
                                 }
                             })
                             .collect::<Vec<_>>(),
@@ -157,26 +272,28 @@ fn top_level_batch(
                     Arc::new(Float64Array::from(
                         (0..rows)
                             .map(|index| {
-                                if index % 7 == 0 {
+                                let global_index = row_offset + index;
+                                if global_index % 7 == 0 {
                                     None
                                 } else {
-                                    Some(index as f64 * 0.75)
+                                    Some(global_index as f64 * 0.75)
                                 }
                             })
                             .collect::<Vec<_>>(),
                     )) as ArrayRef,
                     Arc::new(Int32Array::from(
                         (0..rows)
-                            .map(|index| start_event_id + index as i32)
+                            .map(|index| start_event_id + (row_offset + index) as i32)
                             .collect::<Vec<_>>(),
                     )) as ArrayRef,
                     Arc::new(Int32Array::from(
                         (0..rows)
                             .map(|index| {
-                                if index % 5 == 0 {
+                                let global_index = row_offset + index;
+                                if global_index % 5 == 0 {
                                     None
                                 } else {
-                                    Some(20 + (index % 45) as i32)
+                                    Some(20 + (global_index % 45) as i32)
                                 }
                             })
                             .collect::<Vec<_>>(),
@@ -193,6 +310,7 @@ fn nested_payload_batch(
     schema_family: SchemaFamily,
     rows: usize,
     start_event_id: i32,
+    row_offset: usize,
 ) -> (SchemaRef, RecordBatch) {
     match schema_family {
         SchemaFamily::Left => {
@@ -203,10 +321,11 @@ fn nested_payload_batch(
                 vec![Arc::new(StringArray::from(
                     (0..rows)
                         .map(|index| {
-                            if index % 9 == 0 {
+                            let global_index = row_offset + index;
+                            if global_index % 9 == 0 {
                                 None
                             } else {
-                                Some(format!("profile_{start_event_id}_{index}"))
+                                Some(format!("profile_{}_{}", start_event_id, global_index))
                             }
                         })
                         .collect::<Vec<_>>(),
@@ -216,13 +335,14 @@ fn nested_payload_batch(
 
             let scores =
                 ListArray::from_iter_primitive::<Int32Type, _, _>((0..rows).map(|index| {
-                    if index % 17 == 0 {
+                    let global_index = row_offset + index;
+                    if global_index % 17 == 0 {
                         None
                     } else {
                         Some(vec![
-                            Some(index as i32),
-                            Some(index as i32 + 1),
-                            Some(index as i32 + 2),
+                            Some(global_index as i32),
+                            Some(global_index as i32 + 1),
+                            Some(global_index as i32 + 2),
                         ])
                     }
                 }));
@@ -246,7 +366,7 @@ fn nested_payload_batch(
                 vec![
                     Arc::new(Int32Array::from(
                         (0..rows)
-                            .map(|index| Some((index % 200) as i32))
+                            .map(|index| Some(((row_offset + index) % 200) as i32))
                             .collect::<Vec<_>>(),
                     )) as ArrayRef,
                     profile_array,
@@ -265,12 +385,12 @@ fn nested_payload_batch(
                 vec![
                     Arc::new(Int32Array::from(
                         (0..rows)
-                            .map(|index| start_event_id + index as i32)
+                            .map(|index| start_event_id + (row_offset + index) as i32)
                             .collect::<Vec<_>>(),
                     )) as ArrayRef,
                     Arc::new(Int32Array::from(
                         (0..rows)
-                            .map(|index| 1_000 + (index % 8) as i32)
+                            .map(|index| 1_000 + ((row_offset + index) % 8) as i32)
                             .collect::<Vec<_>>(),
                     )) as ArrayRef,
                     payload_array,
@@ -298,12 +418,13 @@ fn nested_payload_batch(
 
             let scores =
                 ListArray::from_iter_primitive::<Float64Type, _, _>((0..rows).map(|index| {
-                    if index % 19 == 0 {
+                    let global_index = row_offset + index;
+                    if global_index % 19 == 0 {
                         None
                     } else {
                         Some(vec![
-                            Some(index as f64 * 1.25),
-                            Some(index as f64 * 1.25 + 0.5),
+                            Some(global_index as f64 * 1.25),
+                            Some(global_index as f64 * 1.25 + 0.5),
                         ])
                     }
                 }));
@@ -328,14 +449,14 @@ fn nested_payload_batch(
                 vec![
                     Arc::new(Float64Array::from(
                         (0..rows)
-                            .map(|index| Some(index as f64 * 0.5))
+                            .map(|index| Some((row_offset + index) as f64 * 0.5))
                             .collect::<Vec<_>>(),
                     )) as ArrayRef,
                     profile_array,
                     Arc::new(scores) as ArrayRef,
                     Arc::new(Int32Array::from(
                         (0..rows)
-                            .map(|index| Some(((index * 5) % 500) as i32))
+                            .map(|index| Some((((row_offset + index) * 5) % 500) as i32))
                             .collect::<Vec<_>>(),
                     )) as ArrayRef,
                 ],
@@ -352,12 +473,12 @@ fn nested_payload_batch(
                 vec![
                     Arc::new(Int32Array::from(
                         (0..rows)
-                            .map(|index| 2_000 + (index % 8) as i32)
+                            .map(|index| 2_000 + ((row_offset + index) % 8) as i32)
                             .collect::<Vec<_>>(),
                     )) as ArrayRef,
                     Arc::new(Int32Array::from(
                         (0..rows)
-                            .map(|index| start_event_id + index as i32)
+                            .map(|index| start_event_id + (row_offset + index) as i32)
                             .collect::<Vec<_>>(),
                     )) as ArrayRef,
                     payload_array,
@@ -369,47 +490,153 @@ fn nested_payload_batch(
     }
 }
 
-async fn write_parquet_file(
+fn scenario_batch(
+    scenario: Scenario,
+    schema_family: SchemaFamily,
+    rows: usize,
+    start_event_id: i32,
+    row_offset: usize,
+) -> (SchemaRef, RecordBatch) {
+    match scenario {
+        Scenario::TopLevelPragmatic => {
+            top_level_batch(schema_family, rows, start_event_id, row_offset)
+        }
+        Scenario::NestedPayloadPragmatic => {
+            nested_payload_batch(schema_family, rows, start_event_id, row_offset)
+        }
+    }
+}
+
+async fn write_scenario_file(
     path: &Path,
-    schema: SchemaRef,
-    batch: RecordBatch,
+    scenario: Scenario,
+    schema_family: SchemaFamily,
+    rows_per_file: usize,
+    start_event_id: i32,
+    generation_batch_rows: usize,
 ) -> Result<(), Box<dyn Error>> {
+    let first_batch_rows = rows_per_file.min(generation_batch_rows);
+    let (schema, first_batch) =
+        scenario_batch(scenario, schema_family, first_batch_rows, start_event_id, 0);
     let file = File::create(path).await?;
     let mut writer = AsyncArrowWriter::try_new(file, schema, Some(WriterProperties::new()))?;
-    writer.write(&batch).await?;
+    writer.write(&first_batch).await?;
+
+    let mut row_offset = first_batch_rows;
+    while row_offset < rows_per_file {
+        let batch_rows = (rows_per_file - row_offset).min(generation_batch_rows);
+        let (_, batch) = scenario_batch(
+            scenario,
+            schema_family,
+            batch_rows,
+            start_event_id,
+            row_offset,
+        );
+        writer.write(&batch).await?;
+        row_offset += batch_rows;
+    }
+
     writer.close().await?;
     Ok(())
+}
+
+async fn estimate_rows_per_file(
+    benchmark_dir: &Path,
+    scenario: Scenario,
+    config: &BenchmarkConfig,
+) -> Result<usize, Box<dyn Error>> {
+    let Some(target_input_bytes) = config.target_input_bytes else {
+        return Ok(config.rows_per_file);
+    };
+
+    let calibration_dir = benchmark_dir
+        .join(scenario.name())
+        .join("calibration_inputs");
+    fs::create_dir_all(&calibration_dir).await?;
+    let calibration_rows = config.generation_batch_rows.max(10_000);
+    let families = [SchemaFamily::Left, SchemaFamily::Right];
+    let mut sample_bytes = 0_u64;
+
+    for (index, family) in families.into_iter().enumerate() {
+        let path = calibration_dir.join(format!("sample_{index}.parquet"));
+        write_scenario_file(
+            &path,
+            scenario,
+            family,
+            calibration_rows,
+            (index * calibration_rows) as i32,
+            config.generation_batch_rows,
+        )
+        .await?;
+        sample_bytes += std::fs::metadata(&path)?.len();
+    }
+
+    for entry in std::fs::read_dir(&calibration_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+
+    let avg_bytes_per_row = sample_bytes as f64 / (calibration_rows * 2) as f64;
+    if avg_bytes_per_row <= 0.0 {
+        return Err("failed to estimate bytes per row for calibration".into());
+    }
+
+    let estimated_rows = ((target_input_bytes as f64)
+        / (avg_bytes_per_row * config.file_count as f64))
+        .ceil() as usize;
+
+    Ok(estimated_rows.max(config.generation_batch_rows))
 }
 
 async fn generate_inputs(
     benchmark_dir: &Path,
     scenario: Scenario,
-) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    config: &BenchmarkConfig,
+) -> Result<GeneratedScenarioData, Box<dyn Error>> {
     let scenario_dir = benchmark_dir.join(scenario.name());
     fs::create_dir_all(&scenario_dir).await?;
+    let rows_per_file = estimate_rows_per_file(benchmark_dir, scenario, config).await?;
 
-    let mut input_paths = Vec::with_capacity(FILE_COUNT);
-    for file_index in 0..FILE_COUNT {
+    println!(
+        "Generating {} inputs: files={}, rows/file={}, target_input_bytes={}",
+        scenario.name(),
+        config.file_count,
+        rows_per_file,
+        config
+            .target_input_bytes
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+
+    let mut input_paths = Vec::with_capacity(config.file_count);
+    for file_index in 0..config.file_count {
         let schema_family = if file_index % 2 == 0 {
             SchemaFamily::Left
         } else {
             SchemaFamily::Right
         };
-        let start_event_id = (file_index * ROWS_PER_FILE) as i32;
-        let (schema, batch) = match scenario {
-            Scenario::TopLevelPragmatic => {
-                top_level_batch(schema_family, ROWS_PER_FILE, start_event_id)
-            }
-            Scenario::NestedPayloadPragmatic => {
-                nested_payload_batch(schema_family, ROWS_PER_FILE, start_event_id)
-            }
-        };
+        let start_event_id = (file_index * rows_per_file) as i32;
         let path = scenario_dir.join(format!("input_{file_index}.parquet"));
-        write_parquet_file(&path, schema, batch).await?;
+        write_scenario_file(
+            &path,
+            scenario,
+            schema_family,
+            rows_per_file,
+            start_event_id,
+            config.generation_batch_rows,
+        )
+        .await?;
         input_paths.push(path);
     }
 
-    Ok(input_paths)
+    let input_bytes = total_input_bytes(&input_paths)?;
+    Ok(GeneratedScenarioData {
+        input_paths,
+        rows_per_file,
+        input_bytes,
+    })
 }
 
 fn total_input_bytes(input_paths: &[PathBuf]) -> Result<u64, Box<dyn Error>> {
@@ -627,10 +854,10 @@ async fn benchmark_scenario(
     benchmark_dir: &Path,
     duckdb_bin: &str,
     scenario: Scenario,
+    config: &BenchmarkConfig,
 ) -> Result<ScenarioSummary, Box<dyn Error>> {
-    let input_paths = generate_inputs(benchmark_dir, scenario).await?;
-    let input_bytes = total_input_bytes(&input_paths)?;
-    let expected_rows = (FILE_COUNT * ROWS_PER_FILE) as u64;
+    let generated = generate_inputs(benchmark_dir, scenario, config).await?;
+    let expected_rows = (config.file_count * generated.rows_per_file) as u64;
     let scenario_dir = benchmark_dir.join(scenario.name());
 
     let rust_warmup_output = scenario_dir.join("rust_warmup_output.parquet");
@@ -639,7 +866,7 @@ async fn benchmark_scenario(
         Engine::Rust,
         scenario,
         duckdb_bin,
-        &input_paths,
+        &generated.input_paths,
         &rust_warmup_output,
     )
     .await?;
@@ -647,51 +874,54 @@ async fn benchmark_scenario(
         Engine::DuckDb,
         scenario,
         duckdb_bin,
-        &input_paths,
+        &generated.input_paths,
         &duckdb_warmup_output,
     )
     .await?;
 
     let validation =
         validate_outputs(expected_rows, &rust_warmup_output, &duckdb_warmup_output).await?;
+    let _ = fs::remove_file(&rust_warmup_output).await;
+    let _ = fs::remove_file(&duckdb_warmup_output).await;
     if validation.status != "ok" {
         if let Some(message) = &validation.message {
             eprintln!("Validation failed for {}: {message}", scenario.name());
         }
         return Ok(ScenarioSummary {
             name: scenario.name().to_string(),
+            rows_per_file: generated.rows_per_file,
             expected_rows,
-            input_bytes,
+            input_bytes: generated.input_bytes,
             validation,
             rust: None,
             duckdb: None,
         });
     }
 
-    let mut rust_runs = Vec::with_capacity(MEASURED_RUNS);
-    let mut duckdb_runs = Vec::with_capacity(MEASURED_RUNS);
+    let mut rust_runs = Vec::with_capacity(config.measured_runs);
+    let mut duckdb_runs = Vec::with_capacity(config.measured_runs);
     let rust_output = scenario_dir.join("rust_measured_output.parquet");
     let duckdb_output = scenario_dir.join("duckdb_measured_output.parquet");
 
-    for _ in 0..MEASURED_RUNS {
+    for _ in 0..config.measured_runs {
         rust_runs.push(
             benchmark_engine(
                 Engine::Rust,
                 scenario,
                 duckdb_bin,
-                &input_paths,
+                &generated.input_paths,
                 &rust_output,
             )
             .await?,
         );
     }
-    for _ in 0..MEASURED_RUNS {
+    for _ in 0..config.measured_runs {
         duckdb_runs.push(
             benchmark_engine(
                 Engine::DuckDb,
                 scenario,
                 duckdb_bin,
-                &input_paths,
+                &generated.input_paths,
                 &duckdb_output,
             )
             .await?,
@@ -700,20 +930,21 @@ async fn benchmark_scenario(
 
     Ok(ScenarioSummary {
         name: scenario.name().to_string(),
+        rows_per_file: generated.rows_per_file,
         expected_rows,
-        input_bytes,
+        input_bytes: generated.input_bytes,
         validation,
         rust: Some(summarize_engine(
             rust_warmup,
             &rust_runs,
             expected_rows,
-            input_bytes,
+            generated.input_bytes,
         )),
         duckdb: Some(summarize_engine(
             duckdb_warmup,
             &duckdb_runs,
             expected_rows,
-            input_bytes,
+            generated.input_bytes,
         )),
     })
 }
@@ -724,6 +955,11 @@ fn print_summary(summary: &BenchmarkSummary) {
     for scenario in &summary.scenarios {
         println!();
         println!("Scenario: {}", scenario.name);
+        println!(
+            "  Inputs: rows/file={} total_input={:.2} MiB",
+            scenario.rows_per_file,
+            scenario.input_bytes as f64 / (1024.0 * 1024.0)
+        );
         println!(
             "  Validation: {} (rows rust={}, duckdb={})",
             scenario.validation.status,
@@ -756,24 +992,21 @@ fn print_summary(summary: &BenchmarkSummary) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let config = load_config()?;
     let duckdb_bin = std::env::var("DUCKDB_BIN").unwrap_or_else(|_| "duckdb".to_string());
     let duckdb_version = ensure_duckdb_version(&duckdb_bin).await?;
     let benchmark_dir = unique_benchmark_dir();
     fs::create_dir_all(&benchmark_dir).await?;
 
-    let scenarios = vec![
-        benchmark_scenario(&benchmark_dir, &duckdb_bin, Scenario::TopLevelPragmatic).await?,
-        benchmark_scenario(
-            &benchmark_dir,
-            &duckdb_bin,
-            Scenario::NestedPayloadPragmatic,
-        )
-        .await?,
-    ];
+    let mut scenarios = Vec::with_capacity(config.scenarios.len());
+    for scenario in &config.scenarios {
+        scenarios.push(benchmark_scenario(&benchmark_dir, &duckdb_bin, *scenario, &config).await?);
+    }
 
     let summary = BenchmarkSummary {
         duckdb_version,
         benchmark_dir: benchmark_dir.display().to_string(),
+        config,
         scenarios,
     };
     print_summary(&summary);
