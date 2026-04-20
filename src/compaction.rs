@@ -6,7 +6,7 @@ use std::fs::File as StdFile;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,17 +16,17 @@ use super::{
     merge_payload_schemas_pair, merge_top_level_schemas_many, to_parquet_error, widen_data_type,
 };
 use arrow::array::new_null_array;
-use arrow::compute::{cast, concat_batches, take_record_batch};
+use arrow::compute::{cast, concat_batches, interleave_record_batch, take_record_batch};
 use arrow_array::builder::{
     ArrayBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder,
     Int32Builder, Int64Builder, LargeListBuilder, LargeStringBuilder, ListBuilder, NullBuilder,
     StringBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
 };
 use arrow_array::{
-    Array, ArrayRef, Date32Array, Date64Array, Float64Array, Int64Array, LargeListArray,
-    LargeStringArray, ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, Date32Array, Date64Array, Float64Array, Int32Array, Int64Array,
+    LargeListArray, LargeStringArray, ListArray, RecordBatch, StringArray, StructArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt32Array, UInt64Array,
 };
 use arrow_buffer::NullBufferBuilder;
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
@@ -118,6 +118,10 @@ pub struct CompactionReport {
     pub fast_path_row_groups: u64,
     pub fast_path_batches: u64,
     pub fallback_batches: u64,
+    pub source_prepare_duration: Duration,
+    pub ordered_output_assembly_duration: Duration,
+    pub direct_batch_writes: u64,
+    pub accumulator_flushes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -152,6 +156,15 @@ struct ParquetMergeRunStats {
     fast_path_row_groups: u64,
     fast_path_batches: u64,
     fallback_batches: u64,
+    source_prepare_duration: Duration,
+    ordered_output_assembly_duration: Duration,
+    direct_batch_writes: u64,
+    accumulator_flushes: u64,
+}
+
+#[derive(Debug, Default)]
+struct OrderedWorkerMetrics {
+    source_prepare_nanos: AtomicU64,
 }
 
 type InternedFieldName = Arc<str>;
@@ -369,6 +382,7 @@ impl CompiledColumnOperation {
 enum CompiledTypeAdapter {
     PassThrough,
     PrimitiveCast { target_type: DataType },
+    Int32ToFloat64,
     NullFill { target_type: DataType },
     StructAdapter(CompiledStructAdapter),
     ListAdapter(CompiledListAdapter),
@@ -384,6 +398,15 @@ impl CompiledTypeAdapter {
     ) -> Result<ArrayRef, String> {
         match self {
             Self::PassThrough => Ok(array.clone()),
+            Self::Int32ToFloat64 => {
+                let source = array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| format!("expected Int32Array, got {:?}", array.data_type()))?;
+                Ok(Arc::new(Float64Array::from_iter(
+                    source.iter().map(|value| value.map(|value| value as f64)),
+                )) as ArrayRef)
+            }
             Self::PrimitiveCast { target_type } => {
                 cast(array.as_ref(), target_type).map_err(|error| {
                     format!(
@@ -954,6 +977,10 @@ pub async fn merge_top_level_parquet_files(
         fast_path_row_groups: run_stats.fast_path_row_groups,
         fast_path_batches: run_stats.fast_path_batches,
         fallback_batches: run_stats.fallback_batches,
+        source_prepare_duration: run_stats.source_prepare_duration,
+        ordered_output_assembly_duration: run_stats.ordered_output_assembly_duration,
+        direct_batch_writes: run_stats.direct_batch_writes,
+        accumulator_flushes: run_stats.accumulator_flushes,
     })
 }
 
@@ -1060,6 +1087,10 @@ pub async fn merge_payload_parquet_files_with_execution(
         fast_path_row_groups: run_stats.fast_path_row_groups,
         fast_path_batches: run_stats.fast_path_batches,
         fallback_batches: run_stats.fallback_batches,
+        source_prepare_duration: run_stats.source_prepare_duration,
+        ordered_output_assembly_duration: run_stats.ordered_output_assembly_duration,
+        direct_batch_writes: run_stats.direct_batch_writes,
+        accumulator_flushes: run_stats.accumulator_flushes,
     })
 }
 
@@ -1301,22 +1332,135 @@ fn parquet_writer_properties(execution_options: &ParquetMergeExecutionOptions) -
         .build()
 }
 
-fn materialize_pending_output(
-    schema: &SchemaRef,
-    pending_batches: &mut Vec<RecordBatch>,
-) -> Result<Option<RecordBatch>, String> {
-    if pending_batches.is_empty() {
-        return Ok(None);
+#[derive(Clone, Debug)]
+struct OrderedBatchSource {
+    key: usize,
+    batch: RecordBatch,
+}
+
+#[derive(Clone, Debug)]
+struct OrderedBatchFragment {
+    source_index: usize,
+    start: usize,
+    len: usize,
+}
+
+#[derive(Debug)]
+struct OrderedOutputAccumulator {
+    schema: SchemaRef,
+    batch_sources: Vec<OrderedBatchSource>,
+    fragments: Vec<OrderedBatchFragment>,
+    rows: usize,
+}
+
+impl OrderedOutputAccumulator {
+    fn new(schema: SchemaRef) -> Self {
+        Self {
+            schema,
+            batch_sources: Vec::new(),
+            fragments: Vec::new(),
+            rows: 0,
+        }
     }
 
-    if pending_batches.len() == 1 {
-        return Ok(Some(pending_batches.pop().expect("single pending batch")));
+    fn rows(&self) -> usize {
+        self.rows
     }
 
-    let combined = concat_batches(schema, pending_batches.iter())
-        .map_err(|error| format!("failed to concatenate ordered merge output batches: {error}"))?;
-    pending_batches.clear();
-    Ok(Some(combined))
+    fn is_empty(&self) -> bool {
+        self.rows == 0
+    }
+
+    fn append_range(
+        &mut self,
+        batch: &RecordBatch,
+        start: usize,
+        len: usize,
+    ) -> Result<(), String> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        if start + len > batch.num_rows() {
+            return Err(format!(
+                "ordered accumulator append range out of bounds: start={start}, len={len}, rows={}",
+                batch.num_rows()
+            ));
+        }
+        if batch.schema().fields().len() != self.schema.fields().len() {
+            return Err(format!(
+                "ordered accumulator schema mismatch: expected {} columns, got {}",
+                self.schema.fields().len(),
+                batch.schema().fields().len()
+            ));
+        }
+
+        let batch_key = batch as *const RecordBatch as usize;
+        let source_index = self
+            .batch_sources
+            .iter()
+            .position(|source| source.key == batch_key)
+            .unwrap_or_else(|| {
+                let next = self.batch_sources.len();
+                self.batch_sources.push(OrderedBatchSource {
+                    key: batch_key,
+                    batch: batch.clone(),
+                });
+                next
+            });
+        self.fragments.push(OrderedBatchFragment {
+            source_index,
+            start,
+            len,
+        });
+        self.rows += len;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<Option<RecordBatch>, String> {
+        if self.rows == 0 {
+            return Ok(None);
+        }
+
+        self.rows = 0;
+        if self.fragments.len() == 1 {
+            let fragment = self
+                .fragments
+                .pop()
+                .expect("single fragment exists for direct materialization");
+            let batch = self
+                .batch_sources
+                .pop()
+                .expect("single fragment has a backing source batch")
+                .batch;
+            return Ok(Some(
+                if fragment.start == 0 && fragment.len == batch.num_rows() {
+                    batch
+                } else {
+                    batch.slice(fragment.start, fragment.len)
+                },
+            ));
+        }
+
+        let batch_sources = std::mem::take(&mut self.batch_sources);
+        let fragments = std::mem::take(&mut self.fragments);
+        let record_batches = batch_sources
+            .iter()
+            .map(|source| &source.batch)
+            .collect::<Vec<_>>();
+        let mut indices =
+            Vec::with_capacity(fragments.iter().map(|fragment| fragment.len).sum::<usize>());
+        for fragment in fragments {
+            indices.extend(
+                (fragment.start..fragment.start + fragment.len)
+                    .map(|row| (fragment.source_index, row)),
+            );
+        }
+
+        interleave_record_batch(&record_batches, &indices)
+            .map(Some)
+            .map_err(|error| format!("failed to materialize ordered output batch: {error}"))
+    }
 }
 
 fn extract_prepared_order_column(
@@ -1755,6 +1899,7 @@ async fn merge_payload_parquet_files_ordered(
             .map_err(|error| format!("failed to create parquet writer: {error}"))?;
 
     let order_plan = Arc::new(order_plan);
+    let worker_metrics = Arc::new(OrderedWorkerMetrics::default());
     let mut receivers = Vec::with_capacity(input_paths.len());
     let mut worker_handles = Vec::with_capacity(input_paths.len());
     for (source_index, (input_path, adapter)) in input_paths
@@ -1767,6 +1912,7 @@ async fn merge_payload_parquet_files_ordered(
         let output_schema = output_schema.clone();
         let order_plan = order_plan.clone();
         let execution_options = execution_options.clone();
+        let worker_metrics = worker_metrics.clone();
         let handle = tokio::spawn(async move {
             parquet_merge_source_worker(
                 source_index,
@@ -1775,6 +1921,7 @@ async fn merge_payload_parquet_files_ordered(
                 adapter,
                 order_plan,
                 execution_options,
+                worker_metrics,
                 tx,
             )
             .await
@@ -1785,6 +1932,7 @@ async fn merge_payload_parquet_files_ordered(
 
     let ordered_merge_start = Instant::now();
     let mut stats = ParquetMergeRunStats::default();
+    let mut accumulator = OrderedOutputAccumulator::new(output_schema.clone());
     let mut sources = receivers
         .into_iter()
         .enumerate()
@@ -1801,8 +1949,6 @@ async fn merge_payload_parquet_files_ordered(
         }
     }
 
-    let mut pending_batches = Vec::new();
-    let mut pending_rows = 0_usize;
     while !heap.is_empty() {
         if execution_options.stats_fast_path {
             if let Some(source_index) = select_fast_path_source(&sources, &source_order_metadata) {
@@ -1813,10 +1959,8 @@ async fn merge_payload_parquet_files_ordered(
                     &mut sources,
                     &source_order_metadata,
                     &mut writer,
-                    &output_schema,
                     execution_options,
-                    &mut pending_batches,
-                    &mut pending_rows,
+                    &mut accumulator,
                     &mut stats,
                 )
                 .await?;
@@ -1834,22 +1978,25 @@ async fn merge_payload_parquet_files_ordered(
             .pop(&sources)
             .expect("non-empty ordered merge heap always pops");
         let next_competitor = heap.peek().map(|entry| entry.source_index);
-        let remaining_output_rows = execution_options.output_batch_rows - pending_rows;
         let counts_as_fallback_batch = sources[entry.source_index].current_row == 0;
         let run_len = {
             let source = &sources[entry.source_index];
             let competitor = next_competitor.map(|index| &sources[index]);
-            source.contiguous_run_len(competitor, remaining_output_rows)
+            source.contiguous_run_len(
+                competitor,
+                execution_options
+                    .output_batch_rows
+                    .saturating_sub(accumulator.rows())
+                    .max(1),
+            )
         };
         append_rows_from_source(
             entry.source_index,
             run_len,
             &mut sources,
             &mut writer,
-            &output_schema,
             execution_options,
-            &mut pending_batches,
-            &mut pending_rows,
+            &mut accumulator,
             &mut stats,
         )
         .await?;
@@ -1862,12 +2009,15 @@ async fn merge_payload_parquet_files_ordered(
         }
     }
 
-    if let Some(batch) = materialize_pending_output(&output_schema, &mut pending_batches)? {
+    let assembly_start = Instant::now();
+    if let Some(batch) = accumulator.flush()? {
+        stats.ordered_output_assembly_duration += assembly_start.elapsed();
         writer
             .write(&batch)
             .await
             .map_err(|error| format!("failed writing ordered merge tail batch: {error}"))?;
         stats.output_batches += 1;
+        stats.accumulator_flushes += 1;
     }
 
     stats.ordered_merge_duration = ordered_merge_start.elapsed();
@@ -1885,6 +2035,8 @@ async fn merge_payload_parquet_files_ordered(
         }
     }
 
+    stats.source_prepare_duration =
+        Duration::from_nanos(worker_metrics.source_prepare_nanos.load(Ordering::Relaxed));
     stats.execution_duration = execution_start.elapsed();
     Ok(stats)
 }
@@ -1980,10 +2132,8 @@ async fn drain_fast_path_source(
     sources: &mut [OrderedMergeSource],
     source_order_metadata: &[SourceOrderMetadata],
     writer: &mut AsyncArrowWriter<BufWriter<File>>,
-    output_schema: &SchemaRef,
     execution_options: &ParquetMergeExecutionOptions,
-    pending_batches: &mut Vec<RecordBatch>,
-    pending_rows: &mut usize,
+    accumulator: &mut OrderedOutputAccumulator,
     stats: &mut ParquetMergeRunStats,
 ) -> Result<(u64, u64), String> {
     let mut drained_row_groups = 0_u64;
@@ -2021,10 +2171,8 @@ async fn drain_fast_path_source(
                 remaining_batch_rows,
                 sources,
                 writer,
-                output_schema,
                 execution_options,
-                pending_batches,
-                pending_rows,
+                accumulator,
                 stats,
             )
             .await?;
@@ -2039,10 +2187,8 @@ async fn append_rows_from_source(
     row_count: usize,
     sources: &mut [OrderedMergeSource],
     writer: &mut AsyncArrowWriter<BufWriter<File>>,
-    output_schema: &SchemaRef,
     execution_options: &ParquetMergeExecutionOptions,
-    pending_batches: &mut Vec<RecordBatch>,
-    pending_rows: &mut usize,
+    accumulator: &mut OrderedOutputAccumulator,
     stats: &mut ParquetMergeRunStats,
 ) -> Result<(), String> {
     let mut remaining = row_count;
@@ -2054,7 +2200,7 @@ async fn append_rows_from_source(
                 .as_ref()
                 .expect("appending rows requires an active batch");
             let batch_rows = batch.batch.num_rows() - source.current_row;
-            let whole_batch_direct = *pending_rows == 0
+            let whole_batch_direct = accumulator.is_empty()
                 && source.current_row == 0
                 && remaining >= batch_rows
                 && batch_rows <= execution_options.output_batch_rows;
@@ -2062,15 +2208,17 @@ async fn append_rows_from_source(
         };
 
         if whole_batch_direct {
-            let batch = sources[source_index]
+            let direct_batch = sources[source_index]
                 .current_batch
                 .as_ref()
                 .expect("direct batch write requires an active batch");
+            let direct_batch = direct_batch.batch.clone();
             writer
-                .write(&batch.batch)
+                .write(&direct_batch)
                 .await
                 .map_err(|error| format!("failed writing ordered merge batch: {error}"))?;
             stats.output_batches += 1;
+            stats.direct_batch_writes += 1;
             stats.rows += batch_rows as u64;
             remaining -= batch_rows;
             sources[source_index].current_row += batch_rows;
@@ -2078,28 +2226,31 @@ async fn append_rows_from_source(
             let take = batch_rows.min(remaining).min(
                 execution_options
                     .output_batch_rows
-                    .saturating_sub(*pending_rows)
+                    .saturating_sub(accumulator.rows())
                     .max(1),
             );
             let batch = sources[source_index]
                 .current_batch
                 .as_ref()
                 .expect("pending output append requires an active batch");
-            pending_batches.push(batch.batch.slice(current_row, take));
-            *pending_rows += take;
+            let assembly_start = Instant::now();
+            accumulator.append_range(&batch.batch, current_row, take)?;
+            stats.ordered_output_assembly_duration += assembly_start.elapsed();
             stats.rows += take as u64;
             remaining -= take;
             sources[source_index].current_row += take;
 
-            if *pending_rows >= execution_options.output_batch_rows {
-                if let Some(batch) = materialize_pending_output(output_schema, pending_batches)? {
+            if accumulator.rows() >= execution_options.output_batch_rows {
+                let flush_start = Instant::now();
+                if let Some(batch) = accumulator.flush()? {
+                    stats.ordered_output_assembly_duration += flush_start.elapsed();
                     writer
                         .write(&batch)
                         .await
                         .map_err(|error| format!("failed writing ordered merge batch: {error}"))?;
                     stats.output_batches += 1;
+                    stats.accumulator_flushes += 1;
                 }
-                *pending_rows = 0;
             }
         }
 
@@ -2125,6 +2276,7 @@ async fn parquet_merge_source_worker(
     adapter: Arc<CompiledSourceAdapter>,
     order_plan: Arc<ParquetOrderPlan>,
     execution_options: ParquetMergeExecutionOptions,
+    worker_metrics: Arc<OrderedWorkerMetrics>,
     tx: mpsc::Sender<Result<PreparedOrderBatch, String>>,
 ) -> Result<(), String> {
     let result: Result<(), String> = async {
@@ -2170,6 +2322,7 @@ async fn parquet_merge_source_worker(
                         row_group_index
                     )
                 })?;
+                let prepare_start = Instant::now();
                 let adapted = adapter
                     .adapt_batch(&batch, &output_schema, &mut scratch)
                     .map_err(|error| {
@@ -2188,6 +2341,9 @@ async fn parquet_merge_source_worker(
                     &order_plan.field_name,
                     source_index,
                 )?;
+                worker_metrics
+                    .source_prepare_nanos
+                    .fetch_add(prepare_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 if tx.send(Ok(prepared)).await.is_err() {
                     return Ok(());
                 }
@@ -2626,6 +2782,10 @@ pub async fn compact_ndjson_to_parquet(
         fast_path_row_groups: 0,
         fast_path_batches: 0,
         fallback_batches: 0,
+        source_prepare_duration: Duration::default(),
+        ordered_output_assembly_duration: Duration::default(),
+        direct_batch_writes: 0,
+        accumulator_flushes: 0,
     })
 }
 
@@ -5011,6 +5171,10 @@ fn compile_type_adapter(
         return Ok(CompiledTypeAdapter::PassThrough);
     }
 
+    if matches!(source_type, DataType::Int32) && matches!(target_type, DataType::Float64) {
+        return Ok(CompiledTypeAdapter::Int32ToFloat64);
+    }
+
     if is_primitive_or_string(source_type) && is_primitive_or_string(target_type) {
         return Ok(CompiledTypeAdapter::PrimitiveCast {
             target_type: target_type.clone(),
@@ -6541,6 +6705,158 @@ mod tests {
             .collect()
     }
 
+    fn concat_batch_slices(
+        schema: SchemaRef,
+        slices: &[(RecordBatch, usize, usize)],
+    ) -> Result<RecordBatch, Box<dyn Error>> {
+        let pending = slices
+            .iter()
+            .map(|(batch, start, len)| batch.slice(*start, *len))
+            .collect::<Vec<_>>();
+        concat_batches(&schema, &pending).map_err(|error| io_error(error.to_string()).into())
+    }
+
+    #[test]
+    fn ordered_output_accumulator_matches_concat_for_primitive_fragments()
+    -> Result<(), Box<dyn Error>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int64, false),
+            Field::new("org_id", DataType::Int64, false),
+        ]));
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
+            ],
+        )?;
+        let second = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![4, 5, 6])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![40, 50, 60])) as ArrayRef,
+            ],
+        )?;
+
+        let mut accumulator = OrderedOutputAccumulator::new(schema.clone());
+        accumulator.append_range(&first, 0, 2).map_err(io_error)?;
+        accumulator.append_range(&second, 1, 2).map_err(io_error)?;
+        let actual = accumulator
+            .flush()
+            .map_err(io_error)?
+            .expect("flush emits batch");
+        let expected = concat_batch_slices(schema, &[(first, 0, 2), (second, 1, 2)])?;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_output_accumulator_matches_concat_for_struct_fragments() -> Result<(), Box<dyn Error>>
+    {
+        let profile_fields: Fields = vec![
+            Arc::new(Field::new("name", DataType::Utf8, true)),
+            Arc::new(Field::new("tier", DataType::Utf8, true)),
+        ]
+        .into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int64, false),
+            Field::new("profile", DataType::Struct(profile_fields.clone()), true),
+        ]));
+
+        let first_profile = Arc::new(StructArray::new(
+            profile_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None, Some("gold")])) as ArrayRef,
+            ],
+            None,
+        )) as ArrayRef;
+        let second_profile = Arc::new(StructArray::new(
+            profile_fields,
+            vec![
+                Arc::new(StringArray::from(vec![Some("Cara"), None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("silver"), Some("bronze")])) as ArrayRef,
+            ],
+            None,
+        )) as ArrayRef;
+
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                first_profile,
+            ],
+        )?;
+        let second = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![3, 4])) as ArrayRef,
+                second_profile,
+            ],
+        )?;
+
+        let mut accumulator = OrderedOutputAccumulator::new(schema.clone());
+        accumulator.append_range(&first, 1, 1).map_err(io_error)?;
+        accumulator.append_range(&second, 0, 2).map_err(io_error)?;
+        let actual = accumulator
+            .flush()
+            .map_err(io_error)?
+            .expect("flush emits batch");
+        let expected = concat_batch_slices(schema, &[(first, 1, 1), (second, 0, 2)])?;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_output_accumulator_matches_concat_for_widened_lists() -> Result<(), Box<dyn Error>> {
+        let (left_schema, left_batch, right_schema, right_batch) = sample_payload_inputs();
+        let mut plan = build_compiled_payload_plan(
+            [left_schema.as_ref(), right_schema.as_ref()],
+            &payload_schema_options(),
+        )
+        .map_err(io_error)?;
+        let left = plan.adapt_batch(&left_batch)?;
+        let right = plan.adapt_batch(&right_batch)?;
+
+        let mut accumulator = OrderedOutputAccumulator::new(plan.output_schema.clone());
+        accumulator.append_range(&left, 0, 1).map_err(io_error)?;
+        accumulator.append_range(&right, 0, 2).map_err(io_error)?;
+        let actual = accumulator
+            .flush()
+            .map_err(io_error)?
+            .expect("flush emits batch");
+        let expected = concat_batch_slices(
+            plan.output_schema.clone(),
+            &[(left.clone(), 0, 1), (right.clone(), 0, 2)],
+        )?;
+
+        assert_eq!(actual, expected);
+
+        let payload = actual
+            .column(actual.schema().index_of("payload")?)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("payload is struct");
+        let scores = payload
+            .column_by_name("scores")
+            .expect("scores exists")
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("scores is list");
+        let values = scores
+            .values()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("widened list values are Float64");
+        assert_eq!(values.value(0), 1.0);
+        assert_eq!(values.value(1), 2.0);
+        assert_eq!(values.value(2), 1.5);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn ordered_merge_uses_stats_fast_path_for_non_overlapping_row_groups()
     -> Result<(), Box<dyn Error>> {
@@ -7005,6 +7321,106 @@ mod tests {
 
         let _ = tokio::fs::remove_file(left_path).await;
         let _ = tokio::fs::remove_file(right_path).await;
+        let _ = tokio::fs::remove_file(output_path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordered_merge_handles_interleaved_single_row_runs_with_schema_drift()
+    -> Result<(), Box<dyn Error>> {
+        let (left_schema, left_batch, right_schema, right_batch) = sample_payload_inputs();
+        let (first_left_schema, first_left_batch) = promote_payload_envelope_to_int64(
+            left_schema.clone(),
+            left_batch.clone(),
+            &[1, 5],
+            &[10, 50],
+        );
+        let (first_right_schema, first_right_batch) = promote_payload_envelope_to_int64(
+            right_schema.clone(),
+            right_batch.clone(),
+            &[1, 6],
+            &[30, 60],
+        );
+        let (second_left_schema, second_left_batch) =
+            promote_payload_envelope_to_int64(left_schema, left_batch, &[2, 7], &[20, 70]);
+        let (second_right_schema, second_right_batch) =
+            promote_payload_envelope_to_int64(right_schema, right_batch, &[3, 8], &[40, 80]);
+
+        let first_left_path = unique_path("ordered_interleaved_left_a", "parquet");
+        let first_right_path = unique_path("ordered_interleaved_right_a", "parquet");
+        let second_left_path = unique_path("ordered_interleaved_left_b", "parquet");
+        let second_right_path = unique_path("ordered_interleaved_right_b", "parquet");
+        let output_path = unique_path("ordered_interleaved_output", "parquet");
+
+        write_parquet(&first_left_path, first_left_schema, first_left_batch).await?;
+        write_parquet(&first_right_path, first_right_schema, first_right_batch).await?;
+        write_parquet(&second_left_path, second_left_schema, second_left_batch).await?;
+        write_parquet(&second_right_path, second_right_schema, second_right_batch).await?;
+
+        let report = merge_payload_parquet_files_with_execution(
+            &[
+                first_left_path.clone(),
+                first_right_path.clone(),
+                second_left_path.clone(),
+                second_right_path.clone(),
+            ],
+            &output_path,
+            &payload_schema_options(),
+            &ParquetMergeExecutionOptions {
+                output_batch_rows: 3,
+                output_row_group_rows: 3,
+                ..ordered_execution_options("event_id")
+            },
+        )
+        .await?;
+        assert_eq!(report.rows, 8);
+        assert_eq!(report.direct_batch_writes, 0);
+        assert!(report.accumulator_flushes > 0);
+
+        let batches = read_parquet_batches(&output_path).await?;
+        assert_eq!(
+            collect_int64_column(&batches, "event_id"),
+            vec![
+                Some(1),
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(5),
+                Some(6),
+                Some(7),
+                Some(8),
+            ]
+        );
+        assert_eq!(
+            collect_int64_column(&batches, "org_id"),
+            vec![
+                Some(10),
+                Some(30),
+                Some(20),
+                Some(40),
+                Some(50),
+                Some(60),
+                Some(70),
+                Some(80),
+            ]
+        );
+
+        let first_batch = batches.first().expect("ordered merge output has batches");
+        let payload = first_batch
+            .column(first_batch.schema().index_of("payload")?)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("payload is struct");
+        let DataType::Struct(payload_fields) = payload.data_type() else {
+            panic!("payload should remain a struct");
+        };
+        assert_eq!(payload_fields[0].data_type(), &DataType::Float64);
+        assert!(payload_fields.iter().any(|field| field.name() == "amount"));
+
+        let _ = tokio::fs::remove_file(first_left_path).await;
+        let _ = tokio::fs::remove_file(first_right_path).await;
+        let _ = tokio::fs::remove_file(second_left_path).await;
+        let _ = tokio::fs::remove_file(second_right_path).await;
         let _ = tokio::fs::remove_file(output_path).await;
         Ok(())
     }

@@ -6,14 +6,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_array::types::{Float64Type, Int32Type};
 use arrow_array::{
-    ArrayRef, Float64Array, Int32Array, ListArray, RecordBatch, StringArray, StructArray,
+    ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
+    StructArray,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_writer::AsyncArrowWriter;
 use parquet::file::properties::WriterProperties;
 use rust_parquet_merge::{
-    NumericWideningMode, PayloadMergeOptions, TopLevelMergeOptions, merge_payload_parquet_files,
+    CompactionReport, NumericWideningMode, ParquetMergeExecutionOptions, PayloadMergeOptions,
+    TopLevelMergeOptions, merge_payload_parquet_files, merge_payload_parquet_files_with_execution,
     merge_top_level_parquet_files,
 };
 use serde::Serialize;
@@ -29,6 +31,7 @@ const DEFAULT_GENERATION_BATCH_ROWS: usize = 50_000;
 enum Scenario {
     TopLevelPragmatic,
     NestedPayloadPragmatic,
+    OrderedPayloadPragmatic,
 }
 
 impl Scenario {
@@ -36,13 +39,25 @@ impl Scenario {
         match self {
             Self::TopLevelPragmatic => "top_level_pragmatic",
             Self::NestedPayloadPragmatic => "nested_payload_pragmatic",
+            Self::OrderedPayloadPragmatic => "ordered_payload_pragmatic",
+        }
+    }
+
+    fn ordering_field(self) -> Option<&'static str> {
+        match self {
+            Self::OrderedPayloadPragmatic => Some("event_id"),
+            _ => None,
         }
     }
 
     fn parse_many(value: &str) -> Result<Vec<Self>, String> {
         let normalized = value.trim();
         if normalized.is_empty() || normalized.eq_ignore_ascii_case("all") {
-            return Ok(vec![Self::TopLevelPragmatic, Self::NestedPayloadPragmatic]);
+            return Ok(vec![
+                Self::TopLevelPragmatic,
+                Self::NestedPayloadPragmatic,
+                Self::OrderedPayloadPragmatic,
+            ]);
         }
 
         let mut scenarios = Vec::new();
@@ -50,9 +65,10 @@ impl Scenario {
             let scenario = match part.trim() {
                 "top_level_pragmatic" => Self::TopLevelPragmatic,
                 "nested_payload_pragmatic" => Self::NestedPayloadPragmatic,
+                "ordered_payload_pragmatic" => Self::OrderedPayloadPragmatic,
                 other => {
                     return Err(format!(
-                        "unsupported RPM_BENCH_SCENARIO value `{other}`; expected `top_level_pragmatic`, `nested_payload_pragmatic`, or `all`"
+                        "unsupported RPM_BENCH_SCENARIO value `{other}`; expected `top_level_pragmatic`, `nested_payload_pragmatic`, `ordered_payload_pragmatic`, or `all`"
                     ));
                 }
             };
@@ -62,7 +78,11 @@ impl Scenario {
         }
 
         if scenarios.is_empty() {
-            Ok(vec![Self::TopLevelPragmatic, Self::NestedPayloadPragmatic])
+            Ok(vec![
+                Self::TopLevelPragmatic,
+                Self::NestedPayloadPragmatic,
+                Self::OrderedPayloadPragmatic,
+            ])
         } else {
             Ok(scenarios)
         }
@@ -73,12 +93,6 @@ impl Scenario {
 enum SchemaFamily {
     Left,
     Right,
-}
-
-#[derive(Clone, Copy)]
-enum Engine {
-    Rust,
-    DuckDb,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -96,6 +110,13 @@ struct GeneratedScenarioData {
     input_paths: Vec<PathBuf>,
     rows_per_file: usize,
     input_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ScenarioBatchLayout {
+    start_event_id: i64,
+    event_step: i64,
+    org_base: i64,
 }
 
 #[derive(Serialize)]
@@ -124,7 +145,21 @@ struct ValidationSummary {
     duckdb_rows: u64,
     rust_schema_shape: Vec<String>,
     duckdb_schema_shape: Vec<String>,
+    rust_is_sorted: Option<bool>,
+    duckdb_is_sorted: Option<bool>,
     message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OrderedMetricsSummary {
+    ordered_merge_ms: u128,
+    stats_fast_path_ms: u128,
+    source_prepare_ms: u128,
+    ordered_output_assembly_ms: u128,
+    fast_path_batches: u64,
+    fallback_batches: u64,
+    direct_batch_writes: u64,
+    accumulator_flushes: u64,
 }
 
 #[derive(Serialize)]
@@ -134,6 +169,13 @@ struct EngineSummary {
     median_ms: u128,
     rows_per_sec: f64,
     input_mb_per_sec: f64,
+    ordered_metrics: Option<OrderedMetricsSummary>,
+}
+
+#[derive(Clone, Debug)]
+struct RustRunResult {
+    duration: Duration,
+    report: CompactionReport,
 }
 
 fn unique_benchmark_dir() -> PathBuf {
@@ -490,19 +532,241 @@ fn nested_payload_batch(
     }
 }
 
+fn ordered_payload_batch(
+    schema_family: SchemaFamily,
+    rows: usize,
+    layout: ScenarioBatchLayout,
+    row_offset: usize,
+) -> (SchemaRef, RecordBatch) {
+    match schema_family {
+        SchemaFamily::Left => {
+            let profile_fields: Fields =
+                vec![Arc::new(Field::new("name", DataType::Utf8, true))].into();
+            let profile_array = Arc::new(StructArray::new(
+                profile_fields.clone(),
+                vec![Arc::new(StringArray::from(
+                    (0..rows)
+                        .map(|index| {
+                            let global_index = row_offset + index;
+                            if global_index % 9 == 0 {
+                                None
+                            } else {
+                                Some(format!(
+                                    "ordered_profile_{}_{}",
+                                    layout.start_event_id, global_index
+                                ))
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef],
+                None,
+            )) as ArrayRef;
+
+            let scores =
+                ListArray::from_iter_primitive::<Int32Type, _, _>((0..rows).map(|index| {
+                    let global_index = row_offset + index;
+                    if global_index % 17 == 0 {
+                        None
+                    } else {
+                        Some(vec![
+                            Some(global_index as i32),
+                            Some(global_index as i32 + 1),
+                            Some(global_index as i32 + 2),
+                        ])
+                    }
+                }));
+
+            let payload_fields: Fields = vec![
+                Arc::new(Field::new("score", DataType::Int32, true)),
+                Arc::new(Field::new(
+                    "profile",
+                    DataType::Struct(profile_fields.clone()),
+                    true,
+                )),
+                Arc::new(Field::new(
+                    "scores",
+                    DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                    true,
+                )),
+            ]
+            .into();
+            let payload_array = Arc::new(StructArray::new(
+                payload_fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from(
+                        (0..rows)
+                            .map(|index| Some(((row_offset + index) % 200) as i32))
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    profile_array,
+                    Arc::new(scores) as ArrayRef,
+                ],
+                None,
+            )) as ArrayRef;
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("event_id", DataType::Int64, false),
+                Field::new("org_id", DataType::Int64, false),
+                Field::new("payload", DataType::Struct(payload_fields), true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        (0..rows)
+                            .map(|index| {
+                                layout.start_event_id
+                                    + ((row_offset + index) as i64 * layout.event_step)
+                            })
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(Int64Array::from(
+                        (0..rows)
+                            .map(|index| layout.org_base + ((row_offset + index) % 8) as i64)
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    payload_array,
+                ],
+            )
+            .unwrap();
+            (schema, batch)
+        }
+        SchemaFamily::Right => {
+            let profile_fields: Fields =
+                vec![Arc::new(Field::new("tier", DataType::Utf8, true))].into();
+            let profile_array = Arc::new(StructArray::new(
+                profile_fields.clone(),
+                vec![Arc::new(StringArray::from(
+                    (0..rows)
+                        .map(|index| match (row_offset + index) % 3 {
+                            0 => Some("gold".to_string()),
+                            1 => Some("silver".to_string()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef],
+                None,
+            )) as ArrayRef;
+
+            let scores =
+                ListArray::from_iter_primitive::<Float64Type, _, _>((0..rows).map(|index| {
+                    let global_index = row_offset + index;
+                    if global_index % 19 == 0 {
+                        None
+                    } else {
+                        Some(vec![
+                            Some(global_index as f64 * 1.25),
+                            Some(global_index as f64 * 1.25 + 0.5),
+                        ])
+                    }
+                }));
+
+            let payload_fields: Fields = vec![
+                Arc::new(Field::new("score", DataType::Float64, true)),
+                Arc::new(Field::new(
+                    "profile",
+                    DataType::Struct(profile_fields.clone()),
+                    true,
+                )),
+                Arc::new(Field::new(
+                    "scores",
+                    DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+                    true,
+                )),
+                Arc::new(Field::new("amount", DataType::Int32, true)),
+            ]
+            .into();
+            let payload_array = Arc::new(StructArray::new(
+                payload_fields.clone(),
+                vec![
+                    Arc::new(Float64Array::from(
+                        (0..rows)
+                            .map(|index| Some((row_offset + index) as f64 * 0.75))
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    profile_array,
+                    Arc::new(scores) as ArrayRef,
+                    Arc::new(Int32Array::from(
+                        (0..rows)
+                            .map(|index| Some((((row_offset + index) * 5) % 500) as i32))
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ],
+                None,
+            )) as ArrayRef;
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("org_id", DataType::Int64, false),
+                Field::new("event_id", DataType::Int64, false),
+                Field::new("payload", DataType::Struct(payload_fields), true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        (0..rows)
+                            .map(|index| layout.org_base + ((row_offset + index) % 8) as i64)
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(Int64Array::from(
+                        (0..rows)
+                            .map(|index| {
+                                layout.start_event_id
+                                    + ((row_offset + index) as i64 * layout.event_step)
+                            })
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    payload_array,
+                ],
+            )
+            .unwrap();
+            (schema, batch)
+        }
+    }
+}
+
+fn scenario_batch_layout(
+    scenario: Scenario,
+    file_index: usize,
+    rows_per_file: usize,
+    file_count: usize,
+) -> ScenarioBatchLayout {
+    match scenario {
+        Scenario::OrderedPayloadPragmatic => ScenarioBatchLayout {
+            start_event_id: file_index as i64,
+            event_step: file_count as i64,
+            org_base: 10_000 + ((file_index as i64) * 100),
+        },
+        _ => ScenarioBatchLayout {
+            start_event_id: (file_index * rows_per_file) as i64,
+            event_step: 1,
+            org_base: 10_000 + ((file_index as i64) * 100),
+        },
+    }
+}
+
 fn scenario_batch(
     scenario: Scenario,
     schema_family: SchemaFamily,
     rows: usize,
-    start_event_id: i32,
+    layout: ScenarioBatchLayout,
     row_offset: usize,
 ) -> (SchemaRef, RecordBatch) {
     match scenario {
-        Scenario::TopLevelPragmatic => {
-            top_level_batch(schema_family, rows, start_event_id, row_offset)
-        }
-        Scenario::NestedPayloadPragmatic => {
-            nested_payload_batch(schema_family, rows, start_event_id, row_offset)
+        Scenario::TopLevelPragmatic => top_level_batch(
+            schema_family,
+            rows,
+            layout.start_event_id as i32,
+            row_offset,
+        ),
+        Scenario::NestedPayloadPragmatic => nested_payload_batch(
+            schema_family,
+            rows,
+            layout.start_event_id as i32,
+            row_offset,
+        ),
+        Scenario::OrderedPayloadPragmatic => {
+            ordered_payload_batch(schema_family, rows, layout, row_offset)
         }
     }
 }
@@ -512,12 +776,14 @@ async fn write_scenario_file(
     scenario: Scenario,
     schema_family: SchemaFamily,
     rows_per_file: usize,
-    start_event_id: i32,
+    file_index: usize,
+    file_count: usize,
     generation_batch_rows: usize,
 ) -> Result<(), Box<dyn Error>> {
+    let layout = scenario_batch_layout(scenario, file_index, rows_per_file, file_count);
     let first_batch_rows = rows_per_file.min(generation_batch_rows);
     let (schema, first_batch) =
-        scenario_batch(scenario, schema_family, first_batch_rows, start_event_id, 0);
+        scenario_batch(scenario, schema_family, first_batch_rows, layout, 0);
     let file = File::create(path).await?;
     let mut writer = AsyncArrowWriter::try_new(file, schema, Some(WriterProperties::new()))?;
     writer.write(&first_batch).await?;
@@ -525,13 +791,7 @@ async fn write_scenario_file(
     let mut row_offset = first_batch_rows;
     while row_offset < rows_per_file {
         let batch_rows = (rows_per_file - row_offset).min(generation_batch_rows);
-        let (_, batch) = scenario_batch(
-            scenario,
-            schema_family,
-            batch_rows,
-            start_event_id,
-            row_offset,
-        );
+        let (_, batch) = scenario_batch(scenario, schema_family, batch_rows, layout, row_offset);
         writer.write(&batch).await?;
         row_offset += batch_rows;
     }
@@ -564,7 +824,8 @@ async fn estimate_rows_per_file(
             scenario,
             family,
             calibration_rows,
-            (index * calibration_rows) as i32,
+            index,
+            config.file_count,
             config.generation_batch_rows,
         )
         .await?;
@@ -617,14 +878,14 @@ async fn generate_inputs(
         } else {
             SchemaFamily::Right
         };
-        let start_event_id = (file_index * rows_per_file) as i32;
         let path = scenario_dir.join(format!("input_{file_index}.parquet"));
         write_scenario_file(
             &path,
             scenario,
             schema_family,
             rows_per_file,
-            start_event_id,
+            file_index,
+            config.file_count,
             config.generation_batch_rows,
         )
         .await?;
@@ -647,16 +908,44 @@ fn total_input_bytes(input_paths: &[PathBuf]) -> Result<u64, Box<dyn Error>> {
     Ok(total)
 }
 
-async fn parquet_row_count_and_schema(path: &Path) -> Result<(u64, SchemaRef), Box<dyn Error>> {
+async fn parquet_row_count_and_schema(
+    path: &Path,
+    ordering_field: Option<&str>,
+) -> Result<(u64, SchemaRef, Option<bool>), Box<dyn Error>> {
     let file = File::open(path).await?;
     let builder = ParquetRecordBatchStreamBuilder::new(file).await?;
     let schema = builder.schema().clone();
+    let ordering_index = ordering_field
+        .map(|field| {
+            schema
+                .index_of(field)
+                .map_err(|error| format!("missing ordering field `{field}` in validation: {error}"))
+        })
+        .transpose()?;
     let mut stream = builder.build()?;
     let mut rows = 0_u64;
+    let mut previous_event_id = None;
+    let mut is_sorted = ordering_index.map(|_| true);
     while let Some(batch) = futures_util::StreamExt::next(&mut stream).await {
-        rows += batch?.num_rows() as u64;
+        let batch = batch?;
+        rows += batch.num_rows() as u64;
+        if let Some(index) = ordering_index {
+            let event_ids = batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "ordered validation expects Int64 ordering column".to_string())?;
+            for value in event_ids.iter().flatten() {
+                if let Some(previous) = previous_event_id {
+                    if value < previous {
+                        is_sorted = Some(false);
+                    }
+                }
+                previous_event_id = Some(value);
+            }
+        }
     }
-    Ok((rows, schema))
+    Ok((rows, schema, is_sorted))
 }
 
 fn data_type_shape(data_type: &DataType) -> String {
@@ -691,14 +980,20 @@ fn sql_quote(path: &Path) -> String {
     path.display().to_string().replace('\'', "''")
 }
 
-fn duckdb_merge_sql(input_paths: &[PathBuf], output_path: &Path) -> String {
+fn duckdb_merge_sql(scenario: Scenario, input_paths: &[PathBuf], output_path: &Path) -> String {
     let inputs = input_paths
         .iter()
         .map(|path| format!("'{}'", sql_quote(path)))
         .collect::<Vec<_>>()
         .join(", ");
+    let select_sql = match scenario.ordering_field() {
+        Some(field) => format!(
+            "SELECT * FROM read_parquet([{inputs}], union_by_name = true) ORDER BY {field} NULLS LAST"
+        ),
+        None => format!("SELECT * FROM read_parquet([{inputs}], union_by_name = true)"),
+    };
     format!(
-        "COPY (SELECT * FROM read_parquet([{inputs}], union_by_name = true)) TO '{}' (FORMAT PARQUET);",
+        "COPY ({select_sql}) TO '{}' (FORMAT PARQUET);",
         sql_quote(output_path)
     )
 }
@@ -724,14 +1019,25 @@ async fn ensure_duckdb_version(duckdb_bin: &str) -> Result<String, Box<dyn Error
     Ok(version)
 }
 
+fn ordered_benchmark_execution_options() -> ParquetMergeExecutionOptions {
+    ParquetMergeExecutionOptions {
+        ordering_field: Some("event_id".to_string()),
+        read_batch_size: 131_072,
+        output_batch_rows: 131_072,
+        prefetch_batches_per_source: 4,
+        output_row_group_rows: 512_000,
+        stats_fast_path: true,
+    }
+}
+
 async fn run_rust_merge(
     scenario: Scenario,
     input_paths: &[PathBuf],
     output_path: &Path,
-) -> Result<Duration, Box<dyn Error>> {
+) -> Result<RustRunResult, Box<dyn Error>> {
     let _ = fs::remove_file(output_path).await;
     let start = Instant::now();
-    match scenario {
+    let report = match scenario {
         Scenario::TopLevelPragmatic => {
             merge_top_level_parquet_files(
                 input_paths,
@@ -740,23 +1046,36 @@ async fn run_rust_merge(
                     numeric_mode: NumericWideningMode::Float64Pragmatic,
                 },
             )
-            .await?;
+            .await?
         }
         Scenario::NestedPayloadPragmatic => {
             merge_payload_parquet_files(input_paths, output_path, &PayloadMergeOptions::default())
-                .await?;
+                .await?
         }
-    }
-    Ok(start.elapsed())
+        Scenario::OrderedPayloadPragmatic => {
+            merge_payload_parquet_files_with_execution(
+                input_paths,
+                output_path,
+                &PayloadMergeOptions::default(),
+                &ordered_benchmark_execution_options(),
+            )
+            .await?
+        }
+    };
+    Ok(RustRunResult {
+        duration: start.elapsed(),
+        report,
+    })
 }
 
 async fn run_duckdb_merge(
+    scenario: Scenario,
     duckdb_bin: &str,
     input_paths: &[PathBuf],
     output_path: &Path,
 ) -> Result<Duration, Box<dyn Error>> {
     let _ = fs::remove_file(output_path).await;
-    let sql = duckdb_merge_sql(input_paths, output_path);
+    let sql = duckdb_merge_sql(scenario, input_paths, output_path);
     let start = Instant::now();
     let output = Command::new(duckdb_bin).arg("-c").arg(sql).output().await?;
     if !output.status.success() {
@@ -783,6 +1102,7 @@ fn summarize_engine(
     measured: &[Duration],
     rows: u64,
     input_bytes: u64,
+    ordered_metrics: Option<OrderedMetricsSummary>,
 ) -> EngineSummary {
     let median = median_duration(measured.to_vec());
     let seconds = median.as_secs_f64();
@@ -795,16 +1115,64 @@ fn summarize_engine(
         median_ms: duration_millis(median),
         rows_per_sec: rows as f64 / seconds,
         input_mb_per_sec: (input_bytes as f64 / (1024.0 * 1024.0)) / seconds,
+        ordered_metrics,
     }
 }
 
+fn ordered_metrics_from_report(report: &CompactionReport) -> Option<OrderedMetricsSummary> {
+    if report.ordered_merge_duration == Duration::default()
+        && report.stats_fast_path_duration == Duration::default()
+        && report.source_prepare_duration == Duration::default()
+        && report.ordered_output_assembly_duration == Duration::default()
+        && report.fast_path_batches == 0
+        && report.fallback_batches == 0
+        && report.direct_batch_writes == 0
+        && report.accumulator_flushes == 0
+    {
+        return None;
+    }
+
+    Some(OrderedMetricsSummary {
+        ordered_merge_ms: duration_millis(report.ordered_merge_duration),
+        stats_fast_path_ms: duration_millis(report.stats_fast_path_duration),
+        source_prepare_ms: duration_millis(report.source_prepare_duration),
+        ordered_output_assembly_ms: duration_millis(report.ordered_output_assembly_duration),
+        fast_path_batches: report.fast_path_batches,
+        fallback_batches: report.fallback_batches,
+        direct_batch_writes: report.direct_batch_writes,
+        accumulator_flushes: report.accumulator_flushes,
+    })
+}
+
+fn summarize_rust_runs(
+    warmup: &RustRunResult,
+    measured: &[RustRunResult],
+    rows: u64,
+    input_bytes: u64,
+) -> EngineSummary {
+    let measured_durations = measured.iter().map(|run| run.duration).collect::<Vec<_>>();
+    let mut median_indices = (0..measured.len()).collect::<Vec<_>>();
+    median_indices.sort_unstable_by_key(|index| measured[*index].duration);
+    let median_run = &measured[median_indices[median_indices.len() / 2]];
+    summarize_engine(
+        warmup.duration,
+        &measured_durations,
+        rows,
+        input_bytes,
+        ordered_metrics_from_report(&median_run.report),
+    )
+}
+
 async fn validate_outputs(
+    scenario: Scenario,
     expected_rows: u64,
     rust_output: &Path,
     duckdb_output: &Path,
 ) -> Result<ValidationSummary, Box<dyn Error>> {
-    let (rust_rows, rust_schema) = parquet_row_count_and_schema(rust_output).await?;
-    let (duckdb_rows, duckdb_schema) = parquet_row_count_and_schema(duckdb_output).await?;
+    let (rust_rows, rust_schema, rust_is_sorted) =
+        parquet_row_count_and_schema(rust_output, scenario.ordering_field()).await?;
+    let (duckdb_rows, duckdb_schema, duckdb_is_sorted) =
+        parquet_row_count_and_schema(duckdb_output, scenario.ordering_field()).await?;
 
     let rust_shape = schema_shape(rust_schema.as_ref());
     let duckdb_shape = schema_shape(duckdb_schema.as_ref());
@@ -817,6 +1185,10 @@ async fn validate_outputs(
         Some(format!(
             "DuckDB output row count mismatch: expected {expected_rows}, got {duckdb_rows}"
         ))
+    } else if rust_is_sorted == Some(false) {
+        Some("Rust output is not sorted by event_id".to_string())
+    } else if duckdb_is_sorted == Some(false) {
+        Some("DuckDB output is not sorted by event_id".to_string())
     } else if rust_shape != duckdb_shape {
         Some("Rust and DuckDB output schemas differ".to_string())
     } else {
@@ -833,21 +1205,10 @@ async fn validate_outputs(
         duckdb_rows,
         rust_schema_shape: rust_shape,
         duckdb_schema_shape: duckdb_shape,
+        rust_is_sorted,
+        duckdb_is_sorted,
         message,
     })
-}
-
-async fn benchmark_engine(
-    engine: Engine,
-    scenario: Scenario,
-    duckdb_bin: &str,
-    input_paths: &[PathBuf],
-    output_path: &Path,
-) -> Result<Duration, Box<dyn Error>> {
-    match engine {
-        Engine::Rust => run_rust_merge(scenario, input_paths, output_path).await,
-        Engine::DuckDb => run_duckdb_merge(duckdb_bin, input_paths, output_path).await,
-    }
 }
 
 async fn benchmark_scenario(
@@ -862,16 +1223,8 @@ async fn benchmark_scenario(
 
     let rust_warmup_output = scenario_dir.join("rust_warmup_output.parquet");
     let duckdb_warmup_output = scenario_dir.join("duckdb_warmup_output.parquet");
-    let rust_warmup = benchmark_engine(
-        Engine::Rust,
-        scenario,
-        duckdb_bin,
-        &generated.input_paths,
-        &rust_warmup_output,
-    )
-    .await?;
-    let duckdb_warmup = benchmark_engine(
-        Engine::DuckDb,
+    let rust_warmup = run_rust_merge(scenario, &generated.input_paths, &rust_warmup_output).await?;
+    let duckdb_warmup = run_duckdb_merge(
         scenario,
         duckdb_bin,
         &generated.input_paths,
@@ -879,8 +1232,13 @@ async fn benchmark_scenario(
     )
     .await?;
 
-    let validation =
-        validate_outputs(expected_rows, &rust_warmup_output, &duckdb_warmup_output).await?;
+    let validation = validate_outputs(
+        scenario,
+        expected_rows,
+        &rust_warmup_output,
+        &duckdb_warmup_output,
+    )
+    .await?;
     let _ = fs::remove_file(&rust_warmup_output).await;
     let _ = fs::remove_file(&duckdb_warmup_output).await;
     if validation.status != "ok" {
@@ -904,27 +1262,11 @@ async fn benchmark_scenario(
     let duckdb_output = scenario_dir.join("duckdb_measured_output.parquet");
 
     for _ in 0..config.measured_runs {
-        rust_runs.push(
-            benchmark_engine(
-                Engine::Rust,
-                scenario,
-                duckdb_bin,
-                &generated.input_paths,
-                &rust_output,
-            )
-            .await?,
-        );
+        rust_runs.push(run_rust_merge(scenario, &generated.input_paths, &rust_output).await?);
     }
     for _ in 0..config.measured_runs {
         duckdb_runs.push(
-            benchmark_engine(
-                Engine::DuckDb,
-                scenario,
-                duckdb_bin,
-                &generated.input_paths,
-                &duckdb_output,
-            )
-            .await?,
+            run_duckdb_merge(scenario, duckdb_bin, &generated.input_paths, &duckdb_output).await?,
         );
     }
 
@@ -934,8 +1276,8 @@ async fn benchmark_scenario(
         expected_rows,
         input_bytes: generated.input_bytes,
         validation,
-        rust: Some(summarize_engine(
-            rust_warmup,
+        rust: Some(summarize_rust_runs(
+            &rust_warmup,
             &rust_runs,
             expected_rows,
             generated.input_bytes,
@@ -945,6 +1287,7 @@ async fn benchmark_scenario(
             &duckdb_runs,
             expected_rows,
             generated.input_bytes,
+            None,
         )),
     })
 }
@@ -966,6 +1309,15 @@ fn print_summary(summary: &BenchmarkSummary) {
             scenario.validation.rust_rows,
             scenario.validation.duckdb_rows
         );
+        if let (Some(rust_is_sorted), Some(duckdb_is_sorted)) = (
+            scenario.validation.rust_is_sorted,
+            scenario.validation.duckdb_is_sorted,
+        ) {
+            println!(
+                "  Order check: rust_sorted={} duckdb_sorted={}",
+                rust_is_sorted, duckdb_is_sorted
+            );
+        }
         if let Some(message) = &scenario.validation.message {
             println!("  Validation detail: {message}");
             continue;
@@ -983,6 +1335,22 @@ fn print_summary(summary: &BenchmarkSummary) {
             "  Rust   median: {} ms | {:>10.0} rows/s | {:>8.2} MiB/s",
             rust.median_ms, rust.rows_per_sec, rust.input_mb_per_sec
         );
+        if let Some(metrics) = &rust.ordered_metrics {
+            println!(
+                "  Rust ordered: merge={} ms | prepare={} ms | assembly={} ms | fast_path={} ms",
+                metrics.ordered_merge_ms,
+                metrics.source_prepare_ms,
+                metrics.ordered_output_assembly_ms,
+                metrics.stats_fast_path_ms,
+            );
+            println!(
+                "                fallback_batches={} fast_path_batches={} direct_writes={} flushes={}",
+                metrics.fallback_batches,
+                metrics.fast_path_batches,
+                metrics.direct_batch_writes,
+                metrics.accumulator_flushes,
+            );
+        }
         println!(
             "  DuckDB median: {} ms | {:>10.0} rows/s | {:>8.2} MiB/s",
             duckdb.median_ms, duckdb.rows_per_sec, duckdb.input_mb_per_sec
