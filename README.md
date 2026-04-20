@@ -122,13 +122,14 @@ It reports:
 
 - one strict top-level merge workload using the new top-level merge path
 - one nested payload merge workload using the payload-aware merge path
+- one ordered payload merge workload using the ordered k-way merge path
 - side-by-side Rust and DuckDB timings for the exact same Parquet inputs
 - row-count and merged-schema validation before timings are accepted
 - a JSON summary written into the benchmark artifact directory
 
 Useful env vars:
 
-- `RPM_BENCH_SCENARIO=top_level_pragmatic`, `nested_payload_pragmatic`, or `all`
+- `RPM_BENCH_SCENARIO=top_level_pragmatic`, `nested_payload_pragmatic`, `ordered_payload_pragmatic`, or `all`
 - `RPM_BENCH_TARGET_INPUT_GIB=<float>` to scale generated input size by approximate total GiB
 - `RPM_BENCH_FILE_COUNT=<int>` to change the number of input files
 - `RPM_BENCH_MEASURED_RUNS=<int>` to reduce or increase measured repetitions
@@ -147,6 +148,13 @@ Observed in one larger local `--release` top-level run on April 19, 2026 using:
 - DuckDB `1150 ms`
 
 Important: the comparison should be run in `--release`. A debug-mode `cargo run` makes the Rust merge path look artificially slow and is not a fair comparison against the optimized DuckDB CLI binary.
+
+Observed in one local isolated `--release` ordered 1 GiB run on April 20, 2026 using the same generated `ordered_payload_pragmatic` inputs:
+
+- Rust wall time `6.69 s`, user CPU `10.76 s`, sys CPU `1.03 s`, max RSS `1.70 GiB`
+- Rust internal breakdown: decode `1274 ms`, prepare `209 ms`, assembly `2389 ms`, write `3923 ms`
+- DuckDB wall time `1.06 s`, user CPU `8.23 s`, sys CPU `1.18 s`, max RSS `5.42 GiB`
+- In this workload DuckDB is materially faster, but it is also using substantially more CPU parallelism and memory than the Rust merge path
 
 For a much larger startup-latency-insensitive run, a 10 GiB target is:
 

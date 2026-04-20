@@ -154,8 +154,10 @@ struct ValidationSummary {
 struct OrderedMetricsSummary {
     ordered_merge_ms: u128,
     stats_fast_path_ms: u128,
+    read_decode_ms: u128,
     source_prepare_ms: u128,
     ordered_output_assembly_ms: u128,
+    writer_write_ms: u128,
     fast_path_batches: u64,
     fallback_batches: u64,
     direct_batch_writes: u64,
@@ -1135,8 +1137,10 @@ fn ordered_metrics_from_report(report: &CompactionReport) -> Option<OrderedMetri
     Some(OrderedMetricsSummary {
         ordered_merge_ms: duration_millis(report.ordered_merge_duration),
         stats_fast_path_ms: duration_millis(report.stats_fast_path_duration),
+        read_decode_ms: duration_millis(report.read_decode_duration),
         source_prepare_ms: duration_millis(report.source_prepare_duration),
         ordered_output_assembly_ms: duration_millis(report.ordered_output_assembly_duration),
+        writer_write_ms: duration_millis(report.writer_write_duration),
         fast_path_batches: report.fast_path_batches,
         fallback_batches: report.fallback_batches,
         direct_batch_writes: report.direct_batch_writes,
@@ -1337,10 +1341,12 @@ fn print_summary(summary: &BenchmarkSummary) {
         );
         if let Some(metrics) = &rust.ordered_metrics {
             println!(
-                "  Rust ordered: merge={} ms | prepare={} ms | assembly={} ms | fast_path={} ms",
+                "  Rust ordered: merge={} ms | decode={} ms | prepare={} ms | assembly={} ms | write={} ms | fast_path={} ms",
                 metrics.ordered_merge_ms,
+                metrics.read_decode_ms,
                 metrics.source_prepare_ms,
                 metrics.ordered_output_assembly_ms,
+                metrics.writer_write_ms,
                 metrics.stats_fast_path_ms,
             );
             println!(

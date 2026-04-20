@@ -118,8 +118,10 @@ pub struct CompactionReport {
     pub fast_path_row_groups: u64,
     pub fast_path_batches: u64,
     pub fallback_batches: u64,
+    pub read_decode_duration: Duration,
     pub source_prepare_duration: Duration,
     pub ordered_output_assembly_duration: Duration,
+    pub writer_write_duration: Duration,
     pub direct_batch_writes: u64,
     pub accumulator_flushes: u64,
 }
@@ -156,14 +158,17 @@ struct ParquetMergeRunStats {
     fast_path_row_groups: u64,
     fast_path_batches: u64,
     fallback_batches: u64,
+    read_decode_duration: Duration,
     source_prepare_duration: Duration,
     ordered_output_assembly_duration: Duration,
+    writer_write_duration: Duration,
     direct_batch_writes: u64,
     accumulator_flushes: u64,
 }
 
 #[derive(Debug, Default)]
 struct OrderedWorkerMetrics {
+    read_decode_nanos: AtomicU64,
     source_prepare_nanos: AtomicU64,
 }
 
@@ -977,8 +982,10 @@ pub async fn merge_top_level_parquet_files(
         fast_path_row_groups: run_stats.fast_path_row_groups,
         fast_path_batches: run_stats.fast_path_batches,
         fallback_batches: run_stats.fallback_batches,
+        read_decode_duration: run_stats.read_decode_duration,
         source_prepare_duration: run_stats.source_prepare_duration,
         ordered_output_assembly_duration: run_stats.ordered_output_assembly_duration,
+        writer_write_duration: run_stats.writer_write_duration,
         direct_batch_writes: run_stats.direct_batch_writes,
         accumulator_flushes: run_stats.accumulator_flushes,
     })
@@ -1087,8 +1094,10 @@ pub async fn merge_payload_parquet_files_with_execution(
         fast_path_row_groups: run_stats.fast_path_row_groups,
         fast_path_batches: run_stats.fast_path_batches,
         fallback_batches: run_stats.fallback_batches,
+        read_decode_duration: run_stats.read_decode_duration,
         source_prepare_duration: run_stats.source_prepare_duration,
         ordered_output_assembly_duration: run_stats.ordered_output_assembly_duration,
+        writer_write_duration: run_stats.writer_write_duration,
         direct_batch_writes: run_stats.direct_batch_writes,
         accumulator_flushes: run_stats.accumulator_flushes,
     })
@@ -1460,6 +1469,86 @@ impl OrderedOutputAccumulator {
         interleave_record_batch(&record_batches, &indices)
             .map(Some)
             .map_err(|error| format!("failed to materialize ordered output batch: {error}"))
+    }
+}
+
+#[derive(Debug, Default)]
+struct OrderedWriterResult {
+    output_batches: u64,
+    write_duration: Duration,
+}
+
+#[derive(Debug)]
+struct OrderedOutputWriter {
+    tx: Option<mpsc::Sender<RecordBatch>>,
+    handle: Option<tokio::task::JoinHandle<Result<OrderedWriterResult, String>>>,
+}
+
+impl OrderedOutputWriter {
+    fn new(writer: AsyncArrowWriter<BufWriter<File>>, channel_capacity: usize) -> Self {
+        let (tx, mut rx) = mpsc::channel::<RecordBatch>(channel_capacity.max(1));
+        let handle = tokio::spawn(async move {
+            let mut writer = writer;
+            let mut result = OrderedWriterResult::default();
+            while let Some(batch) = rx.recv().await {
+                let write_start = Instant::now();
+                writer
+                    .write(&batch)
+                    .await
+                    .map_err(|error| format!("failed writing ordered merge batch: {error}"))?;
+                result.write_duration += write_start.elapsed();
+                result.output_batches += 1;
+            }
+
+            let close_start = Instant::now();
+            writer
+                .close()
+                .await
+                .map_err(|error| format!("failed closing parquet writer: {error}"))?;
+            result.write_duration += close_start.elapsed();
+            Ok(result)
+        });
+
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+        }
+    }
+
+    async fn send(&mut self, batch: RecordBatch) -> Result<(), String> {
+        let Some(tx) = self.tx.as_ref().cloned() else {
+            return Err("ordered writer is no longer accepting batches".to_string());
+        };
+
+        if tx.send(batch).await.is_err() {
+            return Err(self
+                .take_failure("ordered writer task closed unexpectedly")
+                .await);
+        }
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> Result<OrderedWriterResult, String> {
+        self.tx.take();
+        let Some(handle) = self.handle.take() else {
+            return Ok(OrderedWriterResult::default());
+        };
+        match handle.await {
+            Ok(result) => result,
+            Err(error) => Err(format!("ordered writer task failed to join: {error}")),
+        }
+    }
+
+    async fn take_failure(&mut self, fallback_message: &str) -> String {
+        self.tx.take();
+        let Some(handle) = self.handle.take() else {
+            return fallback_message.to_string();
+        };
+        match handle.await {
+            Ok(Ok(_)) => fallback_message.to_string(),
+            Ok(Err(error)) => error,
+            Err(error) => format!("ordered writer task failed to join: {error}"),
+        }
     }
 }
 
@@ -1894,9 +1983,13 @@ async fn merge_payload_parquet_files_ordered(
         .map_err(|error| format!("failed to create output parquet file: {error}"))?;
     let output_file = BufWriter::with_capacity(1 << 20, output_file);
     let writer_properties = parquet_writer_properties(execution_options);
-    let mut writer =
+    let writer =
         AsyncArrowWriter::try_new(output_file, output_schema.clone(), Some(writer_properties))
             .map_err(|error| format!("failed to create parquet writer: {error}"))?;
+    let mut ordered_writer = OrderedOutputWriter::new(
+        writer,
+        execution_options.prefetch_batches_per_source.max(2) * 2,
+    );
 
     let order_plan = Arc::new(order_plan);
     let worker_metrics = Arc::new(OrderedWorkerMetrics::default());
@@ -1958,7 +2051,7 @@ async fn merge_payload_parquet_files_ordered(
                     source_index,
                     &mut sources,
                     &source_order_metadata,
-                    &mut writer,
+                    &mut ordered_writer,
                     execution_options,
                     &mut accumulator,
                     &mut stats,
@@ -1994,7 +2087,7 @@ async fn merge_payload_parquet_files_ordered(
             entry.source_index,
             run_len,
             &mut sources,
-            &mut writer,
+            &mut ordered_writer,
             execution_options,
             &mut accumulator,
             &mut stats,
@@ -2012,20 +2105,11 @@ async fn merge_payload_parquet_files_ordered(
     let assembly_start = Instant::now();
     if let Some(batch) = accumulator.flush()? {
         stats.ordered_output_assembly_duration += assembly_start.elapsed();
-        writer
-            .write(&batch)
-            .await
-            .map_err(|error| format!("failed writing ordered merge tail batch: {error}"))?;
-        stats.output_batches += 1;
+        ordered_writer.send(batch).await?;
         stats.accumulator_flushes += 1;
     }
 
     stats.ordered_merge_duration = ordered_merge_start.elapsed();
-
-    writer
-        .close()
-        .await
-        .map_err(|error| format!("failed closing parquet writer: {error}"))?;
 
     for handle in worker_handles {
         match handle.await {
@@ -2035,6 +2119,11 @@ async fn merge_payload_parquet_files_ordered(
         }
     }
 
+    let writer_result = ordered_writer.finish().await?;
+    stats.output_batches = writer_result.output_batches;
+    stats.writer_write_duration = writer_result.write_duration;
+    stats.read_decode_duration =
+        Duration::from_nanos(worker_metrics.read_decode_nanos.load(Ordering::Relaxed));
     stats.source_prepare_duration =
         Duration::from_nanos(worker_metrics.source_prepare_nanos.load(Ordering::Relaxed));
     stats.execution_duration = execution_start.elapsed();
@@ -2131,7 +2220,7 @@ async fn drain_fast_path_source(
     source_index: usize,
     sources: &mut [OrderedMergeSource],
     source_order_metadata: &[SourceOrderMetadata],
-    writer: &mut AsyncArrowWriter<BufWriter<File>>,
+    writer: &mut OrderedOutputWriter,
     execution_options: &ParquetMergeExecutionOptions,
     accumulator: &mut OrderedOutputAccumulator,
     stats: &mut ParquetMergeRunStats,
@@ -2186,7 +2275,7 @@ async fn append_rows_from_source(
     source_index: usize,
     row_count: usize,
     sources: &mut [OrderedMergeSource],
-    writer: &mut AsyncArrowWriter<BufWriter<File>>,
+    writer: &mut OrderedOutputWriter,
     execution_options: &ParquetMergeExecutionOptions,
     accumulator: &mut OrderedOutputAccumulator,
     stats: &mut ParquetMergeRunStats,
@@ -2213,11 +2302,7 @@ async fn append_rows_from_source(
                 .as_ref()
                 .expect("direct batch write requires an active batch");
             let direct_batch = direct_batch.batch.clone();
-            writer
-                .write(&direct_batch)
-                .await
-                .map_err(|error| format!("failed writing ordered merge batch: {error}"))?;
-            stats.output_batches += 1;
+            writer.send(direct_batch).await?;
             stats.direct_batch_writes += 1;
             stats.rows += batch_rows as u64;
             remaining -= batch_rows;
@@ -2244,11 +2329,7 @@ async fn append_rows_from_source(
                 let flush_start = Instant::now();
                 if let Some(batch) = accumulator.flush()? {
                     stats.ordered_output_assembly_duration += flush_start.elapsed();
-                    writer
-                        .write(&batch)
-                        .await
-                        .map_err(|error| format!("failed writing ordered merge batch: {error}"))?;
-                    stats.output_batches += 1;
+                    writer.send(batch).await?;
                     stats.accumulator_flushes += 1;
                 }
             }
@@ -2314,7 +2395,15 @@ async fn parquet_merge_source_worker(
                     )
                 })?;
 
-            while let Some(batch_result) = stream.next().await {
+            loop {
+                let decode_start = Instant::now();
+                let batch_result = stream.next().await;
+                worker_metrics
+                    .read_decode_nanos
+                    .fetch_add(decode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let Some(batch_result) = batch_result else {
+                    break;
+                };
                 let batch = batch_result.map_err(|error| {
                     format!(
                         "failed reading parquet batch from `{}` row group {}: {error}",
@@ -2782,8 +2871,10 @@ pub async fn compact_ndjson_to_parquet(
         fast_path_row_groups: 0,
         fast_path_batches: 0,
         fallback_batches: 0,
+        read_decode_duration: Duration::default(),
         source_prepare_duration: Duration::default(),
         ordered_output_assembly_duration: Duration::default(),
+        writer_write_duration: Duration::default(),
         direct_batch_writes: 0,
         accumulator_flushes: 0,
     })
