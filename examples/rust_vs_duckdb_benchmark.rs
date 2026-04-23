@@ -1,6 +1,10 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
+use std::io::Read;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,10 +17,11 @@ use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_writer::AsyncArrowWriter;
 use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use rust_parquet_merge::{
-    CompactionReport, NumericWideningMode, ParquetMergeExecutionOptions, PayloadMergeOptions,
-    TopLevelMergeOptions, merge_payload_parquet_files, merge_payload_parquet_files_with_execution,
-    merge_top_level_parquet_files,
+    CompactionReport, NumericWideningMode, ParquetCompression, ParquetMergeExecutionOptions,
+    PayloadMergeOptions, TopLevelMergeOptions, UnorderedMergeOrder,
+    merge_payload_parquet_files_with_execution, merge_top_level_parquet_files_with_execution,
 };
 use serde::Serialize;
 use tokio::fs::{self, File};
@@ -95,6 +100,87 @@ enum SchemaFamily {
     Right,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+enum BenchmarkUnorderedMergeOrder {
+    Preserve,
+    Interleaved,
+}
+
+impl BenchmarkUnorderedMergeOrder {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "preserve" => Ok(Self::Preserve),
+            "interleaved" => Ok(Self::Interleaved),
+            other => Err(format!(
+                "unsupported RPM_BENCH_RUST_UNORDERED_ORDER value `{other}`; expected `preserve` or `interleaved`"
+            )),
+        }
+    }
+
+    fn execution_order(self) -> UnorderedMergeOrder {
+        match self {
+            Self::Preserve => UnorderedMergeOrder::PreserveInputOrder,
+            Self::Interleaved => UnorderedMergeOrder::AllowInterleaved,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::Interleaved => "interleaved",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+enum BenchmarkCompression {
+    Uncompressed,
+    Snappy,
+    Lz4Raw,
+    Zstd { level: i32 },
+}
+
+impl BenchmarkCompression {
+    fn parse(value: &str) -> Result<Self, String> {
+        let value = value.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "uncompressed" => Ok(Self::Uncompressed),
+            "snappy" => Ok(Self::Snappy),
+            "lz4_raw" => Ok(Self::Lz4Raw),
+            value if value.starts_with("zstd:") => {
+                let level = value["zstd:".len()..]
+                    .parse::<i32>()
+                    .map_err(|error| format!("failed parsing zstd level in `{value}`: {error}"))?;
+                if !(1..=22).contains(&level) {
+                    return Err(format!("zstd level must be between 1 and 22, got {level}"));
+                }
+                Ok(Self::Zstd { level })
+            }
+            other => Err(format!(
+                "unsupported RPM_BENCH_RUST_COMPRESSION value `{other}`; expected `uncompressed`, `snappy`, `lz4_raw`, or `zstd:<level>`"
+            )),
+        }
+    }
+
+    fn execution_compression(self) -> ParquetCompression {
+        match self {
+            Self::Uncompressed => ParquetCompression::Uncompressed,
+            Self::Snappy => ParquetCompression::Snappy,
+            Self::Lz4Raw => ParquetCompression::Lz4Raw,
+            Self::Zstd { level } => ParquetCompression::Zstd { level },
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Uncompressed => "uncompressed".to_string(),
+            Self::Snappy => "snappy".to_string(),
+            Self::Lz4Raw => "lz4_raw".to_string(),
+            Self::Zstd { level } => format!("zstd:{level}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct BenchmarkConfig {
     file_count: usize,
@@ -102,6 +188,12 @@ struct BenchmarkConfig {
     measured_runs: usize,
     generation_batch_rows: usize,
     target_input_bytes: Option<u64>,
+    rust_parallelism: usize,
+    rust_unordered_order: BenchmarkUnorderedMergeOrder,
+    rust_compression: BenchmarkCompression,
+    rust_dictionary_enabled: bool,
+    duckdb_threads: Option<usize>,
+    duckdb_compression: Option<String>,
     scenarios: Vec<Scenario>,
 }
 
@@ -133,9 +225,28 @@ struct ScenarioSummary {
     rows_per_file: usize,
     expected_rows: u64,
     input_bytes: u64,
+    rust_resolved_parallelism: usize,
+    rust_unordered_order: String,
+    rust_compression: String,
+    rust_dictionary_enabled: bool,
+    duckdb_threads: Option<usize>,
+    duckdb_compression: Option<String>,
+    rust_output_bytes: u64,
+    duckdb_output_bytes: u64,
+    rust_parquet_metadata: Vec<ParquetMetadataSummary>,
+    duckdb_parquet_metadata: Vec<ParquetMetadataSummary>,
     validation: ValidationSummary,
     rust: Option<EngineSummary>,
     duckdb: Option<EngineSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ParquetMetadataSummary {
+    compression: String,
+    encodings: String,
+    chunks: u64,
+    compressed_bytes: u64,
+    uncompressed_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -158,6 +269,9 @@ struct OrderedMetricsSummary {
     source_prepare_ms: u128,
     ordered_output_assembly_ms: u128,
     writer_write_ms: u128,
+    writer_encode_work_ms: u128,
+    writer_sink_ms: u128,
+    writer_close_ms: u128,
     fast_path_batches: u64,
     fallback_batches: u64,
     direct_batch_writes: u64,
@@ -171,6 +285,11 @@ struct EngineSummary {
     median_ms: u128,
     rows_per_sec: f64,
     input_mb_per_sec: f64,
+    peak_rss_bytes: Option<u64>,
+    user_cpu_ms: Option<u128>,
+    system_cpu_ms: Option<u128>,
+    total_cpu_ms: Option<u128>,
+    cpu_percent: Option<f64>,
     ordered_metrics: Option<OrderedMetricsSummary>,
 }
 
@@ -178,6 +297,22 @@ struct EngineSummary {
 struct RustRunResult {
     duration: Duration,
     report: CompactionReport,
+    user_cpu_duration: Option<Duration>,
+    system_cpu_duration: Option<Duration>,
+}
+
+#[derive(Clone, Debug)]
+struct EngineRunResult {
+    duration: Duration,
+    peak_rss_bytes: Option<u64>,
+    user_cpu_duration: Option<Duration>,
+    system_cpu_duration: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CpuUsageSnapshot {
+    user: Duration,
+    system: Duration,
 }
 
 fn unique_benchmark_dir() -> PathBuf {
@@ -199,6 +334,45 @@ fn parse_env_usize(name: &str, default: usize) -> Result<usize, Box<dyn Error>> 
             .map_err(|error| format!("failed to parse {name}=`{value}` as usize: {error}"))?),
         Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(format!("failed reading {name}: {error}").into()),
+    }
+}
+
+fn parse_env_optional_usize(name: &str) -> Result<Option<usize>, Box<dyn Error>> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value.parse::<usize>().map_err(|error| {
+            format!("failed to parse {name}=`{value}` as usize: {error}")
+        })?)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("failed reading {name}: {error}").into()),
+    }
+}
+
+fn parse_env_bool(name: &str, default: bool) -> Result<bool, Box<dyn Error>> {
+    match env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(true),
+            "false" | "0" | "no" => Ok(false),
+            _ => Err(format!("failed to parse {name}=`{value}` as bool").into()),
+        },
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(format!("failed reading {name}: {error}").into()),
+    }
+}
+
+fn parse_duckdb_compression() -> Result<Option<String>, Box<dyn Error>> {
+    match env::var("RPM_BENCH_DUCKDB_COMPRESSION") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "snappy" | "uncompressed" | "zstd" | "lz4" => Ok(Some(normalized)),
+                other => Err(format!(
+                    "unsupported RPM_BENCH_DUCKDB_COMPRESSION value `{other}`; expected `snappy`, `uncompressed`, `zstd`, or `lz4`"
+                )
+                .into()),
+            }
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("failed reading RPM_BENCH_DUCKDB_COMPRESSION: {error}").into()),
     }
 }
 
@@ -227,6 +401,16 @@ fn load_config() -> Result<BenchmarkConfig, Box<dyn Error>> {
         DEFAULT_GENERATION_BATCH_ROWS,
     )?;
     let target_input_bytes = parse_env_gib("RPM_BENCH_TARGET_INPUT_GIB")?;
+    let rust_parallelism = parse_env_usize("RPM_BENCH_RUST_PARALLELISM", 1)?;
+    let rust_unordered_order = BenchmarkUnorderedMergeOrder::parse(
+        &env::var("RPM_BENCH_RUST_UNORDERED_ORDER").unwrap_or_else(|_| "preserve".to_string()),
+    )?;
+    let rust_compression = BenchmarkCompression::parse(
+        &env::var("RPM_BENCH_RUST_COMPRESSION").unwrap_or_else(|_| "uncompressed".to_string()),
+    )?;
+    let rust_dictionary_enabled = parse_env_bool("RPM_BENCH_RUST_DICTIONARY", true)?;
+    let duckdb_threads = parse_env_optional_usize("RPM_BENCH_DUCKDB_THREADS")?;
+    let duckdb_compression = parse_duckdb_compression()?;
     let scenarios = Scenario::parse_many(
         &env::var("RPM_BENCH_SCENARIO").unwrap_or_else(|_| "all".to_string()),
     )?;
@@ -243,6 +427,9 @@ fn load_config() -> Result<BenchmarkConfig, Box<dyn Error>> {
     if generation_batch_rows == 0 {
         return Err("RPM_BENCH_GENERATION_BATCH_ROWS must be > 0".into());
     }
+    if duckdb_threads == Some(0) {
+        return Err("RPM_BENCH_DUCKDB_THREADS must be > 0 when set".into());
+    }
 
     Ok(BenchmarkConfig {
         file_count,
@@ -250,6 +437,12 @@ fn load_config() -> Result<BenchmarkConfig, Box<dyn Error>> {
         measured_runs,
         generation_batch_rows,
         target_input_bytes,
+        rust_parallelism,
+        rust_unordered_order,
+        rust_compression,
+        rust_dictionary_enabled,
+        duckdb_threads,
+        duckdb_compression,
         scenarios,
     })
 }
@@ -910,6 +1103,37 @@ fn total_input_bytes(input_paths: &[PathBuf]) -> Result<u64, Box<dyn Error>> {
     Ok(total)
 }
 
+fn parquet_metadata_summary(path: &Path) -> Result<Vec<ParquetMetadataSummary>, Box<dyn Error>> {
+    let file = std::fs::File::open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    let mut groups = BTreeMap::<(String, String), ParquetMetadataSummary>::new();
+    for row_group_index in 0..reader.num_row_groups() {
+        let row_group = reader.metadata().row_group(row_group_index);
+        for column in row_group.columns() {
+            let compression = format!("{:?}", column.compression());
+            let encodings = column
+                .encodings()
+                .iter()
+                .map(|encoding| format!("{encoding:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let entry = groups
+                .entry((compression.clone(), encodings.clone()))
+                .or_insert_with(|| ParquetMetadataSummary {
+                    compression,
+                    encodings,
+                    chunks: 0,
+                    compressed_bytes: 0,
+                    uncompressed_bytes: 0,
+                });
+            entry.chunks += 1;
+            entry.compressed_bytes += column.compressed_size() as u64;
+            entry.uncompressed_bytes += column.uncompressed_size() as u64;
+        }
+    }
+    Ok(groups.into_values().collect())
+}
+
 async fn parquet_row_count_and_schema(
     path: &Path,
     ordering_field: Option<&str>,
@@ -982,7 +1206,13 @@ fn sql_quote(path: &Path) -> String {
     path.display().to_string().replace('\'', "''")
 }
 
-fn duckdb_merge_sql(scenario: Scenario, input_paths: &[PathBuf], output_path: &Path) -> String {
+fn duckdb_merge_sql(
+    scenario: Scenario,
+    input_paths: &[PathBuf],
+    output_path: &Path,
+    duckdb_threads: Option<usize>,
+    duckdb_compression: Option<&str>,
+) -> String {
     let inputs = input_paths
         .iter()
         .map(|path| format!("'{}'", sql_quote(path)))
@@ -994,8 +1224,14 @@ fn duckdb_merge_sql(scenario: Scenario, input_paths: &[PathBuf], output_path: &P
         ),
         None => format!("SELECT * FROM read_parquet([{inputs}], union_by_name = true)"),
     };
+    let thread_pragma = duckdb_threads
+        .map(|threads| format!("PRAGMA threads={threads}; "))
+        .unwrap_or_default();
+    let compression_clause = duckdb_compression
+        .map(|compression| format!(", COMPRESSION '{compression}'"))
+        .unwrap_or_default();
     format!(
-        "COPY ({select_sql}) TO '{}' (FORMAT PARQUET);",
+        "{thread_pragma}COPY ({select_sql}) TO '{}' (FORMAT PARQUET{compression_clause});",
         sql_quote(output_path)
     )
 }
@@ -1021,14 +1257,93 @@ async fn ensure_duckdb_version(duckdb_bin: &str) -> Result<String, Box<dyn Error
     Ok(version)
 }
 
-fn ordered_benchmark_execution_options() -> ParquetMergeExecutionOptions {
+fn benchmark_execution_options(config: &BenchmarkConfig) -> ParquetMergeExecutionOptions {
+    ParquetMergeExecutionOptions {
+        parallelism: config.rust_parallelism,
+        unordered_merge_order: config.rust_unordered_order.execution_order(),
+        writer_compression: config.rust_compression.execution_compression(),
+        writer_dictionary_enabled: config.rust_dictionary_enabled,
+        ..ParquetMergeExecutionOptions::default()
+    }
+}
+
+fn ordered_benchmark_execution_options(config: &BenchmarkConfig) -> ParquetMergeExecutionOptions {
     ParquetMergeExecutionOptions {
         ordering_field: Some("event_id".to_string()),
         read_batch_size: 131_072,
         output_batch_rows: 131_072,
         prefetch_batches_per_source: 4,
         output_row_group_rows: 512_000,
+        parallelism: config.rust_parallelism,
+        unordered_merge_order: config.rust_unordered_order.execution_order(),
+        writer_compression: config.rust_compression.execution_compression(),
+        writer_dictionary_enabled: config.rust_dictionary_enabled,
         stats_fast_path: true,
+    }
+}
+
+fn resolve_benchmark_parallelism(requested: usize, input_count: usize) -> usize {
+    if input_count == 0 {
+        return 0;
+    }
+    let target = if requested == 0 {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+    } else {
+        requested
+    };
+    target.max(1).min(input_count)
+}
+
+fn duration_from_timeval(value: libc::timeval) -> Duration {
+    Duration::new(
+        value.tv_sec.max(0) as u64,
+        (value.tv_usec.max(0) as u32) * 1_000,
+    )
+}
+
+fn peak_rss_bytes_from_rusage(usage: &libc::rusage) -> Option<u64> {
+    if usage.ru_maxrss <= 0 {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(usage.ru_maxrss as u64)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some((usage.ru_maxrss as u64) * 1024)
+    }
+}
+
+fn current_process_cpu_usage() -> Option<CpuUsageSnapshot> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    Some(CpuUsageSnapshot {
+        user: duration_from_timeval(usage.ru_utime),
+        system: duration_from_timeval(usage.ru_stime),
+    })
+}
+
+fn duration_delta(after: Duration, before: Duration) -> Duration {
+    after.checked_sub(before).unwrap_or_default()
+}
+
+fn cpu_usage_delta(
+    before: Option<CpuUsageSnapshot>,
+    after: Option<CpuUsageSnapshot>,
+) -> (Option<Duration>, Option<Duration>) {
+    match (before, after) {
+        (Some(before), Some(after)) => (
+            Some(duration_delta(after.user, before.user)),
+            Some(duration_delta(after.system, before.system)),
+        ),
+        _ => (None, None),
     }
 }
 
@@ -1036,37 +1351,49 @@ async fn run_rust_merge(
     scenario: Scenario,
     input_paths: &[PathBuf],
     output_path: &Path,
+    config: &BenchmarkConfig,
 ) -> Result<RustRunResult, Box<dyn Error>> {
     let _ = fs::remove_file(output_path).await;
+    let cpu_before = current_process_cpu_usage();
     let start = Instant::now();
     let report = match scenario {
         Scenario::TopLevelPragmatic => {
-            merge_top_level_parquet_files(
+            merge_top_level_parquet_files_with_execution(
                 input_paths,
                 output_path,
                 &TopLevelMergeOptions {
                     numeric_mode: NumericWideningMode::Float64Pragmatic,
                 },
+                &benchmark_execution_options(config),
             )
             .await?
         }
         Scenario::NestedPayloadPragmatic => {
-            merge_payload_parquet_files(input_paths, output_path, &PayloadMergeOptions::default())
-                .await?
+            merge_payload_parquet_files_with_execution(
+                input_paths,
+                output_path,
+                &PayloadMergeOptions::default(),
+                &benchmark_execution_options(config),
+            )
+            .await?
         }
         Scenario::OrderedPayloadPragmatic => {
             merge_payload_parquet_files_with_execution(
                 input_paths,
                 output_path,
                 &PayloadMergeOptions::default(),
-                &ordered_benchmark_execution_options(),
+                &ordered_benchmark_execution_options(config),
             )
             .await?
         }
     };
+    let cpu_after = current_process_cpu_usage();
+    let (user_cpu_duration, system_cpu_duration) = cpu_usage_delta(cpu_before, cpu_after);
     Ok(RustRunResult {
         duration: start.elapsed(),
         report,
+        user_cpu_duration,
+        system_cpu_duration,
     })
 }
 
@@ -1075,19 +1402,61 @@ async fn run_duckdb_merge(
     duckdb_bin: &str,
     input_paths: &[PathBuf],
     output_path: &Path,
-) -> Result<Duration, Box<dyn Error>> {
+    duckdb_threads: Option<usize>,
+    duckdb_compression: Option<&str>,
+) -> Result<EngineRunResult, Box<dyn Error>> {
     let _ = fs::remove_file(output_path).await;
-    let sql = duckdb_merge_sql(scenario, input_paths, output_path);
+    let sql = duckdb_merge_sql(
+        scenario,
+        input_paths,
+        output_path,
+        duckdb_threads,
+        duckdb_compression,
+    );
+    let duckdb_bin = duckdb_bin.to_string();
+    tokio::task::spawn_blocking(move || run_duckdb_merge_with_rusage(&duckdb_bin, &sql))
+        .await
+        .map_err(|error| format!("DuckDB merge task failed to join: {error}"))?
+        .map_err(|error| error.to_string().into())
+}
+
+fn run_duckdb_merge_with_rusage(
+    duckdb_bin: &str,
+    sql: &str,
+) -> Result<EngineRunResult, Box<dyn Error + Send + Sync>> {
+    let mut child = std::process::Command::new(duckdb_bin)
+        .arg("-c")
+        .arg(sql)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id() as libc::pid_t;
     let start = Instant::now();
-    let output = Command::new(duckdb_bin).arg("-c").arg(sql).output().await?;
-    if !output.status.success() {
-        return Err(format!(
-            "DuckDB merge failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
+    let mut status = 0_i32;
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let waited = unsafe { libc::wait4(pid, &mut status, 0, usage.as_mut_ptr()) };
+    let duration = start.elapsed();
+    if waited < 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
-    Ok(start.elapsed())
+    let usage = unsafe { usage.assume_init() };
+
+    let mut stderr = String::new();
+    if let Some(mut stderr_pipe) = child.stderr.take() {
+        let _ = stderr_pipe.read_to_string(&mut stderr);
+    }
+
+    let exit_status = std::process::ExitStatus::from_raw(status);
+    if !exit_status.success() {
+        return Err(format!("DuckDB merge failed: {stderr}").into());
+    }
+
+    Ok(EngineRunResult {
+        duration,
+        peak_rss_bytes: peak_rss_bytes_from_rusage(&usage),
+        user_cpu_duration: Some(duration_from_timeval(usage.ru_utime)),
+        system_cpu_duration: Some(duration_from_timeval(usage.ru_stime)),
+    })
 }
 
 fn duration_millis(duration: Duration) -> u128 {
@@ -1100,23 +1469,39 @@ fn median_duration(mut values: Vec<Duration>) -> Duration {
 }
 
 fn summarize_engine(
-    warmup: Duration,
-    measured: &[Duration],
+    warmup: &EngineRunResult,
+    measured: &[EngineRunResult],
     rows: u64,
     input_bytes: u64,
     ordered_metrics: Option<OrderedMetricsSummary>,
 ) -> EngineSummary {
-    let median = median_duration(measured.to_vec());
+    let measured_durations = measured.iter().map(|run| run.duration).collect::<Vec<_>>();
+    let median = median_duration(measured_durations.clone());
+    let mut median_indices = (0..measured.len()).collect::<Vec<_>>();
+    median_indices.sort_unstable_by_key(|index| measured[*index].duration);
+    let median_run = &measured[median_indices[median_indices.len() / 2]];
     let seconds = median.as_secs_f64();
+    let total_cpu_duration = median_run
+        .user_cpu_duration
+        .zip(median_run.system_cpu_duration)
+        .map(|(user, system)| user + system);
     EngineSummary {
-        warmup_ms: duration_millis(warmup),
-        measured_ms: measured
+        warmup_ms: duration_millis(warmup.duration),
+        measured_ms: measured_durations
             .iter()
             .map(|value| duration_millis(*value))
             .collect(),
         median_ms: duration_millis(median),
         rows_per_sec: rows as f64 / seconds,
         input_mb_per_sec: (input_bytes as f64 / (1024.0 * 1024.0)) / seconds,
+        peak_rss_bytes: std::iter::once(warmup)
+            .chain(measured.iter())
+            .filter_map(|run| run.peak_rss_bytes)
+            .max(),
+        user_cpu_ms: median_run.user_cpu_duration.map(duration_millis),
+        system_cpu_ms: median_run.system_cpu_duration.map(duration_millis),
+        total_cpu_ms: total_cpu_duration.map(duration_millis),
+        cpu_percent: total_cpu_duration.map(|cpu| cpu.as_secs_f64() / seconds * 100.0),
         ordered_metrics,
     }
 }
@@ -1141,6 +1526,9 @@ fn ordered_metrics_from_report(report: &CompactionReport) -> Option<OrderedMetri
         source_prepare_ms: duration_millis(report.source_prepare_duration),
         ordered_output_assembly_ms: duration_millis(report.ordered_output_assembly_duration),
         writer_write_ms: duration_millis(report.writer_write_duration),
+        writer_encode_work_ms: duration_millis(report.writer_encode_duration),
+        writer_sink_ms: duration_millis(report.writer_sink_duration),
+        writer_close_ms: duration_millis(report.writer_close_duration),
         fast_path_batches: report.fast_path_batches,
         fallback_batches: report.fallback_batches,
         direct_batch_writes: report.direct_batch_writes,
@@ -1154,13 +1542,27 @@ fn summarize_rust_runs(
     rows: u64,
     input_bytes: u64,
 ) -> EngineSummary {
-    let measured_durations = measured.iter().map(|run| run.duration).collect::<Vec<_>>();
     let mut median_indices = (0..measured.len()).collect::<Vec<_>>();
     median_indices.sort_unstable_by_key(|index| measured[*index].duration);
     let median_run = &measured[median_indices[median_indices.len() / 2]];
+    let warmup_engine = EngineRunResult {
+        duration: warmup.duration,
+        peak_rss_bytes: Some(warmup.report.peak_rss_bytes),
+        user_cpu_duration: warmup.user_cpu_duration,
+        system_cpu_duration: warmup.system_cpu_duration,
+    };
+    let measured_engine = measured
+        .iter()
+        .map(|run| EngineRunResult {
+            duration: run.duration,
+            peak_rss_bytes: Some(run.report.peak_rss_bytes),
+            user_cpu_duration: run.user_cpu_duration,
+            system_cpu_duration: run.system_cpu_duration,
+        })
+        .collect::<Vec<_>>();
     summarize_engine(
-        warmup.duration,
-        &measured_durations,
+        &warmup_engine,
+        &measured_engine,
         rows,
         input_bytes,
         ordered_metrics_from_report(&median_run.report),
@@ -1227,12 +1629,20 @@ async fn benchmark_scenario(
 
     let rust_warmup_output = scenario_dir.join("rust_warmup_output.parquet");
     let duckdb_warmup_output = scenario_dir.join("duckdb_warmup_output.parquet");
-    let rust_warmup = run_rust_merge(scenario, &generated.input_paths, &rust_warmup_output).await?;
+    let rust_warmup = run_rust_merge(
+        scenario,
+        &generated.input_paths,
+        &rust_warmup_output,
+        config,
+    )
+    .await?;
     let duckdb_warmup = run_duckdb_merge(
         scenario,
         duckdb_bin,
         &generated.input_paths,
         &duckdb_warmup_output,
+        config.duckdb_threads,
+        config.duckdb_compression.as_deref(),
     )
     .await?;
 
@@ -1254,6 +1664,19 @@ async fn benchmark_scenario(
             rows_per_file: generated.rows_per_file,
             expected_rows,
             input_bytes: generated.input_bytes,
+            rust_resolved_parallelism: resolve_benchmark_parallelism(
+                config.rust_parallelism,
+                generated.input_paths.len(),
+            ),
+            rust_unordered_order: config.rust_unordered_order.label().to_string(),
+            rust_compression: config.rust_compression.label(),
+            rust_dictionary_enabled: config.rust_dictionary_enabled,
+            duckdb_threads: config.duckdb_threads,
+            duckdb_compression: config.duckdb_compression.clone(),
+            rust_output_bytes: 0,
+            duckdb_output_bytes: 0,
+            rust_parquet_metadata: Vec::new(),
+            duckdb_parquet_metadata: Vec::new(),
             validation,
             rust: None,
             duckdb: None,
@@ -1266,19 +1689,46 @@ async fn benchmark_scenario(
     let duckdb_output = scenario_dir.join("duckdb_measured_output.parquet");
 
     for _ in 0..config.measured_runs {
-        rust_runs.push(run_rust_merge(scenario, &generated.input_paths, &rust_output).await?);
+        rust_runs
+            .push(run_rust_merge(scenario, &generated.input_paths, &rust_output, config).await?);
     }
     for _ in 0..config.measured_runs {
         duckdb_runs.push(
-            run_duckdb_merge(scenario, duckdb_bin, &generated.input_paths, &duckdb_output).await?,
+            run_duckdb_merge(
+                scenario,
+                duckdb_bin,
+                &generated.input_paths,
+                &duckdb_output,
+                config.duckdb_threads,
+                config.duckdb_compression.as_deref(),
+            )
+            .await?,
         );
     }
+
+    let rust_output_bytes = std::fs::metadata(&rust_output)?.len();
+    let duckdb_output_bytes = std::fs::metadata(&duckdb_output)?.len();
+    let rust_parquet_metadata = parquet_metadata_summary(&rust_output)?;
+    let duckdb_parquet_metadata = parquet_metadata_summary(&duckdb_output)?;
 
     Ok(ScenarioSummary {
         name: scenario.name().to_string(),
         rows_per_file: generated.rows_per_file,
         expected_rows,
         input_bytes: generated.input_bytes,
+        rust_resolved_parallelism: resolve_benchmark_parallelism(
+            config.rust_parallelism,
+            generated.input_paths.len(),
+        ),
+        rust_unordered_order: config.rust_unordered_order.label().to_string(),
+        rust_compression: config.rust_compression.label(),
+        rust_dictionary_enabled: config.rust_dictionary_enabled,
+        duckdb_threads: config.duckdb_threads,
+        duckdb_compression: config.duckdb_compression.clone(),
+        rust_output_bytes,
+        duckdb_output_bytes,
+        rust_parquet_metadata,
+        duckdb_parquet_metadata,
         validation,
         rust: Some(summarize_rust_runs(
             &rust_warmup,
@@ -1287,7 +1737,7 @@ async fn benchmark_scenario(
             generated.input_bytes,
         )),
         duckdb: Some(summarize_engine(
-            duckdb_warmup,
+            &duckdb_warmup,
             &duckdb_runs,
             expected_rows,
             generated.input_bytes,
@@ -1296,9 +1746,64 @@ async fn benchmark_scenario(
     })
 }
 
+fn format_metadata_summary(summary: &[ParquetMetadataSummary]) -> String {
+    if summary.is_empty() {
+        return "n/a".to_string();
+    }
+    summary
+        .iter()
+        .map(|entry| {
+            format!(
+                "{} [{}] chunks={} compressed={} uncompressed={}",
+                entry.compression,
+                entry.encodings,
+                entry.chunks,
+                entry.compressed_bytes,
+                entry.uncompressed_bytes
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn format_optional_mib(bytes: Option<u64>) -> String {
+    bytes
+        .map(|bytes| format!("{:.2} MiB", bytes as f64 / (1024.0 * 1024.0)))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_optional_ms(value: Option<u128>) -> String {
+    value
+        .map(|value| format!("{value} ms"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_optional_percent(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.0}%"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
 fn print_summary(summary: &BenchmarkSummary) {
     println!("DuckDB CLI: {}", summary.duckdb_version);
     println!("Benchmark artifacts: {}", summary.benchmark_dir);
+    println!(
+        "Rust settings: parallelism={} unordered_order={} compression={} dictionary={} | DuckDB threads={} compression={}",
+        summary.config.rust_parallelism,
+        summary.config.rust_unordered_order.label(),
+        summary.config.rust_compression.label(),
+        summary.config.rust_dictionary_enabled,
+        summary
+            .config
+            .duckdb_threads
+            .map(|threads| threads.to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        summary
+            .config
+            .duckdb_compression
+            .as_deref()
+            .unwrap_or("default")
+    );
     for scenario in &summary.scenarios {
         println!();
         println!("Scenario: {}", scenario.name);
@@ -1306,6 +1811,21 @@ fn print_summary(summary: &BenchmarkSummary) {
             "  Inputs: rows/file={} total_input={:.2} MiB",
             scenario.rows_per_file,
             scenario.input_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "  Rust execution: resolved_parallelism={} unordered_order={} compression={} dictionary={}",
+            scenario.rust_resolved_parallelism,
+            scenario.rust_unordered_order,
+            scenario.rust_compression,
+            scenario.rust_dictionary_enabled
+        );
+        println!(
+            "  DuckDB execution: threads={} compression={}",
+            scenario
+                .duckdb_threads
+                .map(|threads| threads.to_string())
+                .unwrap_or_else(|| "default".to_string()),
+            scenario.duckdb_compression.as_deref().unwrap_or("default")
         );
         println!(
             "  Validation: {} (rows rust={}, duckdb={})",
@@ -1326,6 +1846,18 @@ fn print_summary(summary: &BenchmarkSummary) {
             println!("  Validation detail: {message}");
             continue;
         }
+        println!(
+            "  Output bytes: rust={} duckdb={}",
+            scenario.rust_output_bytes, scenario.duckdb_output_bytes
+        );
+        println!(
+            "  Rust parquet: {}",
+            format_metadata_summary(&scenario.rust_parquet_metadata)
+        );
+        println!(
+            "  DuckDB parquet: {}",
+            format_metadata_summary(&scenario.duckdb_parquet_metadata)
+        );
 
         let rust = scenario
             .rust
@@ -1339,14 +1871,25 @@ fn print_summary(summary: &BenchmarkSummary) {
             "  Rust   median: {} ms | {:>10.0} rows/s | {:>8.2} MiB/s",
             rust.median_ms, rust.rows_per_sec, rust.input_mb_per_sec
         );
+        println!(
+            "          peak_rss={} | cpu={} user={} sys={} ({})",
+            format_optional_mib(rust.peak_rss_bytes),
+            format_optional_ms(rust.total_cpu_ms),
+            format_optional_ms(rust.user_cpu_ms),
+            format_optional_ms(rust.system_cpu_ms),
+            format_optional_percent(rust.cpu_percent),
+        );
         if let Some(metrics) = &rust.ordered_metrics {
             println!(
-                "  Rust ordered: merge={} ms | decode={} ms | prepare={} ms | assembly={} ms | write={} ms | fast_path={} ms",
+                "  Rust ordered: merge={} ms | decode={} ms | prepare={} ms | assembly={} ms | write={} ms | encode_work={} ms | sink={} ms | close={} ms | fast_path={} ms",
                 metrics.ordered_merge_ms,
                 metrics.read_decode_ms,
                 metrics.source_prepare_ms,
                 metrics.ordered_output_assembly_ms,
                 metrics.writer_write_ms,
+                metrics.writer_encode_work_ms,
+                metrics.writer_sink_ms,
+                metrics.writer_close_ms,
                 metrics.stats_fast_path_ms,
             );
             println!(
@@ -1360,6 +1903,14 @@ fn print_summary(summary: &BenchmarkSummary) {
         println!(
             "  DuckDB median: {} ms | {:>10.0} rows/s | {:>8.2} MiB/s",
             duckdb.median_ms, duckdb.rows_per_sec, duckdb.input_mb_per_sec
+        );
+        println!(
+            "          peak_rss={} | cpu={} user={} sys={} ({})",
+            format_optional_mib(duckdb.peak_rss_bytes),
+            format_optional_ms(duckdb.total_cpu_ms),
+            format_optional_ms(duckdb.user_cpu_ms),
+            format_optional_ms(duckdb.system_cpu_ms),
+            format_optional_percent(duckdb.cpu_percent),
         );
     }
 }

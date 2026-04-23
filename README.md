@@ -1,17 +1,8 @@
 # Parquet streaming merge example
 
-Observed across 5 direct `--release` runs on an M3 Max MBP:
-
-- `streaming_merge`: `115-162µs`
-- `async_streaming_merge`: `161-206µs`
-- `async_streaming_merge_widening`: `205-348µs`
-- `async_streaming_merge_payload`: `420-822µs`
-
-These are the in-program merge timings printed by the examples themselves, not total `cargo run` wall-clock time.
-
 ## Async widening merge example
 
-There is now a widening-focused async merge example at `examples/async_streaming_merge_widening.rs`.
+The widening-focused async merge example lives at `examples/async_streaming_merge_widening.rs`.
 
 Run it with:
 
@@ -51,13 +42,13 @@ Run it with:
 
 ### Compiled Engine
 
-The payload path now uses a compiled compaction engine instead of rebuilding name lookups inside the per-batch loop:
+The payload path uses a compiled compaction engine instead of rebuilding name lookups inside the per-batch loop:
 
 - planning computes the output schema once and compiles per-source adapters
 - execution streams batches through cached adapters with an identical-schema fast path
 - nested `Struct` and `List` coercion uses precomputed child indices instead of repeated string lookups
 
-It also now supports an ordered Parquet merge path:
+It also supports an ordered Parquet merge path:
 
 - `merge_payload_parquet_files_with_execution(...)` accepts `ParquetMergeExecutionOptions`
 - ordered mode performs a true k-way merge over inputs already sorted by one top-level envelope column
@@ -133,28 +124,45 @@ Useful env vars:
 - `RPM_BENCH_TARGET_INPUT_GIB=<float>` to scale generated input size by approximate total GiB
 - `RPM_BENCH_FILE_COUNT=<int>` to change the number of input files
 - `RPM_BENCH_MEASURED_RUNS=<int>` to reduce or increase measured repetitions
+- `RPM_BENCH_RUST_PARALLELISM=<int>` to tune Rust merge parallelism (`1` is low-resource/deterministic default, `0` auto-caps to available cores and input count)
+- `RPM_BENCH_RUST_UNORDERED_ORDER=preserve` or `interleaved` to preserve input-file row order or allow fastest unordered writes
+- `RPM_BENCH_RUST_COMPRESSION=uncompressed`, `snappy`, `lz4_raw`, or `zstd:<level>` to choose Rust output compression
+- `RPM_BENCH_RUST_DICTIONARY=true` or `false` to toggle Rust dictionary encoding
+- `RPM_BENCH_DUCKDB_THREADS=<int>` to set DuckDB `PRAGMA threads`
+- `RPM_BENCH_DUCKDB_COMPRESSION=snappy`, `uncompressed`, `zstd`, or `lz4` to set DuckDB output compression
 
-Observed in one local `--release` run on April 19, 2026 on an M3 Max MBP:
+### 1 GiB top-level snapshot
 
-- `top_level_pragmatic`: Rust `14 ms`, DuckDB `30 ms`
-- `nested_payload_pragmatic`: Rust `31 ms`, DuckDB `45 ms`
+Environment: M3 Max MBP, DuckDB CLI `v1.4.1`, `--release`, one measured run.
 
-Observed in one larger local `--release` top-level run on April 19, 2026 using:
-
-`RPM_BENCH_SCENARIO=top_level_pragmatic RPM_BENCH_TARGET_INPUT_GIB=1 RPM_BENCH_MEASURED_RUNS=1 cargo run --release --example rust_vs_duckdb_benchmark`
+`RPM_BENCH_SCENARIO=top_level_pragmatic RPM_BENCH_TARGET_INPUT_GIB=1 RPM_BENCH_MEASURED_RUNS=1 RPM_BENCH_RUST_PARALLELISM=0 RPM_BENCH_RUST_COMPRESSION=snappy cargo run --release --example rust_vs_duckdb_benchmark`
 
 - total input: `1031.70 MiB`
-- Rust `5535 ms`
-- DuckDB `1150 ms`
+- Rust resolved parallelism: `6`
+- Rust `1086 ms`, output `646,169,747` bytes, Snappy
+- Rust peak RSS `831.05 MiB`; CPU `6991 ms` total (`5508 ms` user, `1483 ms` sys, `644%` of wall)
+- DuckDB `1135 ms`, output `455,286,989` bytes, Snappy
+- DuckDB peak RSS `3134.14 MiB`; CPU `6497 ms` total (`5486 ms` user, `1010 ms` sys, `572%` of wall)
+- Rust internal breakdown: decode `723 ms`, prepare `101 ms`, write `1080 ms`
+- Output correctness: DuckDB `EXCEPT ALL` both ways returned zero differing rows (`55,202,568` rows each)
+- Result: Rust and DuckDB are effectively tied on this top-level 1 GiB single-file workload when using DuckDB-comparable Snappy output.
+
+Compression matrix for the same snapshot, all with `RPM_BENCH_RUST_PARALLELISM=0`. Deltas are Rust minus DuckDB, so negative RSS means lower Rust peak memory and positive CPU means higher Rust total CPU:
+
+| Rust compression | Rust median | Rust output bytes | Rust peak RSS | Rust CPU | DuckDB median | DuckDB output bytes | DuckDB peak RSS | DuckDB CPU | RSS delta | CPU delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `uncompressed` | `1119 ms` | `1,231,306,663` | `854.27 MiB` | `6991 ms` (`625%`) | `1126 ms` | `455,286,989` | `3278.52 MiB` | `6353 ms` (`564%`) | `-2424.25 MiB` | `+638 ms` |
+| `snappy` | `1086 ms` | `646,169,747` | `831.05 MiB` | `6991 ms` (`644%`) | `1135 ms` | `455,286,989` | `3134.14 MiB` | `6497 ms` (`572%`) | `-2303.09 MiB` | `+494 ms` |
+| `lz4_raw` | `1108 ms` | `643,242,758` | `769.16 MiB` | `7233 ms` (`652%`) | `1142 ms` | `455,286,989` | `2898.92 MiB` | `6621 ms` (`580%`) | `-2129.76 MiB` | `+612 ms` |
+| `zstd:1` | `1577 ms` | `390,729,708` | `871.42 MiB` | `8496 ms` (`539%`) | `1198 ms` | `455,286,989` | `3086.86 MiB` | `6272 ms` (`523%`) | `-2215.44 MiB` | `+2224 ms` |
+
+Snappy is the DuckDB-comparable Rust benchmark setting because it matches DuckDB's default Parquet output compression. Zstd level 1 is also competitive when output size matters: in this snapshot it produces an output file about 40% smaller than Rust Snappy, with higher CPU and wall time.
+
+A separate DuckDB-uncompressed output run measured DuckDB at `1199 ms`, `1,039,965,398` output bytes, `2778.22 MiB` peak RSS, and `6414 ms` total CPU (`535%` of wall).
+
+The benchmark JSON includes cumulative row-group encode worker time. That value is summed across parallel workers, so it is expected to be larger than elapsed writer wall time.
 
 Important: the comparison should be run in `--release`. A debug-mode `cargo run` makes the Rust merge path look artificially slow and is not a fair comparison against the optimized DuckDB CLI binary.
-
-Observed in one local isolated `--release` ordered 1 GiB run on April 20, 2026 using the same generated `ordered_payload_pragmatic` inputs:
-
-- Rust wall time `6.69 s`, user CPU `10.76 s`, sys CPU `1.03 s`, max RSS `1.70 GiB`
-- Rust internal breakdown: decode `1274 ms`, prepare `209 ms`, assembly `2389 ms`, write `3923 ms`
-- DuckDB wall time `1.06 s`, user CPU `8.23 s`, sys CPU `1.18 s`, max RSS `5.42 GiB`
-- In this workload DuckDB is materially faster, but it is also using substantially more CPU parallelism and memory than the Rust merge path
 
 For a much larger startup-latency-insensitive run, a 10 GiB target is:
 

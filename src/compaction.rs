@@ -1,10 +1,10 @@
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fs::File as StdFile;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,7 +16,7 @@ use super::{
     merge_payload_schemas_pair, merge_top_level_schemas_many, to_parquet_error, widen_data_type,
 };
 use arrow::array::new_null_array;
-use arrow::compute::{cast, concat_batches, interleave_record_batch, take_record_batch};
+use arrow::compute::{cast, concat_batches, take_record_batch};
 use arrow_array::builder::{
     ArrayBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder,
     Int32Builder, Int64Builder, LargeListBuilder, LargeStringBuilder, ListBuilder, NullBuilder,
@@ -30,17 +30,26 @@ use arrow_array::{
 };
 use arrow_buffer::NullBufferBuilder;
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
+use bytes::Bytes;
 use futures_util::StreamExt;
+use futures_util::future::{BoxFuture, FutureExt};
+use futures_util::stream::FuturesUnordered;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, statistics::StatisticsConverter};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_writer::AsyncArrowWriter;
+use parquet::arrow::async_writer::AsyncFileWriter;
+use parquet::arrow::{ArrowSchemaConverter, ArrowWriter, add_encoded_arrow_schema_to_metadata};
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::column::writer::ColumnCloseResult;
+use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::file::properties::WriterProperties;
+use parquet::file::writer::SerializedFileWriter;
 use simd_json::borrowed::Value as BorrowedValue;
 use simd_json::prelude::{TypedScalarValue, ValueAsArray, ValueAsObject, ValueAsScalar};
 use simd_json::{Buffers, to_borrowed_value_with_buffers};
 use tokio::fs::File;
-use tokio::io::BufWriter;
-use tokio::sync::mpsc;
+use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::sync::{Semaphore, mpsc};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompactionOptions {
@@ -79,7 +88,29 @@ pub struct ParquetMergeExecutionOptions {
     pub output_batch_rows: usize,
     pub prefetch_batches_per_source: usize,
     pub output_row_group_rows: usize,
+    pub parallelism: usize,
+    pub unordered_merge_order: UnorderedMergeOrder,
+    pub writer_compression: ParquetCompression,
+    pub writer_dictionary_enabled: bool,
     pub stats_fast_path: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnorderedMergeOrder {
+    #[default]
+    PreserveInputOrder,
+    AllowInterleaved,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParquetCompression {
+    #[default]
+    Uncompressed,
+    Snappy,
+    Lz4Raw,
+    Zstd {
+        level: i32,
+    },
 }
 
 impl Default for ParquetMergeExecutionOptions {
@@ -90,6 +121,10 @@ impl Default for ParquetMergeExecutionOptions {
             output_batch_rows: 32_768,
             prefetch_batches_per_source: 1,
             output_row_group_rows: 128_000,
+            parallelism: 1,
+            unordered_merge_order: UnorderedMergeOrder::PreserveInputOrder,
+            writer_compression: ParquetCompression::Uncompressed,
+            writer_dictionary_enabled: true,
             stats_fast_path: true,
         }
     }
@@ -122,6 +157,9 @@ pub struct CompactionReport {
     pub source_prepare_duration: Duration,
     pub ordered_output_assembly_duration: Duration,
     pub writer_write_duration: Duration,
+    pub writer_encode_duration: Duration,
+    pub writer_sink_duration: Duration,
+    pub writer_close_duration: Duration,
     pub direct_batch_writes: u64,
     pub accumulator_flushes: u64,
 }
@@ -162,12 +200,15 @@ struct ParquetMergeRunStats {
     source_prepare_duration: Duration,
     ordered_output_assembly_duration: Duration,
     writer_write_duration: Duration,
+    writer_encode_duration: Duration,
+    writer_sink_duration: Duration,
+    writer_close_duration: Duration,
     direct_batch_writes: u64,
     accumulator_flushes: u64,
 }
 
 #[derive(Debug, Default)]
-struct OrderedWorkerMetrics {
+struct ParquetWorkerMetrics {
     read_decode_nanos: AtomicU64,
     source_prepare_nanos: AtomicU64,
 }
@@ -920,8 +961,30 @@ pub async fn merge_top_level_parquet_files(
     output_path: &Path,
     options: &TopLevelMergeOptions,
 ) -> Result<CompactionReport, Box<dyn Error>> {
+    merge_top_level_parquet_files_with_execution(
+        input_paths,
+        output_path,
+        options,
+        &ParquetMergeExecutionOptions::default(),
+    )
+    .await
+}
+
+pub async fn merge_top_level_parquet_files_with_execution(
+    input_paths: &[PathBuf],
+    output_path: &Path,
+    options: &TopLevelMergeOptions,
+    execution_options: &ParquetMergeExecutionOptions,
+) -> Result<CompactionReport, Box<dyn Error>> {
     if input_paths.is_empty() {
         return Err(io_error("at least one parquet input path is required").into());
+    }
+    validate_parquet_merge_execution_options(execution_options).map_err(io_error)?;
+    if execution_options.ordering_field.is_some() {
+        return Err(io_error(
+            "top-level parquet merge does not support ordering_field; use unordered execution options",
+        )
+        .into());
     }
 
     let total_start = Instant::now();
@@ -938,9 +1001,10 @@ pub async fn merge_top_level_parquet_files(
         builders.push(builder);
     }
 
-    let plan =
+    let mut plan =
         build_compiled_top_level_plan(schemas.iter().map(|schema| schema.as_ref()), options)?;
 
+    let mut source_adapters = Vec::with_capacity(schemas.len());
     let mut adapter_cache_hits = 0_u64;
     let mut adapter_cache_misses = 0_u64;
     let mut seen_fingerprints = HashSet::with_capacity(schemas.len());
@@ -951,13 +1015,19 @@ pub async fn merge_top_level_parquet_files(
         } else {
             adapter_cache_hits += 1;
         }
+        source_adapters.push(plan.source_adapter_for_schema(schema.as_ref())?);
     }
 
     let planning_duration = planning_start.elapsed();
-    let execution_options = ParquetMergeExecutionOptions::default();
-    let run_stats = merge_parquet_files_unordered(builders, output_path, plan, &execution_options)
-        .await
-        .map_err(io_error)?;
+    let run_stats = merge_parquet_files_unordered(
+        builders,
+        output_path,
+        plan.output_schema.clone(),
+        source_adapters,
+        execution_options,
+    )
+    .await
+    .map_err(io_error)?;
     let output_bytes = std::fs::metadata(output_path)?.len();
 
     Ok(CompactionReport {
@@ -986,6 +1056,9 @@ pub async fn merge_top_level_parquet_files(
         source_prepare_duration: run_stats.source_prepare_duration,
         ordered_output_assembly_duration: run_stats.ordered_output_assembly_duration,
         writer_write_duration: run_stats.writer_write_duration,
+        writer_encode_duration: run_stats.writer_encode_duration,
+        writer_sink_duration: run_stats.writer_sink_duration,
+        writer_close_duration: run_stats.writer_close_duration,
         direct_batch_writes: run_stats.direct_batch_writes,
         accumulator_flushes: run_stats.accumulator_flushes,
     })
@@ -1065,9 +1138,15 @@ pub async fn merge_payload_parquet_files_with_execution(
         .await
         .map_err(io_error)?
     } else {
-        merge_parquet_files_unordered(builders, output_path, plan, execution_options)
-            .await
-            .map_err(io_error)?
+        merge_parquet_files_unordered(
+            builders,
+            output_path,
+            plan.output_schema.clone(),
+            source_adapters,
+            execution_options,
+        )
+        .await
+        .map_err(io_error)?
     };
 
     let output_bytes = std::fs::metadata(output_path)?.len();
@@ -1098,6 +1177,9 @@ pub async fn merge_payload_parquet_files_with_execution(
         source_prepare_duration: run_stats.source_prepare_duration,
         ordered_output_assembly_duration: run_stats.ordered_output_assembly_duration,
         writer_write_duration: run_stats.writer_write_duration,
+        writer_encode_duration: run_stats.writer_encode_duration,
+        writer_sink_duration: run_stats.writer_sink_duration,
+        writer_close_duration: run_stats.writer_close_duration,
         direct_batch_writes: run_stats.direct_batch_writes,
         accumulator_flushes: run_stats.accumulator_flushes,
     })
@@ -1118,12 +1200,35 @@ fn validate_parquet_merge_execution_options(
     if options.output_row_group_rows == 0 {
         return Err("output_row_group_rows must be greater than zero".to_string());
     }
+    if let ParquetCompression::Zstd { level } = options.writer_compression {
+        if !(1..=22).contains(&level) {
+            return Err(format!(
+                "writer_compression zstd level must be between 1 and 22, got {level}"
+            ));
+        }
+    }
     if let Some(ordering_field) = options.ordering_field.as_ref() {
         if ordering_field.trim().is_empty() {
             return Err("ordering_field must not be empty when provided".to_string());
         }
     }
     Ok(())
+}
+
+fn resolve_parquet_parallelism(
+    options: &ParquetMergeExecutionOptions,
+    input_count: usize,
+) -> usize {
+    if input_count == 0 {
+        return 0;
+    }
+
+    let requested = if options.parallelism == 0 {
+        default_scan_parallelism()
+    } else {
+        options.parallelism
+    };
+    requested.max(1).min(input_count)
 }
 
 fn build_parquet_order_plan(
@@ -1334,11 +1439,40 @@ fn extract_stats_order_key(
     }
 }
 
-fn parquet_writer_properties(execution_options: &ParquetMergeExecutionOptions) -> WriterProperties {
-    WriterProperties::builder()
+fn parquet_compression(
+    compression: ParquetCompression,
+) -> Result<Compression, parquet::errors::ParquetError> {
+    match compression {
+        ParquetCompression::Uncompressed => Ok(Compression::UNCOMPRESSED),
+        ParquetCompression::Snappy => Ok(Compression::SNAPPY),
+        ParquetCompression::Lz4Raw => Ok(Compression::LZ4_RAW),
+        ParquetCompression::Zstd { level } => ZstdLevel::try_new(level).map(Compression::ZSTD),
+    }
+}
+
+fn parquet_writer_properties(
+    execution_options: &ParquetMergeExecutionOptions,
+) -> Result<WriterProperties, String> {
+    let compression = parquet_compression(execution_options.writer_compression)
+        .map_err(|error| format!("invalid parquet writer compression: {error}"))?;
+    Ok(WriterProperties::builder()
         .set_max_row_group_size(execution_options.output_row_group_rows)
         .set_write_batch_size(execution_options.output_batch_rows)
-        .build()
+        .set_compression(compression)
+        .set_dictionary_enabled(execution_options.writer_dictionary_enabled)
+        .build())
+}
+
+fn parquet_file_writer_schema_and_properties(
+    output_schema: &Schema,
+    execution_options: &ParquetMergeExecutionOptions,
+) -> Result<(parquet::schema::types::TypePtr, WriterProperties), String> {
+    let parquet_schema = ArrowSchemaConverter::new()
+        .convert(output_schema)
+        .map_err(|error| format!("failed converting arrow schema to parquet schema: {error}"))?;
+    let mut writer_properties = parquet_writer_properties(execution_options)?;
+    add_encoded_arrow_schema_to_metadata(output_schema, &mut writer_properties);
+    Ok((parquet_schema.root_schema_ptr(), writer_properties))
 }
 
 #[derive(Clone, Debug)]
@@ -1453,60 +1587,305 @@ impl OrderedOutputAccumulator {
 
         let batch_sources = std::mem::take(&mut self.batch_sources);
         let fragments = std::mem::take(&mut self.fragments);
-        let record_batches = batch_sources
-            .iter()
-            .map(|source| &source.batch)
+        let batches = fragments
+            .into_iter()
+            .map(|fragment| {
+                batch_sources[fragment.source_index]
+                    .batch
+                    .slice(fragment.start, fragment.len)
+            })
             .collect::<Vec<_>>();
-        let mut indices =
-            Vec::with_capacity(fragments.iter().map(|fragment| fragment.len).sum::<usize>());
-        for fragment in fragments {
-            indices.extend(
-                (fragment.start..fragment.start + fragment.len)
-                    .map(|row| (fragment.source_index, row)),
-            );
-        }
 
-        interleave_record_batch(&record_batches, &indices)
+        concat_batches(&self.schema, batches.iter())
             .map(Some)
             .map_err(|error| format!("failed to materialize ordered output batch: {error}"))
     }
 }
 
 #[derive(Debug, Default)]
-struct OrderedWriterResult {
+struct ParquetWriterResult {
     output_batches: u64,
     write_duration: Duration,
+    encode_duration: Duration,
+    sink_duration: Duration,
+    close_duration: Duration,
+}
+
+#[derive(Debug, Default)]
+struct ParquetAsyncSinkMetrics {
+    sink_nanos: AtomicU64,
+}
+
+impl ParquetAsyncSinkMetrics {
+    fn add_sink_duration(&self, duration: Duration) {
+        self.sink_nanos
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn sink_duration(&self) -> Duration {
+        Duration::from_nanos(self.sink_nanos.load(Ordering::Relaxed))
+    }
 }
 
 #[derive(Debug)]
-struct OrderedOutputWriter {
-    tx: Option<mpsc::Sender<RecordBatch>>,
-    handle: Option<tokio::task::JoinHandle<Result<OrderedWriterResult, String>>>,
+struct TimedAsyncFileWriter {
+    inner: BufWriter<File>,
+    metrics: Arc<ParquetAsyncSinkMetrics>,
 }
 
-impl OrderedOutputWriter {
-    fn new(writer: AsyncArrowWriter<BufWriter<File>>, channel_capacity: usize) -> Self {
+impl TimedAsyncFileWriter {
+    fn new(inner: BufWriter<File>, metrics: Arc<ParquetAsyncSinkMetrics>) -> Self {
+        Self { inner, metrics }
+    }
+}
+
+impl AsyncFileWriter for TimedAsyncFileWriter {
+    fn write(&mut self, bs: Bytes) -> BoxFuture<'_, parquet::errors::Result<()>> {
+        async move {
+            let start = Instant::now();
+            self.inner.write_all(&bs).await?;
+            self.metrics.add_sink_duration(start.elapsed());
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn complete(&mut self) -> BoxFuture<'_, parquet::errors::Result<()>> {
+        async move {
+            let start = Instant::now();
+            self.inner.flush().await?;
+            self.inner.shutdown().await?;
+            self.metrics.add_sink_duration(start.elapsed());
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+type TimedAsyncArrowWriter = AsyncArrowWriter<TimedAsyncFileWriter>;
+
+#[derive(Debug)]
+struct RowGroupEncodeJob {
+    sequence: u64,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    rows: usize,
+    writer_properties: WriterProperties,
+}
+
+#[derive(Debug)]
+struct EncodedRowGroup {
+    sequence: u64,
+    bytes: Bytes,
+    row_group_metadata: parquet::file::metadata::RowGroupMetaDataPtr,
+    encode_duration: Duration,
+}
+
+#[derive(Debug)]
+struct RowGroupBatchAccumulator {
+    schema: SchemaRef,
+    target_rows: usize,
+    writer_properties: WriterProperties,
+    batches: Vec<RecordBatch>,
+    rows: usize,
+    next_sequence: u64,
+}
+
+impl RowGroupBatchAccumulator {
+    fn new(schema: SchemaRef, target_rows: usize, writer_properties: WriterProperties) -> Self {
+        Self {
+            schema,
+            target_rows,
+            writer_properties,
+            batches: Vec::new(),
+            rows: 0,
+            next_sequence: 0,
+        }
+    }
+
+    fn push(&mut self, batch: RecordBatch) -> Vec<RowGroupEncodeJob> {
+        let mut jobs = Vec::new();
+        let mut offset = 0;
+        while offset < batch.num_rows() {
+            let available = self.target_rows - self.rows;
+            let take_rows = available.min(batch.num_rows() - offset);
+            let slice = if offset == 0 && take_rows == batch.num_rows() {
+                batch.clone()
+            } else {
+                batch.slice(offset, take_rows)
+            };
+            self.batches.push(slice);
+            self.rows += take_rows;
+            offset += take_rows;
+
+            if self.rows == self.target_rows {
+                jobs.push(self.flush());
+            }
+        }
+        jobs
+    }
+
+    fn finish(&mut self) -> Option<RowGroupEncodeJob> {
+        (self.rows > 0).then(|| self.flush())
+    }
+
+    fn flush(&mut self) -> RowGroupEncodeJob {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        RowGroupEncodeJob {
+            sequence,
+            schema: self.schema.clone(),
+            batches: std::mem::take(&mut self.batches),
+            rows: std::mem::take(&mut self.rows),
+            writer_properties: self.writer_properties.clone(),
+        }
+    }
+}
+
+type RowGroupEncodeHandle = tokio::task::JoinHandle<Result<EncodedRowGroup, String>>;
+
+fn spawn_row_group_encoder(
+    pending: &mut FuturesUnordered<RowGroupEncodeHandle>,
+    job: RowGroupEncodeJob,
+) {
+    pending.push(tokio::task::spawn_blocking(move || encode_row_group(job)));
+}
+
+fn encode_row_group(job: RowGroupEncodeJob) -> Result<EncodedRowGroup, String> {
+    let encode_start = Instant::now();
+    let mut writer = ArrowWriter::try_new(Vec::new(), job.schema, Some(job.writer_properties))
+        .map_err(|error| format!("failed creating row group encoder: {error}"))?;
+    for batch in &job.batches {
+        writer
+            .write(batch)
+            .map_err(|error| format!("failed encoding row group batch: {error}"))?;
+    }
+    let bytes = Bytes::from(
+        writer
+            .into_inner()
+            .map_err(|error| format!("failed taking encoded row group bytes: {error}"))?,
+    );
+    let metadata = ParquetMetaDataReader::new()
+        .parse_and_finish(&bytes)
+        .map_err(|error| format!("failed reading encoded row group metadata: {error}"))?;
+    if metadata.row_groups().len() != 1 {
+        return Err(format!(
+            "expected exactly one encoded row group, got {}",
+            metadata.row_groups().len()
+        ));
+    }
+    let row_group_metadata = metadata.row_groups()[0].clone();
+    if row_group_metadata.num_rows() != job.rows as i64 {
+        return Err(format!(
+            "encoded row group row count mismatch: expected {}, got {}",
+            job.rows,
+            row_group_metadata.num_rows()
+        ));
+    }
+    Ok(EncodedRowGroup {
+        sequence: job.sequence,
+        bytes,
+        row_group_metadata: row_group_metadata.into(),
+        encode_duration: encode_start.elapsed(),
+    })
+}
+
+fn append_encoded_row_group<W: Write + Send>(
+    writer: &mut SerializedFileWriter<W>,
+    encoded: EncodedRowGroup,
+) -> Result<(), String> {
+    let mut row_group_writer = writer
+        .next_row_group()
+        .map_err(|error| format!("failed creating output row group: {error}"))?;
+    let rows_written = u64::try_from(encoded.row_group_metadata.num_rows())
+        .map_err(|_| "encoded row group row count does not fit u64".to_string())?;
+    for column in encoded.row_group_metadata.columns() {
+        let result = ColumnCloseResult {
+            bytes_written: column.compressed_size() as u64,
+            rows_written,
+            metadata: column.clone(),
+            bloom_filter: None,
+            column_index: None,
+            offset_index: None,
+        };
+        row_group_writer
+            .append_column(&encoded.bytes, result)
+            .map_err(|error| format!("failed appending encoded column chunk: {error}"))?;
+    }
+    row_group_writer
+        .close()
+        .map_err(|error| format!("failed closing output row group: {error}"))?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ParquetOutputWriter {
+    tx: Option<mpsc::Sender<RecordBatch>>,
+    handle: Option<tokio::task::JoinHandle<Result<ParquetWriterResult, String>>>,
+}
+
+impl ParquetOutputWriter {
+    fn new_serial(
+        writer: TimedAsyncArrowWriter,
+        sink_metrics: Arc<ParquetAsyncSinkMetrics>,
+        channel_capacity: usize,
+    ) -> Self {
         let (tx, mut rx) = mpsc::channel::<RecordBatch>(channel_capacity.max(1));
         let handle = tokio::spawn(async move {
             let mut writer = writer;
-            let mut result = OrderedWriterResult::default();
+            let mut result = ParquetWriterResult::default();
             while let Some(batch) = rx.recv().await {
                 let write_start = Instant::now();
+                let sink_before = sink_metrics.sink_duration();
                 writer
                     .write(&batch)
                     .await
                     .map_err(|error| format!("failed writing ordered merge batch: {error}"))?;
-                result.write_duration += write_start.elapsed();
+                let elapsed = write_start.elapsed();
+                let sink_delta = sink_metrics.sink_duration().saturating_sub(sink_before);
+                result.write_duration += elapsed;
+                result.sink_duration += sink_delta;
+                result.encode_duration += elapsed.saturating_sub(sink_delta);
                 result.output_batches += 1;
             }
 
             let close_start = Instant::now();
+            let sink_before = sink_metrics.sink_duration();
             writer
                 .close()
                 .await
                 .map_err(|error| format!("failed closing parquet writer: {error}"))?;
-            result.write_duration += close_start.elapsed();
+            let elapsed = close_start.elapsed();
+            let sink_delta = sink_metrics.sink_duration().saturating_sub(sink_before);
+            result.write_duration += elapsed;
+            result.sink_duration += sink_delta;
+            result.close_duration += elapsed;
             Ok(result)
+        });
+
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+        }
+    }
+
+    fn new_parallel(
+        output_path: PathBuf,
+        output_schema: SchemaRef,
+        execution_options: ParquetMergeExecutionOptions,
+        resolved_parallelism: usize,
+        channel_capacity: usize,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel::<RecordBatch>(channel_capacity.max(1));
+        let handle = tokio::spawn(async move {
+            run_parallel_output_writer(
+                rx,
+                output_path,
+                output_schema,
+                execution_options,
+                resolved_parallelism,
+            )
+            .await
         });
 
         Self {
@@ -1528,10 +1907,10 @@ impl OrderedOutputWriter {
         Ok(())
     }
 
-    async fn finish(&mut self) -> Result<OrderedWriterResult, String> {
+    async fn finish(&mut self) -> Result<ParquetWriterResult, String> {
         self.tx.take();
         let Some(handle) = self.handle.take() else {
-            return Ok(OrderedWriterResult::default());
+            return Ok(ParquetWriterResult::default());
         };
         match handle.await {
             Ok(result) => result,
@@ -1550,6 +1929,134 @@ impl OrderedOutputWriter {
             Err(error) => format!("ordered writer task failed to join: {error}"),
         }
     }
+}
+
+async fn run_parallel_output_writer(
+    mut rx: mpsc::Receiver<RecordBatch>,
+    output_path: PathBuf,
+    output_schema: SchemaRef,
+    execution_options: ParquetMergeExecutionOptions,
+    resolved_parallelism: usize,
+) -> Result<ParquetWriterResult, String> {
+    let mut writer_start = None;
+    let (parquet_schema, final_writer_properties) =
+        parquet_file_writer_schema_and_properties(output_schema.as_ref(), &execution_options)?;
+    let row_group_writer_properties = parquet_writer_properties(&execution_options)?;
+    let output_file = StdFile::create(&output_path)
+        .map_err(|error| format!("failed to create output parquet file: {error}"))?;
+    let mut file_writer = SerializedFileWriter::new(
+        output_file,
+        parquet_schema,
+        Arc::new(final_writer_properties),
+    )
+    .map_err(|error| format!("failed creating output parquet file writer: {error}"))?;
+    let mut accumulator = RowGroupBatchAccumulator::new(
+        output_schema,
+        execution_options.output_row_group_rows,
+        row_group_writer_properties,
+    );
+    let mut pending = FuturesUnordered::new();
+    let mut completed = BTreeMap::new();
+    let mut next_to_write = 0_u64;
+    let mut result = ParquetWriterResult::default();
+    let encoder_limit = resolved_parallelism.max(1);
+
+    while let Some(batch) = rx.recv().await {
+        writer_start.get_or_insert_with(Instant::now);
+        result.output_batches += 1;
+        for job in accumulator.push(batch) {
+            while pending.len() >= encoder_limit {
+                drain_one_encoded_row_group(
+                    &mut pending,
+                    &mut completed,
+                    &mut file_writer,
+                    &mut next_to_write,
+                    &mut result,
+                )
+                .await?;
+            }
+            spawn_row_group_encoder(&mut pending, job);
+        }
+    }
+
+    if let Some(job) = accumulator.finish() {
+        while pending.len() >= encoder_limit {
+            drain_one_encoded_row_group(
+                &mut pending,
+                &mut completed,
+                &mut file_writer,
+                &mut next_to_write,
+                &mut result,
+            )
+            .await?;
+        }
+        spawn_row_group_encoder(&mut pending, job);
+    }
+
+    while !pending.is_empty() {
+        drain_one_encoded_row_group(
+            &mut pending,
+            &mut completed,
+            &mut file_writer,
+            &mut next_to_write,
+            &mut result,
+        )
+        .await?;
+    }
+    write_ready_encoded_row_groups(
+        &mut completed,
+        &mut file_writer,
+        &mut next_to_write,
+        &mut result,
+    )?;
+    if !completed.is_empty() {
+        return Err("encoded row group assembly ended with out-of-order gaps".to_string());
+    }
+
+    let close_start = Instant::now();
+    file_writer
+        .close()
+        .map_err(|error| format!("failed closing parquet writer: {error}"))?;
+    result.close_duration += close_start.elapsed();
+    result.write_duration = writer_start
+        .map(|start| start.elapsed())
+        .unwrap_or(result.close_duration);
+    Ok(result)
+}
+
+async fn drain_one_encoded_row_group<W: Write + Send>(
+    pending: &mut FuturesUnordered<RowGroupEncodeHandle>,
+    completed: &mut BTreeMap<u64, EncodedRowGroup>,
+    writer: &mut SerializedFileWriter<W>,
+    next_to_write: &mut u64,
+    result: &mut ParquetWriterResult,
+) -> Result<(), String> {
+    let Some(join_result) = pending.next().await else {
+        return Ok(());
+    };
+    let encoded = match join_result {
+        Ok(Ok(encoded)) => encoded,
+        Ok(Err(error)) => return Err(error),
+        Err(error) => return Err(format!("row group encoder task failed to join: {error}")),
+    };
+    result.encode_duration += encoded.encode_duration;
+    completed.insert(encoded.sequence, encoded);
+    write_ready_encoded_row_groups(completed, writer, next_to_write, result)
+}
+
+fn write_ready_encoded_row_groups<W: Write + Send>(
+    completed: &mut BTreeMap<u64, EncodedRowGroup>,
+    writer: &mut SerializedFileWriter<W>,
+    next_to_write: &mut u64,
+    result: &mut ParquetWriterResult,
+) -> Result<(), String> {
+    while let Some(encoded) = completed.remove(&*next_to_write) {
+        let sink_start = Instant::now();
+        append_encoded_row_group(writer, encoded)?;
+        result.sink_duration += sink_start.elapsed();
+        *next_to_write += 1;
+    }
+    Ok(())
 }
 
 fn extract_prepared_order_column(
@@ -1913,59 +2420,466 @@ fn compare_source_heads(
 async fn merge_parquet_files_unordered(
     builders: Vec<ParquetRecordBatchStreamBuilder<File>>,
     output_path: &Path,
-    mut plan: CompiledPayloadPlan,
+    output_schema: SchemaRef,
+    source_adapters: Vec<Arc<CompiledSourceAdapter>>,
     execution_options: &ParquetMergeExecutionOptions,
 ) -> Result<ParquetMergeRunStats, String> {
-    let execution_start = Instant::now();
+    let resolved_parallelism = resolve_parquet_parallelism(execution_options, builders.len());
+    if resolved_parallelism <= 1 {
+        return merge_parquet_files_unordered_serial(
+            builders,
+            output_path,
+            output_schema,
+            source_adapters,
+            execution_options,
+        )
+        .await;
+    }
+
+    match execution_options.unordered_merge_order {
+        UnorderedMergeOrder::PreserveInputOrder => {
+            merge_parquet_files_unordered_preserve_order(
+                builders,
+                output_path,
+                output_schema,
+                source_adapters,
+                execution_options,
+                resolved_parallelism,
+            )
+            .await
+        }
+        UnorderedMergeOrder::AllowInterleaved => {
+            merge_parquet_files_unordered_interleaved(
+                builders,
+                output_path,
+                output_schema,
+                source_adapters,
+                execution_options,
+                resolved_parallelism,
+            )
+            .await
+        }
+    }
+}
+
+async fn create_async_parquet_writer(
+    output_path: &Path,
+    output_schema: SchemaRef,
+    execution_options: &ParquetMergeExecutionOptions,
+) -> Result<(TimedAsyncArrowWriter, Arc<ParquetAsyncSinkMetrics>), String> {
     let output_file = File::create(output_path)
         .await
         .map_err(|error| format!("failed to create output parquet file: {error}"))?;
     let output_file = BufWriter::with_capacity(1 << 20, output_file);
-    let writer_properties = parquet_writer_properties(execution_options);
-    let mut writer = AsyncArrowWriter::try_new(
-        output_file,
-        plan.output_schema.clone(),
-        Some(writer_properties),
-    )
-    .map_err(|error| format!("failed to create parquet writer: {error}"))?;
+    let sink_metrics = Arc::new(ParquetAsyncSinkMetrics::default());
+    let output_file = TimedAsyncFileWriter::new(output_file, sink_metrics.clone());
+    let writer_properties = parquet_writer_properties(execution_options)?;
+    let writer = AsyncArrowWriter::try_new(output_file, output_schema, Some(writer_properties))
+        .map_err(|error| format!("failed to create parquet writer: {error}"))?;
+    Ok((writer, sink_metrics))
+}
+
+async fn create_parquet_output_writer(
+    output_path: &Path,
+    output_schema: SchemaRef,
+    execution_options: &ParquetMergeExecutionOptions,
+    resolved_parallelism: usize,
+    channel_capacity: usize,
+) -> Result<ParquetOutputWriter, String> {
+    if resolved_parallelism <= 1 {
+        let (writer, sink_metrics) =
+            create_async_parquet_writer(output_path, output_schema, execution_options).await?;
+        Ok(ParquetOutputWriter::new_serial(
+            writer,
+            sink_metrics,
+            channel_capacity,
+        ))
+    } else {
+        Ok(ParquetOutputWriter::new_parallel(
+            output_path.to_path_buf(),
+            output_schema,
+            execution_options.clone(),
+            resolved_parallelism,
+            channel_capacity,
+        ))
+    }
+}
+
+async fn merge_parquet_files_unordered_serial(
+    builders: Vec<ParquetRecordBatchStreamBuilder<File>>,
+    output_path: &Path,
+    output_schema: SchemaRef,
+    source_adapters: Vec<Arc<CompiledSourceAdapter>>,
+    execution_options: &ParquetMergeExecutionOptions,
+) -> Result<ParquetMergeRunStats, String> {
+    let execution_start = Instant::now();
+    let (mut writer, sink_metrics) =
+        create_async_parquet_writer(output_path, output_schema.clone(), execution_options).await?;
 
     let mut rows = 0_u64;
     let mut input_batches = 0_u64;
     let mut output_batches = 0_u64;
+    let mut read_decode_duration = Duration::default();
+    let mut source_prepare_duration = Duration::default();
+    let mut writer_write_duration = Duration::default();
+    let mut writer_encode_duration = Duration::default();
+    let mut writer_sink_duration = Duration::default();
+    let mut writer_close_duration = Duration::default();
 
-    for builder in builders {
+    for (builder, adapter) in builders.into_iter().zip(source_adapters.into_iter()) {
+        let mut scratch = ExecutionScratch::default();
         let mut stream = builder
             .with_batch_size(execution_options.read_batch_size)
             .build()
             .map_err(|error| format!("failed to build parquet stream: {error}"))?;
-        while let Some(batch_result) = stream.next().await {
+        loop {
+            let decode_start = Instant::now();
+            let batch_result = stream.next().await;
+            read_decode_duration += decode_start.elapsed();
+            let Some(batch_result) = batch_result else {
+                break;
+            };
             let batch =
                 batch_result.map_err(|error| format!("failed reading parquet batch: {error}"))?;
             input_batches += 1;
             rows += batch.num_rows() as u64;
-            let adjusted_batch = plan
-                .adapt_batch(&batch)
+            let prepare_start = Instant::now();
+            let adjusted_batch = adapter
+                .adapt_batch(&batch, &output_schema, &mut scratch)
                 .map_err(|error| format!("failed adapting parquet batch: {error}"))?;
+            source_prepare_duration += prepare_start.elapsed();
+            let write_start = Instant::now();
+            let sink_before = sink_metrics.sink_duration();
             writer
                 .write(&adjusted_batch)
                 .await
                 .map_err(|error| format!("failed writing merged parquet batch: {error}"))?;
+            let elapsed = write_start.elapsed();
+            let sink_delta = sink_metrics.sink_duration().saturating_sub(sink_before);
+            writer_write_duration += elapsed;
+            writer_sink_duration += sink_delta;
+            writer_encode_duration += elapsed.saturating_sub(sink_delta);
             output_batches += 1;
         }
     }
 
+    let close_start = Instant::now();
+    let sink_before = sink_metrics.sink_duration();
     writer
         .close()
         .await
         .map_err(|error| format!("failed closing parquet writer: {error}"))?;
+    let elapsed = close_start.elapsed();
+    let sink_delta = sink_metrics.sink_duration().saturating_sub(sink_before);
+    writer_write_duration += elapsed;
+    writer_sink_duration += sink_delta;
+    writer_close_duration += elapsed;
 
     Ok(ParquetMergeRunStats {
         rows,
         input_batches,
         output_batches,
         execution_duration: execution_start.elapsed(),
+        read_decode_duration,
+        source_prepare_duration,
+        writer_write_duration,
+        writer_encode_duration,
+        writer_sink_duration,
+        writer_close_duration,
         ..ParquetMergeRunStats::default()
     })
+}
+
+#[derive(Debug)]
+struct UnorderedPreparedBatch {
+    batch: RecordBatch,
+    rows: usize,
+}
+
+async fn merge_parquet_files_unordered_preserve_order(
+    builders: Vec<ParquetRecordBatchStreamBuilder<File>>,
+    output_path: &Path,
+    output_schema: SchemaRef,
+    source_adapters: Vec<Arc<CompiledSourceAdapter>>,
+    execution_options: &ParquetMergeExecutionOptions,
+    resolved_parallelism: usize,
+) -> Result<ParquetMergeRunStats, String> {
+    let execution_start = Instant::now();
+    let mut output_writer = create_parquet_output_writer(
+        output_path,
+        output_schema.clone(),
+        execution_options,
+        resolved_parallelism,
+        execution_options.prefetch_batches_per_source.max(1) * resolved_parallelism.max(1),
+    )
+    .await?;
+    let semaphore = Arc::new(Semaphore::new(resolved_parallelism.max(1)));
+    let worker_metrics = Arc::new(ParquetWorkerMetrics::default());
+    let mut receivers = Vec::with_capacity(builders.len());
+    let mut worker_handles = Vec::with_capacity(builders.len());
+
+    for (source_index, (builder, adapter)) in builders
+        .into_iter()
+        .zip(source_adapters.into_iter())
+        .enumerate()
+    {
+        let (tx, rx) = mpsc::channel(execution_options.prefetch_batches_per_source);
+        let output_schema = output_schema.clone();
+        let execution_options = execution_options.clone();
+        let semaphore = semaphore.clone();
+        let worker_metrics = worker_metrics.clone();
+        let handle = tokio::spawn(async move {
+            parquet_unordered_source_worker(
+                source_index,
+                builder,
+                output_schema,
+                adapter,
+                execution_options,
+                semaphore,
+                worker_metrics,
+                tx,
+            )
+            .await
+        });
+        receivers.push(rx);
+        worker_handles.push(handle);
+    }
+
+    let mut stats = ParquetMergeRunStats::default();
+    let mut first_error = None;
+    for receiver in &mut receivers {
+        while let Some(message) = receiver.recv().await {
+            match message {
+                Ok(prepared) => {
+                    stats.input_batches += 1;
+                    stats.rows += prepared.rows as u64;
+                    if let Err(error) = output_writer.send(prepared.batch).await {
+                        first_error = Some(error);
+                        break;
+                    }
+                }
+                Err(error) => {
+                    first_error = Some(error);
+                    break;
+                }
+            }
+        }
+        if first_error.is_some() {
+            break;
+        }
+    }
+    drop(receivers);
+
+    for handle in worker_handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Err(error) => {
+                first_error
+                    .get_or_insert(format!("unordered merge worker failed to join: {error}"));
+            }
+        };
+    }
+
+    if let Some(error) = first_error {
+        let _ = output_writer.finish().await;
+        return Err(error);
+    }
+
+    let writer_result = output_writer.finish().await?;
+    stats.output_batches = writer_result.output_batches;
+    stats.writer_write_duration = writer_result.write_duration;
+    stats.writer_encode_duration = writer_result.encode_duration;
+    stats.writer_sink_duration = writer_result.sink_duration;
+    stats.writer_close_duration = writer_result.close_duration;
+    stats.read_decode_duration =
+        Duration::from_nanos(worker_metrics.read_decode_nanos.load(Ordering::Relaxed));
+    stats.source_prepare_duration =
+        Duration::from_nanos(worker_metrics.source_prepare_nanos.load(Ordering::Relaxed));
+    stats.execution_duration = execution_start.elapsed();
+    Ok(stats)
+}
+
+async fn merge_parquet_files_unordered_interleaved(
+    builders: Vec<ParquetRecordBatchStreamBuilder<File>>,
+    output_path: &Path,
+    output_schema: SchemaRef,
+    source_adapters: Vec<Arc<CompiledSourceAdapter>>,
+    execution_options: &ParquetMergeExecutionOptions,
+    resolved_parallelism: usize,
+) -> Result<ParquetMergeRunStats, String> {
+    let execution_start = Instant::now();
+    let mut output_writer = create_parquet_output_writer(
+        output_path,
+        output_schema.clone(),
+        execution_options,
+        resolved_parallelism,
+        execution_options.prefetch_batches_per_source.max(1) * resolved_parallelism.max(1),
+    )
+    .await?;
+    let semaphore = Arc::new(Semaphore::new(resolved_parallelism.max(1)));
+    let worker_metrics = Arc::new(ParquetWorkerMetrics::default());
+    let channel_capacity =
+        execution_options.prefetch_batches_per_source.max(1) * builders.len().max(1);
+    let (tx, mut rx) = mpsc::channel(channel_capacity);
+    let mut worker_handles = Vec::with_capacity(builders.len());
+
+    for (source_index, (builder, adapter)) in builders
+        .into_iter()
+        .zip(source_adapters.into_iter())
+        .enumerate()
+    {
+        let tx = tx.clone();
+        let output_schema = output_schema.clone();
+        let execution_options = execution_options.clone();
+        let semaphore = semaphore.clone();
+        let worker_metrics = worker_metrics.clone();
+        let handle = tokio::spawn(async move {
+            parquet_unordered_source_worker(
+                source_index,
+                builder,
+                output_schema,
+                adapter,
+                execution_options,
+                semaphore,
+                worker_metrics,
+                tx,
+            )
+            .await
+        });
+        worker_handles.push(handle);
+    }
+    drop(tx);
+
+    let mut stats = ParquetMergeRunStats::default();
+    let mut first_error = None;
+    while let Some(message) = rx.recv().await {
+        match message {
+            Ok(prepared) => {
+                stats.input_batches += 1;
+                stats.rows += prepared.rows as u64;
+                if let Err(error) = output_writer.send(prepared.batch).await {
+                    first_error = Some(error);
+                    break;
+                }
+            }
+            Err(error) => {
+                first_error = Some(error);
+                break;
+            }
+        }
+    }
+    drop(rx);
+
+    for handle in worker_handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Err(error) => {
+                first_error
+                    .get_or_insert(format!("unordered merge worker failed to join: {error}"));
+            }
+        };
+    }
+
+    if let Some(error) = first_error {
+        let _ = output_writer.finish().await;
+        return Err(error);
+    }
+
+    let writer_result = output_writer.finish().await?;
+    stats.output_batches = writer_result.output_batches;
+    stats.writer_write_duration = writer_result.write_duration;
+    stats.writer_encode_duration = writer_result.encode_duration;
+    stats.writer_sink_duration = writer_result.sink_duration;
+    stats.writer_close_duration = writer_result.close_duration;
+    stats.read_decode_duration =
+        Duration::from_nanos(worker_metrics.read_decode_nanos.load(Ordering::Relaxed));
+    stats.source_prepare_duration =
+        Duration::from_nanos(worker_metrics.source_prepare_nanos.load(Ordering::Relaxed));
+    stats.execution_duration = execution_start.elapsed();
+    Ok(stats)
+}
+
+async fn parquet_unordered_source_worker(
+    source_index: usize,
+    builder: ParquetRecordBatchStreamBuilder<File>,
+    output_schema: SchemaRef,
+    adapter: Arc<CompiledSourceAdapter>,
+    execution_options: ParquetMergeExecutionOptions,
+    semaphore: Arc<Semaphore>,
+    worker_metrics: Arc<ParquetWorkerMetrics>,
+    tx: mpsc::Sender<Result<UnorderedPreparedBatch, String>>,
+) -> Result<(), String> {
+    let result: Result<(), String> = async {
+        let mut scratch = ExecutionScratch::default();
+        let mut stream = builder
+            .with_batch_size(execution_options.read_batch_size)
+            .build()
+            .map_err(|error| {
+                format!("failed to build parquet stream for source {source_index}: {error}")
+            })?;
+
+        loop {
+            let batch_result = {
+                let _permit = semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| "parquet merge parallelism semaphore closed".to_string())?;
+                let decode_start = Instant::now();
+                let batch_result = stream.next().await;
+                worker_metrics
+                    .read_decode_nanos
+                    .fetch_add(decode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                batch_result
+            };
+
+            let Some(batch_result) = batch_result else {
+                break;
+            };
+            let batch = batch_result.map_err(|error| {
+                format!("failed reading parquet batch from source {source_index}: {error}")
+            })?;
+            let rows = batch.num_rows();
+            let prepared = {
+                let _permit = semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| "parquet merge parallelism semaphore closed".to_string())?;
+                let prepare_start = Instant::now();
+                let adapted = adapter
+                    .adapt_batch(&batch, &output_schema, &mut scratch)
+                    .map_err(|error| {
+                        format!("failed adapting parquet batch from source {source_index}: {error}")
+                    })?;
+                worker_metrics
+                    .source_prepare_nanos
+                    .fetch_add(prepare_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                UnorderedPreparedBatch {
+                    batch: adapted,
+                    rows,
+                }
+            };
+
+            if tx.send(Ok(prepared)).await.is_err() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = &result {
+        let _ = tx.send(Err(error.clone())).await;
+    }
+
+    result
 }
 
 async fn merge_payload_parquet_files_ordered(
@@ -1978,21 +2892,18 @@ async fn merge_payload_parquet_files_ordered(
     execution_options: &ParquetMergeExecutionOptions,
 ) -> Result<ParquetMergeRunStats, String> {
     let execution_start = Instant::now();
-    let output_file = File::create(output_path)
-        .await
-        .map_err(|error| format!("failed to create output parquet file: {error}"))?;
-    let output_file = BufWriter::with_capacity(1 << 20, output_file);
-    let writer_properties = parquet_writer_properties(execution_options);
-    let writer =
-        AsyncArrowWriter::try_new(output_file, output_schema.clone(), Some(writer_properties))
-            .map_err(|error| format!("failed to create parquet writer: {error}"))?;
-    let mut ordered_writer = OrderedOutputWriter::new(
-        writer,
-        execution_options.prefetch_batches_per_source.max(2) * 2,
-    );
-
     let order_plan = Arc::new(order_plan);
-    let worker_metrics = Arc::new(OrderedWorkerMetrics::default());
+    let worker_metrics = Arc::new(ParquetWorkerMetrics::default());
+    let resolved_parallelism = resolve_parquet_parallelism(execution_options, input_paths.len());
+    let mut ordered_writer = create_parquet_output_writer(
+        output_path,
+        output_schema.clone(),
+        execution_options,
+        resolved_parallelism,
+        execution_options.prefetch_batches_per_source.max(2) * resolved_parallelism.max(1),
+    )
+    .await?;
+    let semaphore = Arc::new(Semaphore::new(resolved_parallelism.max(1)));
     let mut receivers = Vec::with_capacity(input_paths.len());
     let mut worker_handles = Vec::with_capacity(input_paths.len());
     for (source_index, (input_path, adapter)) in input_paths
@@ -2006,6 +2917,7 @@ async fn merge_payload_parquet_files_ordered(
         let order_plan = order_plan.clone();
         let execution_options = execution_options.clone();
         let worker_metrics = worker_metrics.clone();
+        let semaphore = semaphore.clone();
         let handle = tokio::spawn(async move {
             parquet_merge_source_worker(
                 source_index,
@@ -2014,6 +2926,7 @@ async fn merge_payload_parquet_files_ordered(
                 adapter,
                 order_plan,
                 execution_options,
+                semaphore,
                 worker_metrics,
                 tx,
             )
@@ -2122,6 +3035,9 @@ async fn merge_payload_parquet_files_ordered(
     let writer_result = ordered_writer.finish().await?;
     stats.output_batches = writer_result.output_batches;
     stats.writer_write_duration = writer_result.write_duration;
+    stats.writer_encode_duration = writer_result.encode_duration;
+    stats.writer_sink_duration = writer_result.sink_duration;
+    stats.writer_close_duration = writer_result.close_duration;
     stats.read_decode_duration =
         Duration::from_nanos(worker_metrics.read_decode_nanos.load(Ordering::Relaxed));
     stats.source_prepare_duration =
@@ -2220,7 +3136,7 @@ async fn drain_fast_path_source(
     source_index: usize,
     sources: &mut [OrderedMergeSource],
     source_order_metadata: &[SourceOrderMetadata],
-    writer: &mut OrderedOutputWriter,
+    writer: &mut ParquetOutputWriter,
     execution_options: &ParquetMergeExecutionOptions,
     accumulator: &mut OrderedOutputAccumulator,
     stats: &mut ParquetMergeRunStats,
@@ -2275,27 +3191,41 @@ async fn append_rows_from_source(
     source_index: usize,
     row_count: usize,
     sources: &mut [OrderedMergeSource],
-    writer: &mut OrderedOutputWriter,
+    writer: &mut ParquetOutputWriter,
     execution_options: &ParquetMergeExecutionOptions,
     accumulator: &mut OrderedOutputAccumulator,
     stats: &mut ParquetMergeRunStats,
 ) -> Result<(), String> {
     let mut remaining = row_count;
     while remaining > 0 {
-        let (current_row, batch_rows, whole_batch_direct) = {
+        let (current_row, batch_rows, can_write_whole_batch_directly) = {
             let source = &sources[source_index];
             let batch = source
                 .current_batch
                 .as_ref()
                 .expect("appending rows requires an active batch");
             let batch_rows = batch.batch.num_rows() - source.current_row;
-            let whole_batch_direct = accumulator.is_empty()
-                && source.current_row == 0
+            let can_write_whole_batch_directly = source.current_row == 0
                 && remaining >= batch_rows
                 && batch_rows <= execution_options.output_batch_rows;
-            (source.current_row, batch_rows, whole_batch_direct)
+            (
+                source.current_row,
+                batch_rows,
+                can_write_whole_batch_directly,
+            )
         };
 
+        if can_write_whole_batch_directly && !accumulator.is_empty() {
+            let flush_start = Instant::now();
+            if let Some(batch) = accumulator.flush()? {
+                stats.ordered_output_assembly_duration += flush_start.elapsed();
+                writer.send(batch).await?;
+                stats.accumulator_flushes += 1;
+            }
+            continue;
+        }
+
+        let whole_batch_direct = accumulator.is_empty() && can_write_whole_batch_directly;
         if whole_batch_direct {
             let direct_batch = sources[source_index]
                 .current_batch
@@ -2357,7 +3287,8 @@ async fn parquet_merge_source_worker(
     adapter: Arc<CompiledSourceAdapter>,
     order_plan: Arc<ParquetOrderPlan>,
     execution_options: ParquetMergeExecutionOptions,
-    worker_metrics: Arc<OrderedWorkerMetrics>,
+    semaphore: Arc<Semaphore>,
+    worker_metrics: Arc<ParquetWorkerMetrics>,
     tx: mpsc::Sender<Result<PreparedOrderBatch, String>>,
 ) -> Result<(), String> {
     let result: Result<(), String> = async {
@@ -2396,11 +3327,18 @@ async fn parquet_merge_source_worker(
                 })?;
 
             loop {
-                let decode_start = Instant::now();
-                let batch_result = stream.next().await;
-                worker_metrics
-                    .read_decode_nanos
-                    .fetch_add(decode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let batch_result = {
+                    let _permit =
+                        semaphore.clone().acquire_owned().await.map_err(|_| {
+                            "parquet merge parallelism semaphore closed".to_string()
+                        })?;
+                    let decode_start = Instant::now();
+                    let batch_result = stream.next().await;
+                    worker_metrics
+                        .read_decode_nanos
+                        .fetch_add(decode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    batch_result
+                };
                 let Some(batch_result) = batch_result else {
                     break;
                 };
@@ -2411,28 +3349,35 @@ async fn parquet_merge_source_worker(
                         row_group_index
                     )
                 })?;
-                let prepare_start = Instant::now();
-                let adapted = adapter
-                    .adapt_batch(&batch, &output_schema, &mut scratch)
-                    .map_err(|error| {
-                        format!(
-                            "failed adapting parquet batch from `{}` row group {}: {error}",
-                            input_path.display(),
-                            row_group_index
-                        )
-                    })?;
-                let prepared =
-                    PreparedOrderBatch::new(adapted, order_plan.as_ref(), row_group_index)?;
-                validate_prepared_ordered_batch(
-                    &prepared,
-                    &mut last_key,
-                    &input_path,
-                    &order_plan.field_name,
-                    source_index,
-                )?;
-                worker_metrics
-                    .source_prepare_nanos
-                    .fetch_add(prepare_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let prepared = {
+                    let _permit =
+                        semaphore.clone().acquire_owned().await.map_err(|_| {
+                            "parquet merge parallelism semaphore closed".to_string()
+                        })?;
+                    let prepare_start = Instant::now();
+                    let adapted = adapter
+                        .adapt_batch(&batch, &output_schema, &mut scratch)
+                        .map_err(|error| {
+                            format!(
+                                "failed adapting parquet batch from `{}` row group {}: {error}",
+                                input_path.display(),
+                                row_group_index
+                            )
+                        })?;
+                    let prepared =
+                        PreparedOrderBatch::new(adapted, order_plan.as_ref(), row_group_index)?;
+                    validate_prepared_ordered_batch(
+                        &prepared,
+                        &mut last_key,
+                        &input_path,
+                        &order_plan.field_name,
+                        source_index,
+                    )?;
+                    worker_metrics
+                        .source_prepare_nanos
+                        .fetch_add(prepare_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    prepared
+                };
                 if tx.send(Ok(prepared)).await.is_err() {
                     return Ok(());
                 }
@@ -2875,6 +3820,9 @@ pub async fn compact_ndjson_to_parquet(
         source_prepare_duration: Duration::default(),
         ordered_output_assembly_duration: Duration::default(),
         writer_write_duration: Duration::default(),
+        writer_encode_duration: Duration::default(),
+        writer_sink_duration: Duration::default(),
+        writer_close_duration: Duration::default(),
         direct_batch_writes: 0,
         accumulator_flushes: 0,
     })
@@ -5499,6 +6447,7 @@ mod tests {
         LargeStringArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
     };
+    use parquet::file::reader::{FileReader, SerializedFileReader};
     use serde_json::{Value, json};
 
     fn payload_schema_options() -> PayloadMergeOptions {
@@ -5541,6 +6490,10 @@ mod tests {
             output_batch_rows: 2,
             prefetch_batches_per_source: 1,
             output_row_group_rows: 2,
+            parallelism: 1,
+            unordered_merge_order: UnorderedMergeOrder::PreserveInputOrder,
+            writer_compression: ParquetCompression::Uncompressed,
+            writer_dictionary_enabled: true,
             stats_fast_path: true,
         }
     }
@@ -5725,6 +6678,25 @@ mod tests {
             batches.push(batch_result?);
         }
         Ok(batches)
+    }
+
+    fn parquet_compressions(path: &Path) -> Result<Vec<Compression>, Box<dyn Error>> {
+        let file = StdFile::open(path)?;
+        let reader = SerializedFileReader::new(file)?;
+        let mut compressions = Vec::new();
+        for row_group_index in 0..reader.num_row_groups() {
+            let row_group = reader.metadata().row_group(row_group_index);
+            for column in row_group.columns() {
+                compressions.push(column.compression());
+            }
+        }
+        Ok(compressions)
+    }
+
+    fn parquet_row_group_count(path: &Path) -> Result<usize, Box<dyn Error>> {
+        let file = StdFile::open(path)?;
+        let reader = SerializedFileReader::new(file)?;
+        Ok(reader.num_row_groups())
     }
 
     fn write_ndjson(path: &Path, values: &[Value]) -> Result<(), Box<dyn Error>> {
@@ -6765,6 +7737,348 @@ mod tests {
         assert!(!row_group_fast_path_safe(2, &sources, &metadata));
     }
 
+    #[test]
+    fn parquet_parallelism_resolution_handles_auto_serial_and_caps() {
+        let mut options = ParquetMergeExecutionOptions::default();
+        assert_eq!(resolve_parquet_parallelism(&options, 0), 0);
+        assert_eq!(resolve_parquet_parallelism(&options, 4), 1);
+
+        options.parallelism = 0;
+        assert_eq!(
+            resolve_parquet_parallelism(&options, 4),
+            default_scan_parallelism().min(4)
+        );
+
+        options.parallelism = 99;
+        assert_eq!(resolve_parquet_parallelism(&options, 3), 3);
+    }
+
+    #[tokio::test]
+    async fn unordered_payload_parallel_preserves_input_order() -> Result<(), Box<dyn Error>> {
+        let (left_schema, left_batch, right_schema, right_batch) = sample_payload_inputs();
+        let left_path = unique_path("unordered_parallel_left", "parquet");
+        let right_path = unique_path("unordered_parallel_right", "parquet");
+        let output_path = unique_path("unordered_parallel_preserve", "parquet");
+
+        write_parquet(&left_path, left_schema, left_batch).await?;
+        write_parquet(&right_path, right_schema, right_batch).await?;
+
+        let report = merge_payload_parquet_files_with_execution(
+            &[left_path.clone(), right_path.clone()],
+            &output_path,
+            &payload_schema_options(),
+            &ParquetMergeExecutionOptions {
+                read_batch_size: 1,
+                prefetch_batches_per_source: 2,
+                parallelism: 0,
+                unordered_merge_order: UnorderedMergeOrder::PreserveInputOrder,
+                ..ParquetMergeExecutionOptions::default()
+            },
+        )
+        .await?;
+        assert_eq!(report.rows, 4);
+
+        let batches = read_parquet_batches(&output_path).await?;
+        assert_eq!(
+            collect_int32_column(&batches, "event_id"),
+            vec![Some(1), Some(2), Some(3), Some(4)]
+        );
+
+        let _ = tokio::fs::remove_file(left_path).await;
+        let _ = tokio::fs::remove_file(right_path).await;
+        let _ = tokio::fs::remove_file(output_path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unordered_payload_parallel_interleaved_preserves_rows_and_schema()
+    -> Result<(), Box<dyn Error>> {
+        let (left_schema, left_batch, right_schema, right_batch) = sample_payload_inputs();
+        let left_path = unique_path("unordered_interleaved_left", "parquet");
+        let right_path = unique_path("unordered_interleaved_right", "parquet");
+        let output_path = unique_path("unordered_interleaved_output", "parquet");
+
+        write_parquet(&left_path, left_schema, left_batch).await?;
+        write_parquet(&right_path, right_schema, right_batch).await?;
+
+        let report = merge_payload_parquet_files_with_execution(
+            &[left_path.clone(), right_path.clone()],
+            &output_path,
+            &payload_schema_options(),
+            &ParquetMergeExecutionOptions {
+                read_batch_size: 1,
+                prefetch_batches_per_source: 2,
+                parallelism: 0,
+                unordered_merge_order: UnorderedMergeOrder::AllowInterleaved,
+                ..ParquetMergeExecutionOptions::default()
+            },
+        )
+        .await?;
+        assert_eq!(report.rows, 4);
+
+        let batches = read_parquet_batches(&output_path).await?;
+        let merged_schema = batches.first().expect("output batch exists").schema();
+        assert_eq!(collect_int32_column(&batches, "event_id").len(), 4);
+        assert!(merged_schema.field_with_name("payload").is_ok());
+
+        let _ = tokio::fs::remove_file(left_path).await;
+        let _ = tokio::fs::remove_file(right_path).await;
+        let _ = tokio::fs::remove_file(output_path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn top_level_parallel_execution_preserves_input_order() -> Result<(), Box<dyn Error>> {
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int32, false),
+            Field::new("score", DataType::Int32, true),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(10), Some(20)])) as ArrayRef,
+            ],
+        )?;
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("score", DataType::Float64, true),
+            Field::new("event_id", DataType::Int32, false),
+        ]));
+        let right_batch = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(vec![Some(30.0), Some(40.0)])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+            ],
+        )?;
+        let left_path = unique_path("top_level_parallel_left", "parquet");
+        let right_path = unique_path("top_level_parallel_right", "parquet");
+        let output_path = unique_path("top_level_parallel_output", "parquet");
+
+        write_parquet(&left_path, left_schema, left_batch).await?;
+        write_parquet(&right_path, right_schema, right_batch).await?;
+
+        let report = merge_top_level_parquet_files_with_execution(
+            &[left_path.clone(), right_path.clone()],
+            &output_path,
+            &TopLevelMergeOptions::default(),
+            &ParquetMergeExecutionOptions {
+                read_batch_size: 1,
+                prefetch_batches_per_source: 2,
+                parallelism: 0,
+                unordered_merge_order: UnorderedMergeOrder::PreserveInputOrder,
+                ..ParquetMergeExecutionOptions::default()
+            },
+        )
+        .await?;
+        assert_eq!(report.rows, 4);
+
+        let batches = read_parquet_batches(&output_path).await?;
+        assert_eq!(
+            collect_int32_column(&batches, "event_id"),
+            vec![Some(1), Some(2), Some(3), Some(4)]
+        );
+        assert_eq!(
+            batches[0].schema().field_with_name("score")?.data_type(),
+            &DataType::Float64
+        );
+
+        let _ = tokio::fs::remove_file(left_path).await;
+        let _ = tokio::fs::remove_file(right_path).await;
+        let _ = tokio::fs::remove_file(output_path).await;
+        Ok(())
+    }
+
+    #[test]
+    fn parquet_compression_options_validate_and_map() -> Result<(), Box<dyn Error>> {
+        let defaults = ParquetMergeExecutionOptions::default();
+        assert_eq!(
+            defaults.writer_compression,
+            ParquetCompression::Uncompressed
+        );
+        assert!(defaults.writer_dictionary_enabled);
+
+        let snappy = ParquetMergeExecutionOptions {
+            writer_compression: ParquetCompression::Snappy,
+            ..ParquetMergeExecutionOptions::default()
+        };
+        let properties = parquet_writer_properties(&snappy).unwrap();
+        assert_eq!(
+            properties.compression(&parquet::schema::types::ColumnPath::from("x")),
+            Compression::SNAPPY
+        );
+
+        let invalid = ParquetMergeExecutionOptions {
+            writer_compression: ParquetCompression::Zstd { level: 0 },
+            ..ParquetMergeExecutionOptions::default()
+        };
+        assert!(validate_parquet_merge_execution_options(&invalid).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parallel_writer_outputs_requested_compression_and_partial_row_group()
+    -> Result<(), Box<dyn Error>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("c")])) as ArrayRef,
+            ],
+        )?;
+        let right_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![4, 5])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("d"), Some("e")])) as ArrayRef,
+            ],
+        )?;
+        let left_path = unique_path("parallel_compression_left", "parquet");
+        let right_path = unique_path("parallel_compression_right", "parquet");
+        let output_path = unique_path("parallel_compression_output", "parquet");
+
+        write_parquet(&left_path, schema.clone(), left_batch).await?;
+        write_parquet(&right_path, schema, right_batch).await?;
+
+        let report = merge_top_level_parquet_files_with_execution(
+            &[left_path.clone(), right_path.clone()],
+            &output_path,
+            &TopLevelMergeOptions::default(),
+            &ParquetMergeExecutionOptions {
+                read_batch_size: 1,
+                output_batch_rows: 1,
+                output_row_group_rows: 2,
+                prefetch_batches_per_source: 2,
+                parallelism: 2,
+                writer_compression: ParquetCompression::Snappy,
+                ..ParquetMergeExecutionOptions::default()
+            },
+        )
+        .await?;
+        assert_eq!(report.rows, 5);
+        assert_eq!(parquet_row_group_count(&output_path)?, 3);
+        assert!(report.writer_encode_duration > Duration::default());
+        assert!(report.writer_sink_duration > Duration::default());
+        assert!(report.writer_close_duration > Duration::default());
+
+        let batches = read_parquet_batches(&output_path).await?;
+        assert_eq!(
+            collect_int32_column(&batches, "event_id"),
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)]
+        );
+        let compressions = parquet_compressions(&output_path)?;
+        assert!(!compressions.is_empty());
+        assert!(
+            compressions
+                .iter()
+                .all(|codec| *codec == Compression::SNAPPY)
+        );
+
+        let _ = tokio::fs::remove_file(left_path).await;
+        let _ = tokio::fs::remove_file(right_path).await;
+        let _ = tokio::fs::remove_file(output_path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parallel_writer_supports_lz4_raw_and_zstd() -> Result<(), Box<dyn Error>> {
+        for (writer_compression, expected) in [
+            (ParquetCompression::Lz4Raw, Compression::LZ4_RAW),
+            (
+                ParquetCompression::Zstd { level: 1 },
+                Compression::ZSTD(ZstdLevel::try_new(1)?),
+            ),
+        ] {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "event_id",
+                DataType::Int32,
+                false,
+            )]));
+            let left_batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+            )?;
+            let right_batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef],
+            )?;
+            let left_path = unique_path("parallel_codec_left", "parquet");
+            let right_path = unique_path("parallel_codec_right", "parquet");
+            let output_path = unique_path("parallel_codec_output", "parquet");
+
+            write_parquet(&left_path, schema.clone(), left_batch).await?;
+            write_parquet(&right_path, schema, right_batch).await?;
+
+            let report = merge_top_level_parquet_files_with_execution(
+                &[left_path.clone(), right_path.clone()],
+                &output_path,
+                &TopLevelMergeOptions::default(),
+                &ParquetMergeExecutionOptions {
+                    read_batch_size: 1,
+                    output_batch_rows: 1,
+                    output_row_group_rows: 2,
+                    parallelism: 2,
+                    writer_compression,
+                    ..ParquetMergeExecutionOptions::default()
+                },
+            )
+            .await?;
+            assert_eq!(report.rows, 4);
+            assert!(
+                parquet_compressions(&output_path)?
+                    .iter()
+                    .all(|codec| *codec == expected)
+            );
+
+            let _ = tokio::fs::remove_file(left_path).await;
+            let _ = tokio::fs::remove_file(right_path).await;
+            let _ = tokio::fs::remove_file(output_path).await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordered_merge_respects_parallelism_settings() -> Result<(), Box<dyn Error>> {
+        let (left_schema, left_batch, right_schema, right_batch) = sample_payload_inputs();
+        let (left_schema, left_batch) =
+            promote_payload_envelope_to_int64(left_schema, left_batch, &[1, 3], &[10, 20]);
+        let (right_schema, right_batch) =
+            promote_payload_envelope_to_int64(right_schema, right_batch, &[2, 4], &[30, 40]);
+        let left_path = unique_path("ordered_parallel_left", "parquet");
+        let right_path = unique_path("ordered_parallel_right", "parquet");
+        write_parquet(&left_path, left_schema, left_batch).await?;
+        write_parquet(&right_path, right_schema, right_batch).await?;
+
+        for parallelism in [2, 0] {
+            let output_path =
+                unique_path(&format!("ordered_parallel_output_{parallelism}"), "parquet");
+            let report = merge_payload_parquet_files_with_execution(
+                &[left_path.clone(), right_path.clone()],
+                &output_path,
+                &payload_schema_options(),
+                &ParquetMergeExecutionOptions {
+                    parallelism,
+                    ..ordered_execution_options("event_id")
+                },
+            )
+            .await?;
+            assert_eq!(report.rows, 4);
+            assert_eq!(
+                collect_int64_column(&read_parquet_batches(&output_path).await?, "event_id"),
+                vec![Some(1), Some(2), Some(3), Some(4)]
+            );
+            let _ = tokio::fs::remove_file(output_path).await;
+        }
+
+        let _ = tokio::fs::remove_file(left_path).await;
+        let _ = tokio::fs::remove_file(right_path).await;
+        Ok(())
+    }
+
     fn collect_int64_column(batches: &[RecordBatch], field_name: &str) -> Vec<Option<i64>> {
         batches
             .iter()
@@ -6773,6 +8087,21 @@ mod tests {
                     .column(batch.schema().index_of(field_name).unwrap())
                     .as_any()
                     .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn collect_int32_column(batches: &[RecordBatch], field_name: &str) -> Vec<Option<i32>> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(batch.schema().index_of(field_name).unwrap())
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
                     .unwrap()
                     .iter()
                     .collect::<Vec<_>>()

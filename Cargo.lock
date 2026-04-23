@@ -2373,6 +2373,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
+ "bytes",
  "chrono",
  "datafusion",
  "futures-util",
