@@ -278,6 +278,7 @@ struct OrderedMetricsSummary {
     ordered_output_assembly_ms: u128,
     ordered_output_selection_ms: u128,
     ordered_output_materialization_ms: u128,
+    ordered_output_materialization_wait_ms: u128,
     writer_write_ms: u128,
     writer_encode_work_ms: u128,
     writer_sink_ms: u128,
@@ -1572,6 +1573,7 @@ fn ordered_metrics_from_report(report: &CompactionReport) -> Option<OrderedMetri
         && report.ordered_output_assembly_duration == Duration::default()
         && report.ordered_output_selection_duration == Duration::default()
         && report.ordered_output_materialization_duration == Duration::default()
+        && report.ordered_output_materialization_wait_duration == Duration::default()
         && report.fast_path_batches == 0
         && report.fallback_batches == 0
         && report.direct_batch_writes == 0
@@ -1591,6 +1593,9 @@ fn ordered_metrics_from_report(report: &CompactionReport) -> Option<OrderedMetri
         ordered_output_selection_ms: duration_millis(report.ordered_output_selection_duration),
         ordered_output_materialization_ms: duration_millis(
             report.ordered_output_materialization_duration,
+        ),
+        ordered_output_materialization_wait_ms: duration_millis(
+            report.ordered_output_materialization_wait_duration,
         ),
         writer_write_ms: duration_millis(report.writer_write_duration),
         writer_encode_work_ms: duration_millis(report.writer_encode_duration),
@@ -2026,13 +2031,14 @@ fn print_summary(summary: &BenchmarkSummary) {
         );
         if let Some(metrics) = &rust.ordered_metrics {
             println!(
-                "  Rust ordered: merge={} ms | decode={} ms | prepare={} ms | assembly={} ms selection={} ms materialize={} ms | writer_elapsed={} ms encode_work={} ms sink={} ms close={} ms | fast_path={} ms",
+                "  Rust ordered: merge={} ms | decode={} ms | prepare={} ms | assembly={} ms selection={} ms materialize_work={} ms materialize_wait={} ms | writer_elapsed={} ms encode_work={} ms sink={} ms close={} ms | fast_path={} ms",
                 metrics.ordered_merge_ms,
                 metrics.read_decode_ms,
                 metrics.source_prepare_ms,
                 metrics.ordered_output_assembly_ms,
                 metrics.ordered_output_selection_ms,
                 metrics.ordered_output_materialization_ms,
+                metrics.ordered_output_materialization_wait_ms,
                 metrics.writer_write_ms,
                 metrics.writer_encode_work_ms,
                 metrics.writer_sink_ms,

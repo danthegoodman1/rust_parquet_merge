@@ -1,7 +1,7 @@
 use super::*;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow_array::{
     BooleanArray, Date32Array, Date64Array, Float64Array, Int32Array, Int64Array, LargeStringArray,
@@ -1635,6 +1635,191 @@ async fn ordered_merge_respects_parallelism_settings() -> Result<(), Box<dyn Err
     Ok(())
 }
 
+#[tokio::test]
+async fn ordered_merge_typed_drivers_cover_supported_key_types() -> Result<(), Box<dyn Error>> {
+    let cases: Vec<(&str, DataType, ArrayRef, ArrayRef, Vec<Option<String>>)> = vec![
+        (
+            "int64",
+            DataType::Int64,
+            Arc::new(Int64Array::from(vec![1, 3])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![2, 4])) as ArrayRef,
+            ["1", "2", "3", "4"]
+                .into_iter()
+                .map(|value| Some(value.to_string()))
+                .collect(),
+        ),
+        (
+            "uint64",
+            DataType::UInt64,
+            Arc::new(UInt64Array::from(vec![1_u64, 3])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![2_u64, 4])) as ArrayRef,
+            ["1", "2", "3", "4"]
+                .into_iter()
+                .map(|value| Some(value.to_string()))
+                .collect(),
+        ),
+        (
+            "float64",
+            DataType::Float64,
+            Arc::new(Float64Array::from(vec![1.0, 3.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![2.0, 4.0])) as ArrayRef,
+            ["1", "2", "3", "4"]
+                .into_iter()
+                .map(|value| Some(value.to_string()))
+                .collect(),
+        ),
+        (
+            "utf8",
+            DataType::Utf8,
+            Arc::new(StringArray::from(vec![Some("a"), Some("c")])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("b"), Some("d")])) as ArrayRef,
+            ["a", "b", "c", "d"]
+                .into_iter()
+                .map(|value| Some(value.to_string()))
+                .collect(),
+        ),
+        (
+            "large_utf8",
+            DataType::LargeUtf8,
+            Arc::new(LargeStringArray::from(vec![Some("a"), Some("c")])) as ArrayRef,
+            Arc::new(LargeStringArray::from(vec![Some("b"), Some("d")])) as ArrayRef,
+            ["a", "b", "c", "d"]
+                .into_iter()
+                .map(|value| Some(value.to_string()))
+                .collect(),
+        ),
+        (
+            "date32",
+            DataType::Date32,
+            Arc::new(Date32Array::from(vec![1, 3])) as ArrayRef,
+            Arc::new(Date32Array::from(vec![2, 4])) as ArrayRef,
+            ["1", "2", "3", "4"]
+                .into_iter()
+                .map(|value| Some(value.to_string()))
+                .collect(),
+        ),
+        (
+            "date64",
+            DataType::Date64,
+            Arc::new(Date64Array::from(vec![1_i64, 3])) as ArrayRef,
+            Arc::new(Date64Array::from(vec![2_i64, 4])) as ArrayRef,
+            ["1", "2", "3", "4"]
+                .into_iter()
+                .map(|value| Some(value.to_string()))
+                .collect(),
+        ),
+        (
+            "timestamp_second",
+            DataType::Timestamp(arrow_schema::TimeUnit::Second, None),
+            Arc::new(TimestampSecondArray::from(vec![1_i64, 3])) as ArrayRef,
+            Arc::new(TimestampSecondArray::from(vec![2_i64, 4])) as ArrayRef,
+            ["1", "2", "3", "4"]
+                .into_iter()
+                .map(|value| Some(value.to_string()))
+                .collect(),
+        ),
+        (
+            "timestamp_millisecond",
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+            Arc::new(TimestampMillisecondArray::from(vec![1_i64, 3])) as ArrayRef,
+            Arc::new(TimestampMillisecondArray::from(vec![2_i64, 4])) as ArrayRef,
+            ["1", "2", "3", "4"]
+                .into_iter()
+                .map(|value| Some(value.to_string()))
+                .collect(),
+        ),
+        (
+            "timestamp_microsecond",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            Arc::new(TimestampMicrosecondArray::from(vec![1_i64, 3])) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(vec![2_i64, 4])) as ArrayRef,
+            ["1", "2", "3", "4"]
+                .into_iter()
+                .map(|value| Some(value.to_string()))
+                .collect(),
+        ),
+        (
+            "timestamp_nanosecond",
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            Arc::new(TimestampNanosecondArray::from(vec![1_i64, 3])) as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(vec![2_i64, 4])) as ArrayRef,
+            ["1", "2", "3", "4"]
+                .into_iter()
+                .map(|value| Some(value.to_string()))
+                .collect(),
+        ),
+    ];
+
+    let payload_fields: Fields = vec![Arc::new(Field::new("score", DataType::Int32, true))].into();
+
+    for (name, data_type, left_key, right_key, expected) in cases {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("order_key", data_type, false),
+            Field::new("org_id", DataType::Int64, false),
+            Field::new("payload", DataType::Struct(payload_fields.clone()), true),
+        ]));
+        let make_batch =
+            |key: ArrayRef, org_ids: Vec<i64>| -> Result<RecordBatch, Box<dyn Error>> {
+                let payload = Arc::new(StructArray::new(
+                    payload_fields.clone(),
+                    vec![Arc::new(Int32Array::from(vec![Some(10), Some(20)])) as ArrayRef],
+                    None,
+                )) as ArrayRef;
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        key,
+                        Arc::new(Int64Array::from(org_ids)) as ArrayRef,
+                        payload,
+                    ],
+                )
+                .map_err(|error| io_error(error.to_string()).into())
+            };
+
+        let left_path = unique_path(&format!("ordered_typed_{name}_left"), "parquet");
+        let right_path = unique_path(&format!("ordered_typed_{name}_right"), "parquet");
+        let output_path = unique_path(&format!("ordered_typed_{name}_output"), "parquet");
+        write_parquet(
+            &left_path,
+            schema.clone(),
+            make_batch(left_key, vec![10, 30])?,
+        )
+        .await?;
+        write_parquet(
+            &right_path,
+            schema.clone(),
+            make_batch(right_key, vec![20, 40])?,
+        )
+        .await?;
+
+        let report = merge_payload_parquet_files_with_execution(
+            &[left_path.clone(), right_path.clone()],
+            &output_path,
+            &payload_schema_options(),
+            &ParquetMergeExecutionOptions {
+                parallelism: 2,
+                output_batch_rows: 3,
+                output_row_group_rows: 3,
+                ..ordered_execution_options("order_key")
+            },
+        )
+        .await?;
+
+        assert_eq!(report.rows, 4, "{name}");
+        assert_eq!(
+            collect_order_key_column(&read_parquet_batches(&output_path).await?, "order_key"),
+            expected,
+            "{name}"
+        );
+
+        let _ = tokio::fs::remove_file(left_path).await;
+        let _ = tokio::fs::remove_file(right_path).await;
+        let _ = tokio::fs::remove_file(output_path).await;
+    }
+
+    Ok(())
+}
+
 fn collect_int64_column(batches: &[RecordBatch], field_name: &str) -> Vec<Option<i64>> {
     batches
         .iter()
@@ -1681,6 +1866,95 @@ fn collect_string_column(batches: &[RecordBatch], field_name: &str) -> Vec<Optio
         .collect()
 }
 
+fn collect_order_key_column(batches: &[RecordBatch], field_name: &str) -> Vec<Option<String>> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let column = batch.column(batch.schema().index_of(field_name).unwrap());
+            match column.data_type() {
+                DataType::Int64 => column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.map(|value| value.to_string()))
+                    .collect::<Vec<_>>(),
+                DataType::UInt64 => column
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.map(|value| value.to_string()))
+                    .collect::<Vec<_>>(),
+                DataType::Float64 => column
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.map(|value| value.to_string()))
+                    .collect::<Vec<_>>(),
+                DataType::Utf8 => column
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.map(str::to_string))
+                    .collect::<Vec<_>>(),
+                DataType::LargeUtf8 => column
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.map(str::to_string))
+                    .collect::<Vec<_>>(),
+                DataType::Date32 => column
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.map(|value| value.to_string()))
+                    .collect::<Vec<_>>(),
+                DataType::Date64 => column
+                    .as_any()
+                    .downcast_ref::<Date64Array>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.map(|value| value.to_string()))
+                    .collect::<Vec<_>>(),
+                DataType::Timestamp(arrow_schema::TimeUnit::Second, _) => column
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.map(|value| value.to_string()))
+                    .collect::<Vec<_>>(),
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, _) => column
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.map(|value| value.to_string()))
+                    .collect::<Vec<_>>(),
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => column
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.map(|value| value.to_string()))
+                    .collect::<Vec<_>>(),
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => column
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.map(|value| value.to_string()))
+                    .collect::<Vec<_>>(),
+                other => panic!("unsupported ordered test column type: {other:?}"),
+            }
+        })
+        .collect()
+}
+
 fn concat_batch_slices(
     schema: SchemaRef,
     slices: &[(RecordBatch, usize, usize)],
@@ -1690,6 +1964,84 @@ fn concat_batch_slices(
         .map(|(batch, start, len)| batch.slice(*start, *len))
         .collect::<Vec<_>>();
     concat_batches(&schema, &pending).map_err(|error| io_error(error.to_string()).into())
+}
+
+#[tokio::test]
+async fn ordered_output_pipeline_preserves_out_of_order_completion_sequence()
+-> Result<(), Box<dyn Error>> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "event_id",
+        DataType::Int64,
+        false,
+    )]));
+    let first = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+    )?;
+    let second = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![2])) as ArrayRef],
+    )?;
+    let output_path = unique_path("ordered_pipeline_out_of_order", "parquet");
+    let options = ParquetMergeExecutionOptions {
+        output_batch_rows: 1,
+        output_row_group_rows: 1,
+        ..ParquetMergeExecutionOptions::default()
+    };
+    let mut writer = create_parquet_output_writer(&output_path, schema.clone(), &options, 1, 2)
+        .await
+        .map_err(io_error)?;
+    let mut pipeline = OrderedOutputPipeline::new(2);
+    let mut stats = ParquetMergeRunStats::default();
+
+    pipeline
+        .record_completed(
+            OrderedCompletedOutput {
+                sequence: 1,
+                item: OrderedCompletedOutputItem::Batch {
+                    flush: OrderedFlush {
+                        batch: second,
+                        mode: OrderedFlushMode::Direct,
+                    },
+                    count_materialization: false,
+                },
+                materialization_duration: Duration::default(),
+            },
+            &mut writer,
+            &mut stats,
+        )
+        .await
+        .map_err(io_error)?;
+    pipeline
+        .record_completed(
+            OrderedCompletedOutput {
+                sequence: 0,
+                item: OrderedCompletedOutputItem::Batch {
+                    flush: OrderedFlush {
+                        batch: first,
+                        mode: OrderedFlushMode::Direct,
+                    },
+                    count_materialization: false,
+                },
+                materialization_duration: Duration::default(),
+            },
+            &mut writer,
+            &mut stats,
+        )
+        .await
+        .map_err(io_error)?;
+    pipeline
+        .finish(&mut writer, &mut stats)
+        .await
+        .map_err(io_error)?;
+    writer.finish().await.map_err(io_error)?;
+
+    assert_eq!(
+        collect_int64_column(&read_parquet_batches(&output_path).await?, "event_id"),
+        vec![Some(1), Some(2)]
+    );
+    let _ = tokio::fs::remove_file(output_path).await;
+    Ok(())
 }
 
 #[test]

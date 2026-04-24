@@ -144,11 +144,10 @@ Environment: M3 Max MBP, DuckDB CLI `v1.4.1`, `--release`, one measured run.
 
 - total input: `1031.70 MiB`
 - Rust resolved parallelism: `6`
-- Rust `1161 ms`, output `646,169,747` bytes, Snappy
-- Rust peak RSS `861.78 MiB`; CPU `7288 ms` total (`5598 ms` user, `1689 ms` sys, `628%` of wall)
-- DuckDB `1153 ms`, output `455,286,989` bytes, Snappy
-- DuckDB peak RSS `2954.08 MiB`; CPU `6856 ms` total (`5872 ms` user, `983 ms` sys, `595%` of wall)
-- Rust internal breakdown: decode `794 ms`, prepare `104 ms`, writer elapsed `1155 ms`, encode work `5882 ms`, sink `437 ms`
+- Rust `1217 ms`, output `646,169,747` bytes, Snappy
+- Rust peak RSS `771.00 MiB`; CPU `7583 ms` total (`5738 ms` user, `1844 ms` sys, `623%` of wall)
+- DuckDB `1187 ms`, output `455,286,989` bytes, Snappy
+- DuckDB peak RSS `2912.62 MiB`; CPU `7171 ms` total (`6043 ms` user, `1128 ms` sys, `604%` of wall)
 - Output validation: row count and schema matched DuckDB (`55,202,568` rows each)
 - Result: Rust and DuckDB are effectively tied on this top-level 1 GiB single-file workload when using DuckDB-comparable Snappy output.
 
@@ -156,26 +155,27 @@ Compression matrix for the same snapshot, all with `RPM_BENCH_RUST_PARALLELISM=0
 
 | Rust compression | Rust median | Rust output bytes | Rust peak RSS | Rust CPU | DuckDB median | DuckDB output bytes | DuckDB peak RSS | DuckDB CPU | RSS delta | CPU delta |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `snappy` | `1161 ms` | `646,169,747` | `861.78 MiB` | `7288 ms` (`628%`) | `1153 ms` | `455,286,989` | `2954.08 MiB` | `6856 ms` (`595%`) | `-2092.30 MiB` | `+432 ms` |
-| `zstd:1` | `1659 ms` | `390,729,708` | `955.00 MiB` | `9708 ms` (`585%`) | `1254 ms` | `455,286,989` | `2945.66 MiB` | `6616 ms` (`527%`) | `-1990.66 MiB` | `+3092 ms` |
+| `snappy` | `1217 ms` | `646,169,747` | `771.00 MiB` | `7583 ms` (`623%`) | `1187 ms` | `455,286,989` | `2912.62 MiB` | `7171 ms` (`604%`) | `-2141.62 MiB` | `+412 ms` |
+| `zstd:1` | `1345 ms` | `390,729,708` | `845.53 MiB` | `8745 ms` (`650%`) | `1184 ms` | `455,286,989` | `3381.31 MiB` | `7191 ms` (`607%`) | `-2535.78 MiB` | `+1554 ms` |
 
 Snappy is the DuckDB-comparable Rust benchmark setting because it matches DuckDB's default Parquet output compression. Zstd level 1 is also competitive when output size matters: in this snapshot it produces an output file about 40% smaller than Rust Snappy, with higher CPU and wall time.
 
-The benchmark JSON includes cumulative row-group encode worker time. That value is summed across parallel workers, so it is expected to be larger than elapsed writer wall time.
+The benchmark JSON includes cumulative row-group encode worker time and ordered materialization work. Those values are summed across parallel workers, so they can be larger than the corresponding elapsed wall time.
 
 ### 1 GiB ordered payload snapshot
 
-`RPM_BENCH_SCENARIO=ordered_payload_pragmatic RPM_BENCH_TARGET_INPUT_GIB=1 RPM_BENCH_MEASURED_RUNS=1 RPM_BENCH_RUST_PARALLELISM=0 RPM_BENCH_RUST_COMPRESSION=snappy cargo run --release --example rust_vs_duckdb_benchmark`
+`RPM_BENCH_SCENARIO=ordered_payload_pragmatic RPM_BENCH_TARGET_INPUT_GIB=1 RPM_BENCH_MEASURED_RUNS=1 RPM_BENCH_RUST_PARALLELISM=0 RPM_BENCH_RUST_COMPRESSION=snappy RPM_BENCH_EXACT_VALIDATION=true cargo run --release --example rust_vs_duckdb_benchmark`
 
 - total input: `941.89 MiB`
 - Rust resolved parallelism: `6`
-- Rust `5524 ms`, output `366,706,298` bytes, Snappy
-- Rust peak RSS `2157.50 MiB`; CPU `11439 ms` total (`10386 ms` user, `1053 ms` sys, `207%` of wall)
-- DuckDB `1079 ms`, output `315,281,804` bytes, Snappy
-- DuckDB peak RSS `4943.62 MiB`; CPU `9458 ms` total (`8153 ms` user, `1304 ms` sys, `876%` of wall)
-- Delta: Rust `+4445 ms` wall, `-2786.12 MiB` peak RSS, `+1981 ms` total CPU
-- Rust ordered breakdown: decode `1313 ms`, prepare `209 ms`, assembly `3443 ms` (`1569 ms` selection, `1873 ms` materialization), writer elapsed `5469 ms`, encode work `4299 ms`, sink `175 ms`
+- Rust `3857 ms`, output `366,706,298` bytes, Snappy
+- Rust peak RSS `1945.06 MiB`; CPU `11723 ms` total (`10599 ms` user, `1123 ms` sys, `304%` of wall)
+- DuckDB `1153 ms`, output `315,281,804` bytes, Snappy
+- DuckDB peak RSS `5473.56 MiB`; CPU `10616 ms` total (`9107 ms` user, `1508 ms` sys, `921%` of wall)
+- Delta: Rust `+2704 ms` wall, `-3528.50 MiB` peak RSS, `+1107 ms` total CPU
+- Rust ordered breakdown: decode `1399 ms`, prepare `206 ms`, assembly work `3631 ms` (`1768 ms` selection, `1863 ms` materialization work, `15 ms` materialization wait), writer elapsed `3685 ms`, encode work `4352 ms`, sink `187 ms`, close `1 ms`
 - Ordered output used `186` interleave flushes, `0` concat flushes, and `0` direct writes for the dense row-interleaved workload.
+- Exact validation passed with `rust_minus_duckdb=0` and `duckdb_minus_rust=0`.
 
 Important: the comparison should be run in `--release`. A debug-mode `cargo run` makes the Rust merge path look artificially slow and is not a fair comparison against the optimized DuckDB CLI binary.
 

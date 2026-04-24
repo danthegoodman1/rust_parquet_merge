@@ -5,6 +5,7 @@ use std::error::Error;
 use std::fs::File as StdFile;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -158,6 +159,7 @@ pub struct CompactionReport {
     pub ordered_output_assembly_duration: Duration,
     pub ordered_output_selection_duration: Duration,
     pub ordered_output_materialization_duration: Duration,
+    pub ordered_output_materialization_wait_duration: Duration,
     pub writer_write_duration: Duration,
     pub writer_encode_duration: Duration,
     pub writer_sink_duration: Duration,
@@ -215,6 +217,7 @@ struct ParquetMergeRunStats {
     ordered_output_assembly_duration: Duration,
     ordered_output_selection_duration: Duration,
     ordered_output_materialization_duration: Duration,
+    ordered_output_materialization_wait_duration: Duration,
     writer_write_duration: Duration,
     writer_encode_duration: Duration,
     writer_sink_duration: Duration,
@@ -682,6 +685,8 @@ enum ParquetOrderKeyType {
     TimestampNanosecond,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct PreparedOrderBatch {
     batch: RecordBatch,
@@ -691,6 +696,7 @@ struct PreparedOrderBatch {
     non_null_prefix_len: usize,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 enum PreparedOrderColumn {
     Int64(Int64Array),
@@ -718,11 +724,382 @@ enum OrderKeyValue {
     Timestamp(Option<i64>),
 }
 
+trait OrderedKey: Send + Sync + 'static {
+    type Array: Array + Clone + std::fmt::Debug + Send + Sync + 'static;
+
+    const KEY_TYPE: ParquetOrderKeyType;
+    const RUNTIME_NAME: &'static str;
+
+    fn downcast(column: &ArrayRef) -> Option<&Self::Array>;
+    fn compare_values(array: &Self::Array, left: usize, right: usize) -> CmpOrdering;
+    fn compare_arrays(
+        left: &Self::Array,
+        left_row: usize,
+        right: &Self::Array,
+        right_row: usize,
+    ) -> CmpOrdering;
+    fn compare_to_value(array: &Self::Array, row: usize, value: &OrderKeyValue) -> CmpOrdering;
+    fn key_at(array: &Self::Array, row: usize) -> OrderKeyValue;
+
+    fn is_null(array: &Self::Array, row: usize) -> bool {
+        array.is_null(row)
+    }
+
+    fn non_null_prefix_len(array: &Self::Array, row_count: usize) -> usize {
+        let mut low = 0;
+        let mut high = row_count;
+        while low < high {
+            let mid = low + ((high - low) / 2);
+            if Self::is_null(array, mid) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        low
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Int64OrderKey;
+#[derive(Clone, Copy, Debug)]
+struct UInt64OrderKey;
+#[derive(Clone, Copy, Debug)]
+struct Float64OrderKey;
+#[derive(Clone, Copy, Debug)]
+struct Utf8OrderKey;
+#[derive(Clone, Copy, Debug)]
+struct LargeUtf8OrderKey;
+#[derive(Clone, Copy, Debug)]
+struct Date32OrderKey;
+#[derive(Clone, Copy, Debug)]
+struct Date64OrderKey;
+#[derive(Clone, Copy, Debug)]
+struct TimestampSecondOrderKey;
+#[derive(Clone, Copy, Debug)]
+struct TimestampMillisecondOrderKey;
+#[derive(Clone, Copy, Debug)]
+struct TimestampMicrosecondOrderKey;
+#[derive(Clone, Copy, Debug)]
+struct TimestampNanosecondOrderKey;
+
+macro_rules! primitive_order_key {
+    (
+        $key:ident,
+        $array:ty,
+        $key_type:expr,
+        $runtime_name:expr,
+        $compare_values:ident,
+        $compare_arrays:ident,
+        $compare_to_value:ident,
+        $value_variant:ident,
+        $value_type:ty
+    ) => {
+        impl OrderedKey for $key {
+            type Array = $array;
+
+            const KEY_TYPE: ParquetOrderKeyType = $key_type;
+            const RUNTIME_NAME: &'static str = $runtime_name;
+
+            fn downcast(column: &ArrayRef) -> Option<&Self::Array> {
+                column.as_any().downcast_ref::<Self::Array>()
+            }
+
+            fn compare_values(array: &Self::Array, left: usize, right: usize) -> CmpOrdering {
+                $compare_values(array, left, right)
+            }
+
+            fn compare_arrays(
+                left: &Self::Array,
+                left_row: usize,
+                right: &Self::Array,
+                right_row: usize,
+            ) -> CmpOrdering {
+                $compare_arrays(left, left_row, right, right_row)
+            }
+
+            fn compare_to_value(
+                array: &Self::Array,
+                row: usize,
+                value: &OrderKeyValue,
+            ) -> CmpOrdering {
+                match value {
+                    OrderKeyValue::$value_variant(value) => $compare_to_value(array, row, *value),
+                    _ => CmpOrdering::Equal,
+                }
+            }
+
+            fn key_at(array: &Self::Array, row: usize) -> OrderKeyValue {
+                OrderKeyValue::$value_variant(
+                    (!array.is_null(row)).then(|| array.value(row) as $value_type),
+                )
+            }
+        }
+    };
+}
+
+primitive_order_key!(
+    Int64OrderKey,
+    Int64Array,
+    ParquetOrderKeyType::Int64,
+    "Int64",
+    compare_int64_values,
+    compare_int64_arrays,
+    compare_int64_to_value,
+    Int64,
+    i64
+);
+primitive_order_key!(
+    UInt64OrderKey,
+    UInt64Array,
+    ParquetOrderKeyType::UInt64,
+    "UInt64",
+    compare_uint64_values,
+    compare_uint64_arrays,
+    compare_uint64_to_value,
+    UInt64,
+    u64
+);
+primitive_order_key!(
+    Float64OrderKey,
+    Float64Array,
+    ParquetOrderKeyType::Float64,
+    "Float64",
+    compare_float64_values,
+    compare_float64_arrays,
+    compare_float64_to_value,
+    Float64,
+    f64
+);
+primitive_order_key!(
+    Date32OrderKey,
+    Date32Array,
+    ParquetOrderKeyType::Date32,
+    "Date32",
+    compare_date32_values,
+    compare_date32_arrays,
+    compare_date32_to_value,
+    Date32,
+    i32
+);
+primitive_order_key!(
+    Date64OrderKey,
+    Date64Array,
+    ParquetOrderKeyType::Date64,
+    "Date64",
+    compare_date64_values,
+    compare_date64_arrays,
+    compare_date64_to_value,
+    Date64,
+    i64
+);
+
+macro_rules! timestamp_order_key {
+    (
+        $key:ident,
+        $array:ty,
+        $key_type:expr,
+        $runtime_name:expr,
+        $compare_values:ident,
+        $compare_arrays:ident,
+        $compare_to_value:ident
+    ) => {
+        impl OrderedKey for $key {
+            type Array = $array;
+
+            const KEY_TYPE: ParquetOrderKeyType = $key_type;
+            const RUNTIME_NAME: &'static str = $runtime_name;
+
+            fn downcast(column: &ArrayRef) -> Option<&Self::Array> {
+                column.as_any().downcast_ref::<Self::Array>()
+            }
+
+            fn compare_values(array: &Self::Array, left: usize, right: usize) -> CmpOrdering {
+                $compare_values(array, left, right)
+            }
+
+            fn compare_arrays(
+                left: &Self::Array,
+                left_row: usize,
+                right: &Self::Array,
+                right_row: usize,
+            ) -> CmpOrdering {
+                $compare_arrays(left, left_row, right, right_row)
+            }
+
+            fn compare_to_value(
+                array: &Self::Array,
+                row: usize,
+                value: &OrderKeyValue,
+            ) -> CmpOrdering {
+                match value {
+                    OrderKeyValue::Timestamp(value) => $compare_to_value(array, row, *value),
+                    _ => CmpOrdering::Equal,
+                }
+            }
+
+            fn key_at(array: &Self::Array, row: usize) -> OrderKeyValue {
+                OrderKeyValue::Timestamp((!array.is_null(row)).then(|| array.value(row)))
+            }
+        }
+    };
+}
+
+timestamp_order_key!(
+    TimestampSecondOrderKey,
+    TimestampSecondArray,
+    ParquetOrderKeyType::TimestampSecond,
+    "Timestamp(Second)",
+    compare_timestamp_second_values,
+    compare_timestamp_second_arrays,
+    compare_timestamp_second_to_value
+);
+timestamp_order_key!(
+    TimestampMillisecondOrderKey,
+    TimestampMillisecondArray,
+    ParquetOrderKeyType::TimestampMillisecond,
+    "Timestamp(Millisecond)",
+    compare_timestamp_millisecond_values,
+    compare_timestamp_millisecond_arrays,
+    compare_timestamp_millisecond_to_value
+);
+timestamp_order_key!(
+    TimestampMicrosecondOrderKey,
+    TimestampMicrosecondArray,
+    ParquetOrderKeyType::TimestampMicrosecond,
+    "Timestamp(Microsecond)",
+    compare_timestamp_microsecond_values,
+    compare_timestamp_microsecond_arrays,
+    compare_timestamp_microsecond_to_value
+);
+timestamp_order_key!(
+    TimestampNanosecondOrderKey,
+    TimestampNanosecondArray,
+    ParquetOrderKeyType::TimestampNanosecond,
+    "Timestamp(Nanosecond)",
+    compare_timestamp_nanosecond_values,
+    compare_timestamp_nanosecond_arrays,
+    compare_timestamp_nanosecond_to_value
+);
+
+impl OrderedKey for Utf8OrderKey {
+    type Array = StringArray;
+
+    const KEY_TYPE: ParquetOrderKeyType = ParquetOrderKeyType::Utf8;
+    const RUNTIME_NAME: &'static str = "Utf8";
+
+    fn downcast(column: &ArrayRef) -> Option<&Self::Array> {
+        column.as_any().downcast_ref::<Self::Array>()
+    }
+
+    fn compare_values(array: &Self::Array, left: usize, right: usize) -> CmpOrdering {
+        compare_string_values(array, left, right)
+    }
+
+    fn compare_arrays(
+        left: &Self::Array,
+        left_row: usize,
+        right: &Self::Array,
+        right_row: usize,
+    ) -> CmpOrdering {
+        compare_string_arrays(left, left_row, right, right_row)
+    }
+
+    fn compare_to_value(array: &Self::Array, row: usize, value: &OrderKeyValue) -> CmpOrdering {
+        match value {
+            OrderKeyValue::Utf8(value) => compare_string_to_value(array, row, value.as_deref()),
+            _ => CmpOrdering::Equal,
+        }
+    }
+
+    fn key_at(array: &Self::Array, row: usize) -> OrderKeyValue {
+        OrderKeyValue::Utf8((!array.is_null(row)).then(|| array.value(row).to_string()))
+    }
+}
+
+impl OrderedKey for LargeUtf8OrderKey {
+    type Array = LargeStringArray;
+
+    const KEY_TYPE: ParquetOrderKeyType = ParquetOrderKeyType::LargeUtf8;
+    const RUNTIME_NAME: &'static str = "LargeUtf8";
+
+    fn downcast(column: &ArrayRef) -> Option<&Self::Array> {
+        column.as_any().downcast_ref::<Self::Array>()
+    }
+
+    fn compare_values(array: &Self::Array, left: usize, right: usize) -> CmpOrdering {
+        compare_large_string_values(array, left, right)
+    }
+
+    fn compare_arrays(
+        left: &Self::Array,
+        left_row: usize,
+        right: &Self::Array,
+        right_row: usize,
+    ) -> CmpOrdering {
+        compare_large_string_arrays(left, left_row, right, right_row)
+    }
+
+    fn compare_to_value(array: &Self::Array, row: usize, value: &OrderKeyValue) -> CmpOrdering {
+        match value {
+            OrderKeyValue::LargeUtf8(value) => {
+                compare_large_string_to_value(array, row, value.as_deref())
+            }
+            _ => CmpOrdering::Equal,
+        }
+    }
+
+    fn key_at(array: &Self::Array, row: usize) -> OrderKeyValue {
+        OrderKeyValue::LargeUtf8((!array.is_null(row)).then(|| array.value(row).to_string()))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreparedOrderBatchTyped<K: OrderedKey> {
+    batch: RecordBatch,
+    order_column: K::Array,
+    row_group_index: usize,
+    row_group_batch_index: usize,
+    non_null_prefix_len: usize,
+    _key: PhantomData<K>,
+}
+
+impl<K: OrderedKey> PreparedOrderBatchTyped<K> {
+    fn new(
+        batch: RecordBatch,
+        order_plan: &ParquetOrderPlan,
+        row_group_index: usize,
+        row_group_batch_index: usize,
+    ) -> Result<Self, String> {
+        let column = batch.column(order_plan.field_index);
+        let order_column = K::downcast(column).cloned().ok_or_else(|| {
+            format!(
+                "ordering_field `{}` is not {} at runtime",
+                order_plan.field_name,
+                K::RUNTIME_NAME
+            )
+        })?;
+        let non_null_prefix_len = K::non_null_prefix_len(&order_column, batch.num_rows());
+        Ok(Self {
+            batch,
+            order_column,
+            row_group_index,
+            row_group_batch_index,
+            non_null_prefix_len,
+            _key: PhantomData,
+        })
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 struct SourceHeadHeap {
     indices: Vec<usize>,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug)]
 struct OrderedMergeSource {
     source_index: usize,
@@ -731,6 +1108,8 @@ struct OrderedMergeSource {
     current_row: usize,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 impl OrderedMergeSource {
     fn new(
         source_index: usize,
@@ -862,6 +1241,224 @@ struct HeapEntry {
     source_index: usize,
 }
 
+#[derive(Debug)]
+struct OrderedMergeSourceTyped<K: OrderedKey> {
+    source_index: usize,
+    receiver: mpsc::Receiver<Result<PreparedOrderBatchTyped<K>, String>>,
+    current_batch: Option<PreparedOrderBatchTyped<K>>,
+    current_row: usize,
+}
+
+impl<K: OrderedKey> OrderedMergeSourceTyped<K> {
+    fn new(
+        source_index: usize,
+        receiver: mpsc::Receiver<Result<PreparedOrderBatchTyped<K>, String>>,
+    ) -> Self {
+        Self {
+            source_index,
+            receiver,
+            current_batch: None,
+            current_row: 0,
+        }
+    }
+
+    async fn load_next(&mut self, input_batches: &mut u64) -> Result<bool, String> {
+        match self.receiver.recv().await {
+            Some(Ok(batch)) => {
+                *input_batches += 1;
+                self.current_batch = Some(batch);
+                self.current_row = 0;
+                Ok(true)
+            }
+            Some(Err(error)) => Err(error),
+            None => {
+                self.current_batch = None;
+                self.current_row = 0;
+                Ok(false)
+            }
+        }
+    }
+
+    fn current_row_group_index(&self) -> Option<usize> {
+        self.current_batch
+            .as_ref()
+            .map(|batch| batch.row_group_index)
+    }
+
+    fn has_non_null_remaining(&self) -> bool {
+        let Some(batch) = self.current_batch.as_ref() else {
+            return false;
+        };
+        self.current_row < batch.non_null_prefix_len
+    }
+
+    fn compare_head_to_source(&self, other: &Self) -> CmpOrdering {
+        self.compare_row_to_source(self.current_row, other)
+    }
+
+    fn compare_row_to_source(&self, row: usize, other: &Self) -> CmpOrdering {
+        let self_batch = self
+            .current_batch
+            .as_ref()
+            .expect("row comparison requires an active batch");
+        let other_batch = other
+            .current_batch
+            .as_ref()
+            .expect("row comparison requires an active batch");
+        let ordering = K::compare_arrays(
+            &self_batch.order_column,
+            row,
+            &other_batch.order_column,
+            other.current_row,
+        );
+        if ordering == CmpOrdering::Equal {
+            self.source_index.cmp(&other.source_index)
+        } else {
+            ordering
+        }
+    }
+
+    fn contiguous_run_len(&self, next_competitor: Option<&Self>, max_rows: usize) -> usize {
+        let Some(batch) = self.current_batch.as_ref() else {
+            return 0;
+        };
+        if max_rows == 0 {
+            return 0;
+        }
+
+        let available = batch.batch.num_rows() - self.current_row;
+        let limit = available.min(max_rows);
+        if limit == 0 {
+            return 0;
+        }
+
+        let Some(competitor) = next_competitor else {
+            return limit;
+        };
+
+        if limit == 1 {
+            return 1;
+        }
+
+        if self.compare_row_to_source(self.current_row + 1, competitor) == CmpOrdering::Greater {
+            return 1;
+        }
+
+        let mut low = 2;
+        let mut high = limit;
+        while low < high {
+            let mid = low + ((high - low + 1) / 2);
+            let row = self.current_row + mid - 1;
+            if self.compare_row_to_source(row, competitor) == CmpOrdering::Greater {
+                high = mid - 1;
+            } else {
+                low = mid;
+            }
+        }
+        low
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TypedSourceHeadHeap<K: OrderedKey> {
+    indices: Vec<usize>,
+    _key: PhantomData<K>,
+}
+
+impl<K: OrderedKey> TypedSourceHeadHeap<K> {
+    fn new() -> Self {
+        Self {
+            indices: Vec::new(),
+            _key: PhantomData,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    fn push(&mut self, source_index: usize, sources: &[OrderedMergeSourceTyped<K>]) {
+        self.indices.push(source_index);
+        let last = self.indices.len() - 1;
+        self.sift_up(last, sources);
+    }
+
+    fn pop(&mut self, sources: &[OrderedMergeSourceTyped<K>]) -> Option<HeapEntry> {
+        if self.indices.is_empty() {
+            return None;
+        }
+        let source_index = self.indices.swap_remove(0);
+        if !self.indices.is_empty() {
+            self.sift_down(0, sources);
+        }
+        Some(HeapEntry { source_index })
+    }
+
+    fn peek(&self) -> Option<HeapEntry> {
+        self.indices
+            .first()
+            .copied()
+            .map(|source_index| HeapEntry { source_index })
+    }
+
+    fn remove(&mut self, source_index: usize, sources: &[OrderedMergeSourceTyped<K>]) -> bool {
+        let Some(position) = self.indices.iter().position(|index| *index == source_index) else {
+            return false;
+        };
+        self.indices.swap_remove(position);
+        if position < self.indices.len() {
+            self.sift_down(position, sources);
+            self.sift_up(position, sources);
+        }
+        true
+    }
+
+    fn sift_up(&mut self, mut position: usize, sources: &[OrderedMergeSourceTyped<K>]) {
+        while position > 0 {
+            let parent = (position - 1) / 2;
+            if !self.less(self.indices[position], self.indices[parent], sources) {
+                break;
+            }
+            self.indices.swap(position, parent);
+            position = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut position: usize, sources: &[OrderedMergeSourceTyped<K>]) {
+        loop {
+            let left = position * 2 + 1;
+            let right = left + 1;
+            let mut smallest = position;
+            if left < self.indices.len()
+                && self.less(self.indices[left], self.indices[smallest], sources)
+            {
+                smallest = left;
+            }
+            if right < self.indices.len()
+                && self.less(self.indices[right], self.indices[smallest], sources)
+            {
+                smallest = right;
+            }
+            if smallest == position {
+                break;
+            }
+            self.indices.swap(position, smallest);
+            position = smallest;
+        }
+    }
+
+    fn less(
+        &self,
+        left_index: usize,
+        right_index: usize,
+        sources: &[OrderedMergeSourceTyped<K>],
+    ) -> bool {
+        sources[left_index].compare_head_to_source(&sources[right_index]) == CmpOrdering::Less
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 impl SourceHeadHeap {
     fn new() -> Self {
         Self {
@@ -1089,6 +1686,8 @@ pub async fn merge_top_level_parquet_files_with_execution(
         ordered_output_assembly_duration: run_stats.ordered_output_assembly_duration,
         ordered_output_selection_duration: run_stats.ordered_output_selection_duration,
         ordered_output_materialization_duration: run_stats.ordered_output_materialization_duration,
+        ordered_output_materialization_wait_duration: run_stats
+            .ordered_output_materialization_wait_duration,
         writer_write_duration: run_stats.writer_write_duration,
         writer_encode_duration: run_stats.writer_encode_duration,
         writer_sink_duration: run_stats.writer_sink_duration,
@@ -1220,6 +1819,8 @@ pub async fn merge_payload_parquet_files_with_execution(
         ordered_output_assembly_duration: run_stats.ordered_output_assembly_duration,
         ordered_output_selection_duration: run_stats.ordered_output_selection_duration,
         ordered_output_materialization_duration: run_stats.ordered_output_materialization_duration,
+        ordered_output_materialization_wait_duration: run_stats
+            .ordered_output_materialization_wait_duration,
         writer_write_duration: run_stats.writer_write_duration,
         writer_encode_duration: run_stats.writer_encode_duration,
         writer_sink_duration: run_stats.writer_sink_duration,
@@ -1642,6 +2243,68 @@ struct OrderedFlush {
     mode: OrderedFlushMode,
 }
 
+#[derive(Debug)]
+enum OrderedFlushSegment {
+    Completed(OrderedFlush),
+    Materialize(OrderedMaterializationJob),
+}
+
+#[derive(Debug)]
+struct OrderedMaterializationJob {
+    schema: SchemaRef,
+    batch_sources: Vec<OrderedBatchSource>,
+    fragments: Vec<OrderedBatchFragment>,
+    rows: usize,
+    mode: OrderedFlushMode,
+}
+
+impl OrderedMaterializationJob {
+    fn materialize(self) -> Result<OrderedFlush, String> {
+        match self.mode {
+            OrderedFlushMode::Direct => Err(
+                "direct ordered flushes should not be scheduled for materialization".to_string(),
+            ),
+            OrderedFlushMode::Interleave => {
+                let batch_refs = self
+                    .batch_sources
+                    .iter()
+                    .map(|source| &source.batch)
+                    .collect::<Vec<_>>();
+                let mut indices = Vec::with_capacity(self.rows);
+                for fragment in self.fragments {
+                    for row in fragment.start..fragment.start + fragment.len {
+                        indices.push((fragment.source_index, row));
+                    }
+                }
+                interleave_record_batch(&batch_refs, &indices)
+                    .map(|batch| OrderedFlush {
+                        batch,
+                        mode: OrderedFlushMode::Interleave,
+                    })
+                    .map_err(|error| format!("failed to interleave ordered output batch: {error}"))
+            }
+            OrderedFlushMode::Concat => {
+                let batches = self
+                    .fragments
+                    .into_iter()
+                    .map(|fragment| {
+                        self.batch_sources[fragment.source_index]
+                            .batch
+                            .slice(fragment.start, fragment.len)
+                    })
+                    .collect::<Vec<_>>();
+
+                concat_batches(&self.schema, batches.iter())
+                    .map(|batch| OrderedFlush {
+                        batch,
+                        mode: OrderedFlushMode::Concat,
+                    })
+                    .map_err(|error| format!("failed to materialize ordered output batch: {error}"))
+            }
+        }
+    }
+}
+
 impl OrderedOutputAccumulator {
     const CONCAT_FRAGMENT_LIMIT: usize = 8;
     const CONCAT_MIN_AVG_FRAGMENT_ROWS: usize = 1024;
@@ -1721,7 +2384,18 @@ impl OrderedOutputAccumulator {
         Ok(self.flush_with_mode()?.map(|flushed| flushed.batch))
     }
 
+    #[cfg(test)]
     fn flush_with_mode(&mut self) -> Result<Option<OrderedFlush>, String> {
+        let Some(segment) = self.flush_segment()? else {
+            return Ok(None);
+        };
+        match segment {
+            OrderedFlushSegment::Completed(flush) => Ok(Some(flush)),
+            OrderedFlushSegment::Materialize(job) => job.materialize().map(Some),
+        }
+    }
+
+    fn flush_segment(&mut self) -> Result<Option<OrderedFlushSegment>, String> {
         if self.rows == 0 {
             return Ok(None);
         }
@@ -1742,52 +2416,28 @@ impl OrderedOutputAccumulator {
             } else {
                 batch.slice(fragment.start, fragment.len)
             };
-            return Ok(Some(OrderedFlush {
+            return Ok(Some(OrderedFlushSegment::Completed(OrderedFlush {
                 batch,
                 mode: OrderedFlushMode::Direct,
-            }));
+            })));
         }
 
         let batch_sources = std::mem::take(&mut self.batch_sources);
         let fragments = std::mem::take(&mut self.fragments);
-        if Self::should_interleave(&fragments, rows) {
-            let batch_refs = batch_sources
-                .iter()
-                .map(|source| &source.batch)
-                .collect::<Vec<_>>();
-            let mut indices = Vec::with_capacity(rows);
-            for fragment in fragments {
-                for row in fragment.start..fragment.start + fragment.len {
-                    indices.push((fragment.source_index, row));
-                }
-            }
-            return interleave_record_batch(&batch_refs, &indices)
-                .map(|batch| {
-                    Some(OrderedFlush {
-                        batch,
-                        mode: OrderedFlushMode::Interleave,
-                    })
-                })
-                .map_err(|error| format!("failed to interleave ordered output batch: {error}"));
-        }
-
-        let batches = fragments
-            .into_iter()
-            .map(|fragment| {
-                batch_sources[fragment.source_index]
-                    .batch
-                    .slice(fragment.start, fragment.len)
-            })
-            .collect::<Vec<_>>();
-
-        concat_batches(&self.schema, batches.iter())
-            .map(|batch| {
-                Some(OrderedFlush {
-                    batch,
-                    mode: OrderedFlushMode::Concat,
-                })
-            })
-            .map_err(|error| format!("failed to materialize ordered output batch: {error}"))
+        let mode = if Self::should_interleave(&fragments, rows) {
+            OrderedFlushMode::Interleave
+        } else {
+            OrderedFlushMode::Concat
+        };
+        Ok(Some(OrderedFlushSegment::Materialize(
+            OrderedMaterializationJob {
+                schema: self.schema.clone(),
+                batch_sources,
+                fragments,
+                rows,
+                mode,
+            },
+        )))
     }
 
     fn should_interleave(fragments: &[OrderedBatchFragment], rows: usize) -> bool {
@@ -1814,6 +2464,232 @@ fn ordered_batch_identity(batch: &RecordBatch) -> OrderedBatchIdentity {
             .iter()
             .map(|column| Arc::as_ptr(column) as *const () as usize)
             .collect(),
+    }
+}
+
+#[derive(Debug)]
+enum OrderedCompletedOutputItem {
+    Batch {
+        flush: OrderedFlush,
+        count_materialization: bool,
+    },
+    CopyRowGroup(RowGroupCopyRequest),
+}
+
+#[derive(Debug)]
+struct OrderedCompletedOutput {
+    sequence: u64,
+    item: OrderedCompletedOutputItem,
+    materialization_duration: Duration,
+}
+
+type OrderedMaterializationHandle = tokio::task::JoinHandle<Result<OrderedCompletedOutput, String>>;
+
+#[derive(Debug)]
+struct OrderedOutputPipeline {
+    pending: FuturesUnordered<OrderedMaterializationHandle>,
+    completed: BTreeMap<u64, OrderedCompletedOutput>,
+    next_sequence: u64,
+    next_to_send: u64,
+    limit: usize,
+}
+
+impl OrderedOutputPipeline {
+    fn new(limit: usize) -> Self {
+        Self {
+            pending: FuturesUnordered::new(),
+            completed: BTreeMap::new(),
+            next_sequence: 0,
+            next_to_send: 0,
+            limit: limit.max(1),
+        }
+    }
+
+    async fn submit_flush_segment(
+        &mut self,
+        segment: OrderedFlushSegment,
+        writer: &mut ParquetOutputWriter,
+        stats: &mut ParquetMergeRunStats,
+        direct_materialization_duration: Duration,
+    ) -> Result<(), String> {
+        self.ensure_capacity(writer, stats).await?;
+        let sequence = self.next_sequence();
+        match segment {
+            OrderedFlushSegment::Completed(flush) => {
+                self.record_completed(
+                    OrderedCompletedOutput {
+                        sequence,
+                        item: OrderedCompletedOutputItem::Batch {
+                            flush,
+                            count_materialization: true,
+                        },
+                        materialization_duration: direct_materialization_duration,
+                    },
+                    writer,
+                    stats,
+                )
+                .await
+            }
+            OrderedFlushSegment::Materialize(job) => {
+                self.pending.push(tokio::task::spawn_blocking(move || {
+                    let materialization_start = Instant::now();
+                    let flush = job.materialize()?;
+                    Ok(OrderedCompletedOutput {
+                        sequence,
+                        item: OrderedCompletedOutputItem::Batch {
+                            flush,
+                            count_materialization: true,
+                        },
+                        materialization_duration: materialization_start.elapsed(),
+                    })
+                }));
+                self.flush_ready(writer, stats).await
+            }
+        }
+    }
+
+    async fn submit_direct_batch(
+        &mut self,
+        batch: RecordBatch,
+        writer: &mut ParquetOutputWriter,
+        stats: &mut ParquetMergeRunStats,
+    ) -> Result<(), String> {
+        self.ensure_capacity(writer, stats).await?;
+        let sequence = self.next_sequence();
+        self.record_completed(
+            OrderedCompletedOutput {
+                sequence,
+                item: OrderedCompletedOutputItem::Batch {
+                    flush: OrderedFlush {
+                        batch,
+                        mode: OrderedFlushMode::Direct,
+                    },
+                    count_materialization: false,
+                },
+                materialization_duration: Duration::default(),
+            },
+            writer,
+            stats,
+        )
+        .await
+    }
+
+    async fn submit_row_group_copy(
+        &mut self,
+        copy: RowGroupCopyRequest,
+        writer: &mut ParquetOutputWriter,
+        stats: &mut ParquetMergeRunStats,
+    ) -> Result<(), String> {
+        self.ensure_capacity(writer, stats).await?;
+        let sequence = self.next_sequence();
+        self.record_completed(
+            OrderedCompletedOutput {
+                sequence,
+                item: OrderedCompletedOutputItem::CopyRowGroup(copy),
+                materialization_duration: Duration::default(),
+            },
+            writer,
+            stats,
+        )
+        .await
+    }
+
+    async fn finish(
+        &mut self,
+        writer: &mut ParquetOutputWriter,
+        stats: &mut ParquetMergeRunStats,
+    ) -> Result<(), String> {
+        while !self.pending.is_empty() {
+            self.drain_one(writer, stats).await?;
+        }
+        self.flush_ready(writer, stats).await?;
+        if !self.completed.is_empty() {
+            return Err("ordered output pipeline finished with unsent output".to_string());
+        }
+        Ok(())
+    }
+
+    fn next_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        sequence
+    }
+
+    async fn ensure_capacity(
+        &mut self,
+        writer: &mut ParquetOutputWriter,
+        stats: &mut ParquetMergeRunStats,
+    ) -> Result<(), String> {
+        self.flush_ready(writer, stats).await?;
+        while self.pending.len() + self.completed.len() >= self.limit && !self.pending.is_empty() {
+            self.drain_one(writer, stats).await?;
+        }
+        self.flush_ready(writer, stats).await
+    }
+
+    async fn drain_one(
+        &mut self,
+        writer: &mut ParquetOutputWriter,
+        stats: &mut ParquetMergeRunStats,
+    ) -> Result<(), String> {
+        let wait_start = Instant::now();
+        let Some(join_result) = self.pending.next().await else {
+            return Ok(());
+        };
+        stats.ordered_output_materialization_wait_duration += wait_start.elapsed();
+        let completed = match join_result {
+            Ok(Ok(completed)) => completed,
+            Ok(Err(error)) => return Err(error),
+            Err(error) => {
+                return Err(format!(
+                    "ordered materialization task failed to join: {error}"
+                ));
+            }
+        };
+        self.record_completed(completed, writer, stats).await
+    }
+
+    async fn record_completed(
+        &mut self,
+        completed: OrderedCompletedOutput,
+        writer: &mut ParquetOutputWriter,
+        stats: &mut ParquetMergeRunStats,
+    ) -> Result<(), String> {
+        if let OrderedCompletedOutputItem::Batch {
+            flush,
+            count_materialization: true,
+        } = &completed.item
+        {
+            add_ordered_materialization_duration(
+                stats,
+                completed.materialization_duration,
+                flush.mode,
+            );
+        }
+        self.completed.insert(completed.sequence, completed);
+        self.flush_ready(writer, stats).await
+    }
+
+    async fn flush_ready(
+        &mut self,
+        writer: &mut ParquetOutputWriter,
+        stats: &mut ParquetMergeRunStats,
+    ) -> Result<(), String> {
+        while let Some(completed) = self.completed.remove(&self.next_to_send) {
+            match completed.item {
+                OrderedCompletedOutputItem::Batch { flush, .. } => {
+                    writer.send(flush.batch).await?;
+                }
+                OrderedCompletedOutputItem::CopyRowGroup(copy) => {
+                    writer.send_row_group_copy(copy).await?;
+                }
+            }
+            self.next_to_send += 1;
+        }
+        stats.ordered_output_assembly_duration = stats
+            .ordered_output_selection_duration
+            .saturating_add(stats.ordered_output_materialization_duration);
+        Ok(())
     }
 }
 
@@ -2405,6 +3281,8 @@ fn write_ready_encoded_row_groups<W: Write + Send>(
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn extract_prepared_order_column(
     batch: &RecordBatch,
     order_plan: &ParquetOrderPlan,
@@ -2535,6 +3413,8 @@ fn extract_prepared_order_column(
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 impl PreparedOrderBatch {
     fn new(
         batch: RecordBatch,
@@ -2554,6 +3434,8 @@ impl PreparedOrderBatch {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 impl PreparedOrderColumn {
     fn is_null(&self, row: usize) -> bool {
         match self {
@@ -2757,12 +3639,81 @@ fn compare_order_key_values(left: &OrderKeyValue, right: &OrderKeyValue) -> CmpO
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn compare_source_heads(
     sources: &[OrderedMergeSource],
     left_index: usize,
     right_index: usize,
 ) -> CmpOrdering {
     sources[left_index].compare_head_to_source(&sources[right_index])
+}
+
+#[cfg(test)]
+fn row_group_fast_path_safe(
+    candidate_index: usize,
+    sources: &[OrderedMergeSource],
+    source_order_metadata: &[SourceOrderMetadata],
+) -> bool {
+    let Some(source) = sources.get(candidate_index) else {
+        return false;
+    };
+    let Some(current_batch) = source.current_batch.as_ref() else {
+        return false;
+    };
+    let Some(range) = source_order_metadata
+        .get(candidate_index)
+        .and_then(|metadata| metadata.row_groups.get(current_batch.row_group_index))
+    else {
+        return false;
+    };
+
+    match range.null_kind {
+        RowGroupNullKind::MixedOrUnknown => false,
+        RowGroupNullKind::NoNulls => {
+            let (Some(min), Some(max)) = (range.min.as_ref(), range.max.as_ref()) else {
+                return false;
+            };
+            if compare_order_key_values(min, max) == CmpOrdering::Greater {
+                return false;
+            }
+            for (competitor_index, competitor) in sources.iter().enumerate() {
+                if competitor_index == candidate_index || competitor.current_batch.is_none() {
+                    continue;
+                }
+                let ordering = compare_value_to_source_head(max, competitor);
+                if ordering == CmpOrdering::Greater
+                    || (ordering == CmpOrdering::Equal && candidate_index > competitor_index)
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        RowGroupNullKind::AllNulls => {
+            for (competitor_index, competitor) in sources.iter().enumerate() {
+                if competitor_index == candidate_index || competitor.current_batch.is_none() {
+                    continue;
+                }
+                if competitor.has_non_null_remaining() || candidate_index > competitor_index {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+fn compare_value_to_source_head(value: &OrderKeyValue, source: &OrderedMergeSource) -> CmpOrdering {
+    let batch = source
+        .current_batch
+        .as_ref()
+        .expect("source head comparison requires an active batch");
+    batch
+        .order_column
+        .compare_row_to_value(source.current_row, value)
+        .reverse()
 }
 
 async fn merge_parquet_files_unordered(
@@ -3248,6 +4199,164 @@ async fn merge_payload_parquet_files_ordered(
     order_plan: ParquetOrderPlan,
     execution_options: &ParquetMergeExecutionOptions,
 ) -> Result<ParquetMergeRunStats, String> {
+    match order_plan.key_type {
+        ParquetOrderKeyType::Int64 => {
+            merge_payload_parquet_files_ordered_typed::<Int64OrderKey>(
+                input_paths,
+                output_path,
+                output_schema,
+                source_schemas,
+                source_adapters,
+                source_order_metadata,
+                order_plan,
+                execution_options,
+            )
+            .await
+        }
+        ParquetOrderKeyType::UInt64 => {
+            merge_payload_parquet_files_ordered_typed::<UInt64OrderKey>(
+                input_paths,
+                output_path,
+                output_schema,
+                source_schemas,
+                source_adapters,
+                source_order_metadata,
+                order_plan,
+                execution_options,
+            )
+            .await
+        }
+        ParquetOrderKeyType::Float64 => {
+            merge_payload_parquet_files_ordered_typed::<Float64OrderKey>(
+                input_paths,
+                output_path,
+                output_schema,
+                source_schemas,
+                source_adapters,
+                source_order_metadata,
+                order_plan,
+                execution_options,
+            )
+            .await
+        }
+        ParquetOrderKeyType::Utf8 => {
+            merge_payload_parquet_files_ordered_typed::<Utf8OrderKey>(
+                input_paths,
+                output_path,
+                output_schema,
+                source_schemas,
+                source_adapters,
+                source_order_metadata,
+                order_plan,
+                execution_options,
+            )
+            .await
+        }
+        ParquetOrderKeyType::LargeUtf8 => {
+            merge_payload_parquet_files_ordered_typed::<LargeUtf8OrderKey>(
+                input_paths,
+                output_path,
+                output_schema,
+                source_schemas,
+                source_adapters,
+                source_order_metadata,
+                order_plan,
+                execution_options,
+            )
+            .await
+        }
+        ParquetOrderKeyType::Date32 => {
+            merge_payload_parquet_files_ordered_typed::<Date32OrderKey>(
+                input_paths,
+                output_path,
+                output_schema,
+                source_schemas,
+                source_adapters,
+                source_order_metadata,
+                order_plan,
+                execution_options,
+            )
+            .await
+        }
+        ParquetOrderKeyType::Date64 => {
+            merge_payload_parquet_files_ordered_typed::<Date64OrderKey>(
+                input_paths,
+                output_path,
+                output_schema,
+                source_schemas,
+                source_adapters,
+                source_order_metadata,
+                order_plan,
+                execution_options,
+            )
+            .await
+        }
+        ParquetOrderKeyType::TimestampSecond => {
+            merge_payload_parquet_files_ordered_typed::<TimestampSecondOrderKey>(
+                input_paths,
+                output_path,
+                output_schema,
+                source_schemas,
+                source_adapters,
+                source_order_metadata,
+                order_plan,
+                execution_options,
+            )
+            .await
+        }
+        ParquetOrderKeyType::TimestampMillisecond => {
+            merge_payload_parquet_files_ordered_typed::<TimestampMillisecondOrderKey>(
+                input_paths,
+                output_path,
+                output_schema,
+                source_schemas,
+                source_adapters,
+                source_order_metadata,
+                order_plan,
+                execution_options,
+            )
+            .await
+        }
+        ParquetOrderKeyType::TimestampMicrosecond => {
+            merge_payload_parquet_files_ordered_typed::<TimestampMicrosecondOrderKey>(
+                input_paths,
+                output_path,
+                output_schema,
+                source_schemas,
+                source_adapters,
+                source_order_metadata,
+                order_plan,
+                execution_options,
+            )
+            .await
+        }
+        ParquetOrderKeyType::TimestampNanosecond => {
+            merge_payload_parquet_files_ordered_typed::<TimestampNanosecondOrderKey>(
+                input_paths,
+                output_path,
+                output_schema,
+                source_schemas,
+                source_adapters,
+                source_order_metadata,
+                order_plan,
+                execution_options,
+            )
+            .await
+        }
+    }
+}
+
+async fn merge_payload_parquet_files_ordered_typed<K: OrderedKey>(
+    input_paths: &[PathBuf],
+    output_path: &Path,
+    output_schema: SchemaRef,
+    source_schemas: Vec<SchemaRef>,
+    source_adapters: Vec<Arc<CompiledSourceAdapter>>,
+    source_order_metadata: Vec<SourceOrderMetadata>,
+    order_plan: ParquetOrderPlan,
+    execution_options: &ParquetMergeExecutionOptions,
+) -> Result<ParquetMergeRunStats, String> {
+    debug_assert_eq!(order_plan.key_type, K::KEY_TYPE);
     let execution_start = Instant::now();
     let order_plan = Arc::new(order_plan);
     let worker_metrics = Arc::new(ParquetWorkerMetrics::default());
@@ -3260,6 +4369,7 @@ async fn merge_payload_parquet_files_ordered(
         execution_options.prefetch_batches_per_source.max(2) * resolved_parallelism.max(1),
     )
     .await?;
+    let mut ordered_output_pipeline = OrderedOutputPipeline::new(resolved_parallelism.max(1));
     let semaphore = Arc::new(Semaphore::new(resolved_parallelism.max(1)));
     let source_copy_plans = build_ordered_row_group_copy_plans(
         input_paths,
@@ -3283,7 +4393,7 @@ async fn merge_payload_parquet_files_ordered(
         let worker_metrics = worker_metrics.clone();
         let semaphore = semaphore.clone();
         let handle = tokio::spawn(async move {
-            parquet_merge_source_worker(
+            parquet_merge_source_worker_typed::<K>(
                 source_index,
                 input_path,
                 output_schema,
@@ -3306,9 +4416,9 @@ async fn merge_payload_parquet_files_ordered(
     let mut sources = receivers
         .into_iter()
         .enumerate()
-        .map(|(source_index, receiver)| OrderedMergeSource::new(source_index, receiver))
+        .map(|(source_index, receiver)| OrderedMergeSourceTyped::<K>::new(source_index, receiver))
         .collect::<Vec<_>>();
-    let mut heap = SourceHeadHeap::new();
+    let mut heap = TypedSourceHeadHeap::<K>::new();
 
     for source_index in 0..sources.len() {
         if sources[source_index]
@@ -3321,15 +4431,18 @@ async fn merge_payload_parquet_files_ordered(
 
     while !heap.is_empty() {
         if execution_options.stats_fast_path {
-            if let Some(source_index) = select_fast_path_source(&sources, &source_order_metadata) {
+            if let Some(source_index) =
+                select_fast_path_source_typed::<K>(&sources, &source_order_metadata)
+            {
                 heap.remove(source_index, &sources);
                 let fast_path_start = Instant::now();
-                let (row_groups, batches) = drain_fast_path_source(
+                let (row_groups, batches) = drain_fast_path_source_typed::<K>(
                     source_index,
                     &mut sources,
                     &source_order_metadata,
                     &source_copy_plans,
                     &mut ordered_writer,
+                    &mut ordered_output_pipeline,
                     execution_options,
                     &mut accumulator,
                     &mut stats,
@@ -3363,11 +4476,12 @@ async fn merge_payload_parquet_files_ordered(
             )
         };
         add_ordered_selection_duration(&mut stats, selection_start.elapsed());
-        append_rows_from_source(
+        append_rows_from_source_typed::<K>(
             entry.source_index,
             run_len,
             &mut sources,
             &mut ordered_writer,
+            &mut ordered_output_pipeline,
             execution_options,
             &mut accumulator,
             &mut stats,
@@ -3382,7 +4496,16 @@ async fn merge_payload_parquet_files_ordered(
         }
     }
 
-    flush_ordered_accumulator(&mut accumulator, &mut ordered_writer, &mut stats).await?;
+    flush_ordered_accumulator(
+        &mut accumulator,
+        &mut ordered_output_pipeline,
+        &mut ordered_writer,
+        &mut stats,
+    )
+    .await?;
+    ordered_output_pipeline
+        .finish(&mut ordered_writer, &mut stats)
+        .await?;
 
     stats.ordered_merge_duration = ordered_merge_start.elapsed();
 
@@ -3412,19 +4535,21 @@ async fn merge_payload_parquet_files_ordered(
     Ok(stats)
 }
 
-fn select_fast_path_source(
-    sources: &[OrderedMergeSource],
+fn select_fast_path_source_typed<K: OrderedKey>(
+    sources: &[OrderedMergeSourceTyped<K>],
     source_order_metadata: &[SourceOrderMetadata],
 ) -> Option<usize> {
     let mut selected = None;
     for source_index in 0..sources.len() {
-        if !row_group_fast_path_safe(source_index, sources, source_order_metadata) {
+        if !row_group_fast_path_safe_typed::<K>(source_index, sources, source_order_metadata) {
             continue;
         }
         match selected {
             None => selected = Some(source_index),
             Some(current) => {
-                if compare_source_heads(sources, source_index, current) == CmpOrdering::Less {
+                if sources[source_index].compare_head_to_source(&sources[current])
+                    == CmpOrdering::Less
+                {
                     selected = Some(source_index);
                 }
             }
@@ -3433,9 +4558,9 @@ fn select_fast_path_source(
     selected
 }
 
-fn row_group_fast_path_safe(
+fn row_group_fast_path_safe_typed<K: OrderedKey>(
     candidate_index: usize,
-    sources: &[OrderedMergeSource],
+    sources: &[OrderedMergeSourceTyped<K>],
     source_order_metadata: &[SourceOrderMetadata],
 ) -> bool {
     let Some(source) = sources.get(candidate_index) else {
@@ -3464,7 +4589,7 @@ fn row_group_fast_path_safe(
                 if competitor_index == candidate_index || competitor.current_batch.is_none() {
                     continue;
                 }
-                let ordering = compare_value_to_source_head(max, competitor);
+                let ordering = compare_value_to_source_head_typed::<K>(max, competitor);
                 if ordering == CmpOrdering::Greater
                     || (ordering == CmpOrdering::Equal && candidate_index > competitor_index)
                 {
@@ -3487,23 +4612,24 @@ fn row_group_fast_path_safe(
     }
 }
 
-fn compare_value_to_source_head(value: &OrderKeyValue, source: &OrderedMergeSource) -> CmpOrdering {
+fn compare_value_to_source_head_typed<K: OrderedKey>(
+    value: &OrderKeyValue,
+    source: &OrderedMergeSourceTyped<K>,
+) -> CmpOrdering {
     let batch = source
         .current_batch
         .as_ref()
         .expect("source head comparison requires an active batch");
-    batch
-        .order_column
-        .compare_row_to_value(source.current_row, value)
-        .reverse()
+    K::compare_to_value(&batch.order_column, source.current_row, value).reverse()
 }
 
-async fn drain_fast_path_source(
+async fn drain_fast_path_source_typed<K: OrderedKey>(
     source_index: usize,
-    sources: &mut [OrderedMergeSource],
+    sources: &mut [OrderedMergeSourceTyped<K>],
     source_order_metadata: &[SourceOrderMetadata],
     source_copy_plans: &[OrderedRowGroupCopyPlan],
     writer: &mut ParquetOutputWriter,
+    output_pipeline: &mut OrderedOutputPipeline,
     execution_options: &ParquetMergeExecutionOptions,
     accumulator: &mut OrderedOutputAccumulator,
     stats: &mut ParquetMergeRunStats,
@@ -3511,12 +4637,12 @@ async fn drain_fast_path_source(
     let mut drained_row_groups = 0_u64;
     let mut drained_batches = 0_u64;
 
-    while row_group_fast_path_safe(source_index, sources, source_order_metadata) {
+    while row_group_fast_path_safe_typed::<K>(source_index, sources, source_order_metadata) {
         let current_row_group_index = sources[source_index]
             .current_row_group_index()
             .expect("fast path requires an active row group");
         drained_row_groups += 1;
-        if let Some(copy) = copy_request_for_current_row_group(
+        if let Some(copy) = copy_request_for_current_row_group_typed(
             source_index,
             current_row_group_index,
             sources,
@@ -3524,8 +4650,8 @@ async fn drain_fast_path_source(
         ) {
             stats.copy_candidate_row_groups += 1;
             if writer.supports_row_group_copy() {
-                flush_ordered_accumulator(accumulator, writer, stats).await?;
-                let (batches, rows) = consume_current_row_group_without_writing(
+                flush_ordered_accumulator(accumulator, output_pipeline, writer, stats).await?;
+                let (batches, rows) = consume_current_row_group_without_writing_typed(
                     source_index,
                     current_row_group_index,
                     sources,
@@ -3540,7 +4666,9 @@ async fn drain_fast_path_source(
                         copy.rows
                     ));
                 }
-                writer.send_row_group_copy(copy).await?;
+                output_pipeline
+                    .submit_row_group_copy(copy, writer, stats)
+                    .await?;
                 continue;
             }
         }
@@ -3566,11 +4694,12 @@ async fn drain_fast_path_source(
             if sources[source_index].current_row == 0 {
                 drained_batches += 1;
             }
-            append_rows_from_source(
+            append_rows_from_source_typed::<K>(
                 source_index,
                 remaining_batch_rows,
                 sources,
                 writer,
+                output_pipeline,
                 execution_options,
                 accumulator,
                 stats,
@@ -3582,10 +4711,10 @@ async fn drain_fast_path_source(
     Ok((drained_row_groups, drained_batches))
 }
 
-fn copy_request_for_current_row_group(
+fn copy_request_for_current_row_group_typed<K: OrderedKey>(
     source_index: usize,
     row_group_index: usize,
-    sources: &[OrderedMergeSource],
+    sources: &[OrderedMergeSourceTyped<K>],
     source_copy_plans: &[OrderedRowGroupCopyPlan],
 ) -> Option<RowGroupCopyRequest> {
     let source = sources.get(source_index)?;
@@ -3603,10 +4732,10 @@ fn copy_request_for_current_row_group(
         .clone()
 }
 
-async fn consume_current_row_group_without_writing(
+async fn consume_current_row_group_without_writing_typed<K: OrderedKey>(
     source_index: usize,
     row_group_index: usize,
-    sources: &mut [OrderedMergeSource],
+    sources: &mut [OrderedMergeSourceTyped<K>],
     stats: &mut ParquetMergeRunStats,
 ) -> Result<(u64, u64), String> {
     let mut batches = 0_u64;
@@ -3662,22 +4791,26 @@ fn add_ordered_materialization_duration(
 
 async fn flush_ordered_accumulator(
     accumulator: &mut OrderedOutputAccumulator,
+    output_pipeline: &mut OrderedOutputPipeline,
     writer: &mut ParquetOutputWriter,
     stats: &mut ParquetMergeRunStats,
 ) -> Result<(), String> {
     let flush_start = Instant::now();
-    if let Some(flushed) = accumulator.flush_with_mode()? {
-        add_ordered_materialization_duration(stats, flush_start.elapsed(), flushed.mode);
-        writer.send(flushed.batch).await?;
+    if let Some(segment) = accumulator.flush_segment()? {
+        let direct_materialization_duration = flush_start.elapsed();
+        output_pipeline
+            .submit_flush_segment(segment, writer, stats, direct_materialization_duration)
+            .await?;
     }
     Ok(())
 }
 
-async fn append_rows_from_source(
+async fn append_rows_from_source_typed<K: OrderedKey>(
     source_index: usize,
     row_count: usize,
-    sources: &mut [OrderedMergeSource],
+    sources: &mut [OrderedMergeSourceTyped<K>],
     writer: &mut ParquetOutputWriter,
+    output_pipeline: &mut OrderedOutputPipeline,
     execution_options: &ParquetMergeExecutionOptions,
     accumulator: &mut OrderedOutputAccumulator,
     stats: &mut ParquetMergeRunStats,
@@ -3702,7 +4835,7 @@ async fn append_rows_from_source(
         };
 
         if can_write_whole_batch_directly && !accumulator.is_empty() {
-            flush_ordered_accumulator(accumulator, writer, stats).await?;
+            flush_ordered_accumulator(accumulator, output_pipeline, writer, stats).await?;
             continue;
         }
 
@@ -3713,7 +4846,9 @@ async fn append_rows_from_source(
                 .as_ref()
                 .expect("direct batch write requires an active batch");
             let direct_batch = direct_batch.batch.clone();
-            writer.send(direct_batch).await?;
+            output_pipeline
+                .submit_direct_batch(direct_batch, writer, stats)
+                .await?;
             stats.direct_batch_writes += 1;
             stats.rows += batch_rows as u64;
             remaining -= batch_rows;
@@ -3737,7 +4872,7 @@ async fn append_rows_from_source(
             sources[source_index].current_row += take;
 
             if accumulator.rows() >= execution_options.output_batch_rows {
-                flush_ordered_accumulator(accumulator, writer, stats).await?;
+                flush_ordered_accumulator(accumulator, output_pipeline, writer, stats).await?;
             }
         }
 
@@ -3756,7 +4891,7 @@ async fn append_rows_from_source(
     Ok(())
 }
 
-async fn parquet_merge_source_worker(
+async fn parquet_merge_source_worker_typed<K: OrderedKey>(
     source_index: usize,
     input_path: PathBuf,
     output_schema: SchemaRef,
@@ -3765,7 +4900,7 @@ async fn parquet_merge_source_worker(
     execution_options: ParquetMergeExecutionOptions,
     semaphore: Arc<Semaphore>,
     worker_metrics: Arc<ParquetWorkerMetrics>,
-    tx: mpsc::Sender<Result<PreparedOrderBatch, String>>,
+    tx: mpsc::Sender<Result<PreparedOrderBatchTyped<K>, String>>,
 ) -> Result<(), String> {
     let result: Result<(), String> = async {
         let mut file = File::open(&input_path)
@@ -3841,14 +4976,14 @@ async fn parquet_merge_source_worker(
                                 row_group_index
                             )
                         })?;
-                    let prepared = PreparedOrderBatch::new(
+                    let prepared = PreparedOrderBatchTyped::<K>::new(
                         adapted,
                         order_plan.as_ref(),
                         row_group_index,
                         row_group_batch_index,
                     )?;
                     row_group_batch_index += 1;
-                    validate_prepared_ordered_batch(
+                    validate_prepared_ordered_batch_typed::<K>(
                         &prepared,
                         &mut last_key,
                         &input_path,
@@ -3876,6 +5011,44 @@ async fn parquet_merge_source_worker(
     result
 }
 
+fn validate_prepared_ordered_batch_typed<K: OrderedKey>(
+    batch: &PreparedOrderBatchTyped<K>,
+    last_key: &mut Option<OrderKeyValue>,
+    input_path: &Path,
+    field_name: &str,
+    source_index: usize,
+) -> Result<(), String> {
+    if batch.batch.num_rows() == 0 {
+        return Ok(());
+    }
+
+    if let Some(previous_key) = last_key.as_ref() {
+        if K::compare_to_value(&batch.order_column, 0, previous_key) == CmpOrdering::Less {
+            return Err(format!(
+                "input parquet file `{}` is not sorted ascending by `{}` for source {}",
+                input_path.display(),
+                field_name,
+                source_index
+            ));
+        }
+    }
+
+    for row in 1..batch.batch.num_rows() {
+        if K::compare_values(&batch.order_column, row - 1, row) == CmpOrdering::Greater {
+            return Err(format!(
+                "input parquet file `{}` is not sorted ascending by `{}` near row {}",
+                input_path.display(),
+                field_name,
+                row
+            ));
+        }
+    }
+
+    *last_key = Some(K::key_at(&batch.order_column, batch.batch.num_rows() - 1));
+    Ok(())
+}
+
+#[cfg(test)]
 fn validate_prepared_ordered_batch(
     batch: &PreparedOrderBatch,
     last_key: &mut Option<OrderKeyValue>,
@@ -4303,6 +5476,7 @@ pub async fn compact_ndjson_to_parquet(
         ordered_output_assembly_duration: Duration::default(),
         ordered_output_selection_duration: Duration::default(),
         ordered_output_materialization_duration: Duration::default(),
+        ordered_output_materialization_wait_duration: Duration::default(),
         writer_write_duration: Duration::default(),
         writer_encode_duration: Duration::default(),
         writer_sink_duration: Duration::default(),
