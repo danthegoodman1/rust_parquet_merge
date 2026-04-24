@@ -192,6 +192,11 @@ struct BenchmarkConfig {
     rust_unordered_order: BenchmarkUnorderedMergeOrder,
     rust_compression: BenchmarkCompression,
     rust_dictionary_enabled: bool,
+    rust_read_batch_size: Option<usize>,
+    rust_output_batch_rows: Option<usize>,
+    rust_output_row_group_rows: Option<usize>,
+    rust_prefetch_batches_per_source: Option<usize>,
+    exact_validation: bool,
     duckdb_threads: Option<usize>,
     duckdb_compression: Option<String>,
     scenarios: Vec<Scenario>,
@@ -258,6 +263,9 @@ struct ValidationSummary {
     duckdb_schema_shape: Vec<String>,
     rust_is_sorted: Option<bool>,
     duckdb_is_sorted: Option<bool>,
+    exact_validation: bool,
+    rust_minus_duckdb_rows: Option<u64>,
+    duckdb_minus_rust_rows: Option<u64>,
     message: Option<String>,
 }
 
@@ -268,6 +276,8 @@ struct OrderedMetricsSummary {
     read_decode_ms: u128,
     source_prepare_ms: u128,
     ordered_output_assembly_ms: u128,
+    ordered_output_selection_ms: u128,
+    ordered_output_materialization_ms: u128,
     writer_write_ms: u128,
     writer_encode_work_ms: u128,
     writer_sink_ms: u128,
@@ -276,6 +286,13 @@ struct OrderedMetricsSummary {
     fallback_batches: u64,
     direct_batch_writes: u64,
     accumulator_flushes: u64,
+    accumulator_concat_flushes: u64,
+    accumulator_interleave_flushes: u64,
+    copy_candidate_row_groups: u64,
+    copied_row_groups: u64,
+    copied_rows: u64,
+    copied_compressed_bytes: u64,
+    row_group_copy_ms: u128,
 }
 
 #[derive(Serialize)]
@@ -409,6 +426,13 @@ fn load_config() -> Result<BenchmarkConfig, Box<dyn Error>> {
         &env::var("RPM_BENCH_RUST_COMPRESSION").unwrap_or_else(|_| "uncompressed".to_string()),
     )?;
     let rust_dictionary_enabled = parse_env_bool("RPM_BENCH_RUST_DICTIONARY", true)?;
+    let rust_read_batch_size = parse_env_optional_usize("RPM_BENCH_RUST_READ_BATCH_SIZE")?;
+    let rust_output_batch_rows = parse_env_optional_usize("RPM_BENCH_RUST_OUTPUT_BATCH_ROWS")?;
+    let rust_output_row_group_rows =
+        parse_env_optional_usize("RPM_BENCH_RUST_OUTPUT_ROW_GROUP_ROWS")?;
+    let rust_prefetch_batches_per_source =
+        parse_env_optional_usize("RPM_BENCH_RUST_PREFETCH_BATCHES_PER_SOURCE")?;
+    let exact_validation = parse_env_bool("RPM_BENCH_EXACT_VALIDATION", false)?;
     let duckdb_threads = parse_env_optional_usize("RPM_BENCH_DUCKDB_THREADS")?;
     let duckdb_compression = parse_duckdb_compression()?;
     let scenarios = Scenario::parse_many(
@@ -430,6 +454,18 @@ fn load_config() -> Result<BenchmarkConfig, Box<dyn Error>> {
     if duckdb_threads == Some(0) {
         return Err("RPM_BENCH_DUCKDB_THREADS must be > 0 when set".into());
     }
+    if rust_read_batch_size == Some(0) {
+        return Err("RPM_BENCH_RUST_READ_BATCH_SIZE must be > 0 when set".into());
+    }
+    if rust_output_batch_rows == Some(0) {
+        return Err("RPM_BENCH_RUST_OUTPUT_BATCH_ROWS must be > 0 when set".into());
+    }
+    if rust_output_row_group_rows == Some(0) {
+        return Err("RPM_BENCH_RUST_OUTPUT_ROW_GROUP_ROWS must be > 0 when set".into());
+    }
+    if rust_prefetch_batches_per_source == Some(0) {
+        return Err("RPM_BENCH_RUST_PREFETCH_BATCHES_PER_SOURCE must be > 0 when set".into());
+    }
 
     Ok(BenchmarkConfig {
         file_count,
@@ -441,6 +477,11 @@ fn load_config() -> Result<BenchmarkConfig, Box<dyn Error>> {
         rust_unordered_order,
         rust_compression,
         rust_dictionary_enabled,
+        rust_read_batch_size,
+        rust_output_batch_rows,
+        rust_output_row_group_rows,
+        rust_prefetch_batches_per_source,
+        exact_validation,
         duckdb_threads,
         duckdb_compression,
         scenarios,
@@ -1258,17 +1299,34 @@ async fn ensure_duckdb_version(duckdb_bin: &str) -> Result<String, Box<dyn Error
 }
 
 fn benchmark_execution_options(config: &BenchmarkConfig) -> ParquetMergeExecutionOptions {
-    ParquetMergeExecutionOptions {
+    let mut options = ParquetMergeExecutionOptions {
         parallelism: config.rust_parallelism,
         unordered_merge_order: config.rust_unordered_order.execution_order(),
         writer_compression: config.rust_compression.execution_compression(),
         writer_dictionary_enabled: config.rust_dictionary_enabled,
         ..ParquetMergeExecutionOptions::default()
+    };
+    apply_benchmark_tuning(config, &mut options);
+    options
+}
+
+fn apply_benchmark_tuning(config: &BenchmarkConfig, options: &mut ParquetMergeExecutionOptions) {
+    if let Some(read_batch_size) = config.rust_read_batch_size {
+        options.read_batch_size = read_batch_size;
+    }
+    if let Some(output_batch_rows) = config.rust_output_batch_rows {
+        options.output_batch_rows = output_batch_rows;
+    }
+    if let Some(output_row_group_rows) = config.rust_output_row_group_rows {
+        options.output_row_group_rows = output_row_group_rows;
+    }
+    if let Some(prefetch_batches_per_source) = config.rust_prefetch_batches_per_source {
+        options.prefetch_batches_per_source = prefetch_batches_per_source;
     }
 }
 
 fn ordered_benchmark_execution_options(config: &BenchmarkConfig) -> ParquetMergeExecutionOptions {
-    ParquetMergeExecutionOptions {
+    let mut options = ParquetMergeExecutionOptions {
         ordering_field: Some("event_id".to_string()),
         read_batch_size: 131_072,
         output_batch_rows: 131_072,
@@ -1279,7 +1337,9 @@ fn ordered_benchmark_execution_options(config: &BenchmarkConfig) -> ParquetMerge
         writer_compression: config.rust_compression.execution_compression(),
         writer_dictionary_enabled: config.rust_dictionary_enabled,
         stats_fast_path: true,
-    }
+    };
+    apply_benchmark_tuning(config, &mut options);
+    options
 }
 
 fn resolve_benchmark_parallelism(requested: usize, input_count: usize) -> usize {
@@ -1509,12 +1569,15 @@ fn summarize_engine(
 fn ordered_metrics_from_report(report: &CompactionReport) -> Option<OrderedMetricsSummary> {
     if report.ordered_merge_duration == Duration::default()
         && report.stats_fast_path_duration == Duration::default()
-        && report.source_prepare_duration == Duration::default()
         && report.ordered_output_assembly_duration == Duration::default()
+        && report.ordered_output_selection_duration == Duration::default()
+        && report.ordered_output_materialization_duration == Duration::default()
         && report.fast_path_batches == 0
         && report.fallback_batches == 0
         && report.direct_batch_writes == 0
         && report.accumulator_flushes == 0
+        && report.copy_candidate_row_groups == 0
+        && report.copied_row_groups == 0
     {
         return None;
     }
@@ -1525,6 +1588,10 @@ fn ordered_metrics_from_report(report: &CompactionReport) -> Option<OrderedMetri
         read_decode_ms: duration_millis(report.read_decode_duration),
         source_prepare_ms: duration_millis(report.source_prepare_duration),
         ordered_output_assembly_ms: duration_millis(report.ordered_output_assembly_duration),
+        ordered_output_selection_ms: duration_millis(report.ordered_output_selection_duration),
+        ordered_output_materialization_ms: duration_millis(
+            report.ordered_output_materialization_duration,
+        ),
         writer_write_ms: duration_millis(report.writer_write_duration),
         writer_encode_work_ms: duration_millis(report.writer_encode_duration),
         writer_sink_ms: duration_millis(report.writer_sink_duration),
@@ -1533,6 +1600,13 @@ fn ordered_metrics_from_report(report: &CompactionReport) -> Option<OrderedMetri
         fallback_batches: report.fallback_batches,
         direct_batch_writes: report.direct_batch_writes,
         accumulator_flushes: report.accumulator_flushes,
+        accumulator_concat_flushes: report.accumulator_concat_flushes,
+        accumulator_interleave_flushes: report.accumulator_interleave_flushes,
+        copy_candidate_row_groups: report.copy_candidate_row_groups,
+        copied_row_groups: report.copied_row_groups,
+        copied_rows: report.copied_rows,
+        copied_compressed_bytes: report.copied_compressed_bytes,
+        row_group_copy_ms: duration_millis(report.row_group_copy_duration),
     })
 }
 
@@ -1574,6 +1648,8 @@ async fn validate_outputs(
     expected_rows: u64,
     rust_output: &Path,
     duckdb_output: &Path,
+    duckdb_bin: &str,
+    exact_validation: bool,
 ) -> Result<ValidationSummary, Box<dyn Error>> {
     let (rust_rows, rust_schema, rust_is_sorted) =
         parquet_row_count_and_schema(rust_output, scenario.ordering_field()).await?;
@@ -1582,6 +1658,15 @@ async fn validate_outputs(
 
     let rust_shape = schema_shape(rust_schema.as_ref());
     let duckdb_shape = schema_shape(duckdb_schema.as_ref());
+
+    let mut rust_minus_duckdb_rows = None;
+    let mut duckdb_minus_rust_rows = None;
+    if exact_validation {
+        let (rust_minus, duckdb_minus) =
+            duckdb_except_all_counts(duckdb_bin, rust_output, duckdb_output).await?;
+        rust_minus_duckdb_rows = Some(rust_minus);
+        duckdb_minus_rust_rows = Some(duckdb_minus);
+    }
 
     let message = if rust_rows != expected_rows {
         Some(format!(
@@ -1597,6 +1682,12 @@ async fn validate_outputs(
         Some("DuckDB output is not sorted by event_id".to_string())
     } else if rust_shape != duckdb_shape {
         Some("Rust and DuckDB output schemas differ".to_string())
+    } else if rust_minus_duckdb_rows.unwrap_or(0) != 0 || duckdb_minus_rust_rows.unwrap_or(0) != 0 {
+        Some(format!(
+            "Rust and DuckDB exact output differs: rust_minus_duckdb={}, duckdb_minus_rust={}",
+            rust_minus_duckdb_rows.unwrap_or(0),
+            duckdb_minus_rust_rows.unwrap_or(0)
+        ))
     } else {
         None
     };
@@ -1613,8 +1704,53 @@ async fn validate_outputs(
         duckdb_schema_shape: duckdb_shape,
         rust_is_sorted,
         duckdb_is_sorted,
+        exact_validation,
+        rust_minus_duckdb_rows,
+        duckdb_minus_rust_rows,
         message,
     })
+}
+
+fn duckdb_sql_string(value: &Path) -> String {
+    let value = value.to_string_lossy();
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+async fn duckdb_except_all_counts(
+    duckdb_bin: &str,
+    rust_output: &Path,
+    duckdb_output: &Path,
+) -> Result<(u64, u64), Box<dyn Error>> {
+    let rust = duckdb_sql_string(rust_output);
+    let duckdb = duckdb_sql_string(duckdb_output);
+    let sql = format!(
+        "SELECT (SELECT count(*) FROM (SELECT * FROM read_parquet({rust}) EXCEPT ALL SELECT * FROM read_parquet({duckdb}))), (SELECT count(*) FROM (SELECT * FROM read_parquet({duckdb}) EXCEPT ALL SELECT * FROM read_parquet({rust})));"
+    );
+    let output = Command::new(duckdb_bin)
+        .arg("-csv")
+        .arg("-noheader")
+        .arg("-c")
+        .arg(sql)
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(format!(
+            "DuckDB exact validation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut parts = stdout.trim().split(',');
+    let rust_minus = parts
+        .next()
+        .ok_or("DuckDB exact validation returned no rust-minus count")?
+        .parse::<u64>()?;
+    let duckdb_minus = parts
+        .next()
+        .ok_or("DuckDB exact validation returned no duckdb-minus count")?
+        .parse::<u64>()?;
+    Ok((rust_minus, duckdb_minus))
 }
 
 async fn benchmark_scenario(
@@ -1651,6 +1787,8 @@ async fn benchmark_scenario(
         expected_rows,
         &rust_warmup_output,
         &duckdb_warmup_output,
+        duckdb_bin,
+        config.exact_validation,
     )
     .await?;
     let _ = fs::remove_file(&rust_warmup_output).await;
@@ -1842,6 +1980,13 @@ fn print_summary(summary: &BenchmarkSummary) {
                 rust_is_sorted, duckdb_is_sorted
             );
         }
+        if scenario.validation.exact_validation {
+            println!(
+                "  Exact check: rust_minus_duckdb={} duckdb_minus_rust={}",
+                scenario.validation.rust_minus_duckdb_rows.unwrap_or(0),
+                scenario.validation.duckdb_minus_rust_rows.unwrap_or(0)
+            );
+        }
         if let Some(message) = &scenario.validation.message {
             println!("  Validation detail: {message}");
             continue;
@@ -1881,11 +2026,13 @@ fn print_summary(summary: &BenchmarkSummary) {
         );
         if let Some(metrics) = &rust.ordered_metrics {
             println!(
-                "  Rust ordered: merge={} ms | decode={} ms | prepare={} ms | assembly={} ms | write={} ms | encode_work={} ms | sink={} ms | close={} ms | fast_path={} ms",
+                "  Rust ordered: merge={} ms | decode={} ms | prepare={} ms | assembly={} ms selection={} ms materialize={} ms | writer_elapsed={} ms encode_work={} ms sink={} ms close={} ms | fast_path={} ms",
                 metrics.ordered_merge_ms,
                 metrics.read_decode_ms,
                 metrics.source_prepare_ms,
                 metrics.ordered_output_assembly_ms,
+                metrics.ordered_output_selection_ms,
+                metrics.ordered_output_materialization_ms,
                 metrics.writer_write_ms,
                 metrics.writer_encode_work_ms,
                 metrics.writer_sink_ms,
@@ -1893,11 +2040,21 @@ fn print_summary(summary: &BenchmarkSummary) {
                 metrics.stats_fast_path_ms,
             );
             println!(
-                "                fallback_batches={} fast_path_batches={} direct_writes={} flushes={}",
+                "                fallback_batches={} fast_path_batches={} direct_writes={} flushes={} concat_flushes={} interleave_flushes={}",
                 metrics.fallback_batches,
                 metrics.fast_path_batches,
                 metrics.direct_batch_writes,
                 metrics.accumulator_flushes,
+                metrics.accumulator_concat_flushes,
+                metrics.accumulator_interleave_flushes,
+            );
+            println!(
+                "                copy_candidates={} copied_row_groups={} copied_rows={} copied_bytes={} copy_time={} ms",
+                metrics.copy_candidate_row_groups,
+                metrics.copied_row_groups,
+                metrics.copied_rows,
+                metrics.copied_compressed_bytes,
+                metrics.row_group_copy_ms,
             );
         }
         println!(

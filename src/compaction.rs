@@ -16,7 +16,7 @@ use super::{
     merge_payload_schemas_pair, merge_top_level_schemas_many, to_parquet_error, widen_data_type,
 };
 use arrow::array::new_null_array;
-use arrow::compute::{cast, concat_batches, take_record_batch};
+use arrow::compute::{cast, concat_batches, interleave_record_batch, take_record_batch};
 use arrow_array::builder::{
     ArrayBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder,
     Int32Builder, Int64Builder, LargeListBuilder, LargeStringBuilder, ListBuilder, NullBuilder,
@@ -39,9 +39,9 @@ use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_writer::AsyncArrowWriter;
 use parquet::arrow::async_writer::AsyncFileWriter;
 use parquet::arrow::{ArrowSchemaConverter, ArrowWriter, add_encoded_arrow_schema_to_metadata};
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::column::writer::ColumnCloseResult;
-use parquet::file::metadata::ParquetMetaDataReader;
+use parquet::file::metadata::{ParquetMetaDataReader, RowGroupMetaDataPtr};
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use simd_json::borrowed::Value as BorrowedValue;
@@ -156,12 +156,21 @@ pub struct CompactionReport {
     pub read_decode_duration: Duration,
     pub source_prepare_duration: Duration,
     pub ordered_output_assembly_duration: Duration,
+    pub ordered_output_selection_duration: Duration,
+    pub ordered_output_materialization_duration: Duration,
     pub writer_write_duration: Duration,
     pub writer_encode_duration: Duration,
     pub writer_sink_duration: Duration,
     pub writer_close_duration: Duration,
     pub direct_batch_writes: u64,
     pub accumulator_flushes: u64,
+    pub accumulator_concat_flushes: u64,
+    pub accumulator_interleave_flushes: u64,
+    pub copy_candidate_row_groups: u64,
+    pub copied_row_groups: u64,
+    pub copied_rows: u64,
+    pub copied_compressed_bytes: u64,
+    pub row_group_copy_duration: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -185,6 +194,11 @@ struct SourceOrderMetadata {
     row_groups: Vec<RowGroupOrderRange>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct OrderedRowGroupCopyPlan {
+    row_groups: Vec<Option<RowGroupCopyRequest>>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 struct ParquetMergeRunStats {
     rows: u64,
@@ -199,12 +213,21 @@ struct ParquetMergeRunStats {
     read_decode_duration: Duration,
     source_prepare_duration: Duration,
     ordered_output_assembly_duration: Duration,
+    ordered_output_selection_duration: Duration,
+    ordered_output_materialization_duration: Duration,
     writer_write_duration: Duration,
     writer_encode_duration: Duration,
     writer_sink_duration: Duration,
     writer_close_duration: Duration,
     direct_batch_writes: u64,
     accumulator_flushes: u64,
+    accumulator_concat_flushes: u64,
+    accumulator_interleave_flushes: u64,
+    copy_candidate_row_groups: u64,
+    copied_row_groups: u64,
+    copied_rows: u64,
+    copied_compressed_bytes: u64,
+    row_group_copy_duration: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -664,6 +687,7 @@ struct PreparedOrderBatch {
     batch: RecordBatch,
     order_column: PreparedOrderColumn,
     row_group_index: usize,
+    row_group_batch_index: usize,
     non_null_prefix_len: usize,
 }
 
@@ -810,7 +834,15 @@ impl OrderedMergeSource {
             return limit;
         };
 
-        let mut low = 1;
+        if limit == 1 {
+            return 1;
+        }
+
+        if self.compare_row_to_source(self.current_row + 1, competitor) == CmpOrdering::Greater {
+            return 1;
+        }
+
+        let mut low = 2;
         let mut high = limit;
         while low < high {
             let mid = low + ((high - low + 1) / 2);
@@ -1055,12 +1087,21 @@ pub async fn merge_top_level_parquet_files_with_execution(
         read_decode_duration: run_stats.read_decode_duration,
         source_prepare_duration: run_stats.source_prepare_duration,
         ordered_output_assembly_duration: run_stats.ordered_output_assembly_duration,
+        ordered_output_selection_duration: run_stats.ordered_output_selection_duration,
+        ordered_output_materialization_duration: run_stats.ordered_output_materialization_duration,
         writer_write_duration: run_stats.writer_write_duration,
         writer_encode_duration: run_stats.writer_encode_duration,
         writer_sink_duration: run_stats.writer_sink_duration,
         writer_close_duration: run_stats.writer_close_duration,
         direct_batch_writes: run_stats.direct_batch_writes,
         accumulator_flushes: run_stats.accumulator_flushes,
+        accumulator_concat_flushes: run_stats.accumulator_concat_flushes,
+        accumulator_interleave_flushes: run_stats.accumulator_interleave_flushes,
+        copy_candidate_row_groups: run_stats.copy_candidate_row_groups,
+        copied_row_groups: run_stats.copied_row_groups,
+        copied_rows: run_stats.copied_rows,
+        copied_compressed_bytes: run_stats.copied_compressed_bytes,
+        row_group_copy_duration: run_stats.row_group_copy_duration,
     })
 }
 
@@ -1130,6 +1171,7 @@ pub async fn merge_payload_parquet_files_with_execution(
             input_paths,
             output_path,
             plan.output_schema.clone(),
+            schemas.clone(),
             source_adapters,
             source_order_metadata,
             order_plan.clone(),
@@ -1176,12 +1218,21 @@ pub async fn merge_payload_parquet_files_with_execution(
         read_decode_duration: run_stats.read_decode_duration,
         source_prepare_duration: run_stats.source_prepare_duration,
         ordered_output_assembly_duration: run_stats.ordered_output_assembly_duration,
+        ordered_output_selection_duration: run_stats.ordered_output_selection_duration,
+        ordered_output_materialization_duration: run_stats.ordered_output_materialization_duration,
         writer_write_duration: run_stats.writer_write_duration,
         writer_encode_duration: run_stats.writer_encode_duration,
         writer_sink_duration: run_stats.writer_sink_duration,
         writer_close_duration: run_stats.writer_close_duration,
         direct_batch_writes: run_stats.direct_batch_writes,
         accumulator_flushes: run_stats.accumulator_flushes,
+        accumulator_concat_flushes: run_stats.accumulator_concat_flushes,
+        accumulator_interleave_flushes: run_stats.accumulator_interleave_flushes,
+        copy_candidate_row_groups: run_stats.copy_candidate_row_groups,
+        copied_row_groups: run_stats.copied_row_groups,
+        copied_rows: run_stats.copied_rows,
+        copied_compressed_bytes: run_stats.copied_compressed_bytes,
+        row_group_copy_duration: run_stats.row_group_copy_duration,
     })
 }
 
@@ -1351,6 +1402,82 @@ fn build_source_order_metadata(
     Ok(SourceOrderMetadata { row_groups: ranges })
 }
 
+fn build_ordered_row_group_copy_plans(
+    input_paths: &[PathBuf],
+    source_schemas: &[SchemaRef],
+    output_schema: &Schema,
+    source_adapters: &[Arc<CompiledSourceAdapter>],
+    execution_options: &ParquetMergeExecutionOptions,
+) -> Result<Vec<OrderedRowGroupCopyPlan>, String> {
+    let (output_parquet_schema, _) =
+        parquet_file_writer_schema_and_properties(output_schema, execution_options)?;
+    let requested_compression = parquet_compression(execution_options.writer_compression)
+        .map_err(|error| format!("invalid parquet writer compression: {error}"))?;
+    input_paths
+        .iter()
+        .zip(source_schemas.iter())
+        .zip(source_adapters.iter())
+        .map(|((input_path, source_schema), adapter)| {
+            let file = StdFile::open(input_path)
+                .map_err(|error| format!("failed opening parquet metadata for copy: {error}"))?;
+            let metadata = ParquetMetaDataReader::new()
+                .parse_and_finish(&file)
+                .map_err(|error| format!("failed reading parquet metadata for copy: {error}"))?;
+            let source_path = Arc::new(input_path.clone());
+            let file_copy_safe = adapter.identical_schema
+                && source_schema.as_ref() == output_schema
+                && metadata.file_metadata().schema() == output_parquet_schema.as_ref();
+            let row_groups = metadata
+                .row_groups()
+                .iter()
+                .map(|row_group| {
+                    let row_count = row_group.num_rows();
+                    if !file_copy_safe
+                        || row_count < 0
+                        || row_count as usize > execution_options.output_row_group_rows
+                        || !row_group_copy_matches_writer_properties(
+                            row_group,
+                            requested_compression,
+                            execution_options.writer_dictionary_enabled,
+                        )
+                    {
+                        return None;
+                    }
+                    let compressed_bytes = row_group
+                        .columns()
+                        .iter()
+                        .map(|column| column.compressed_size().max(0) as u64)
+                        .sum();
+                    Some(RowGroupCopyRequest {
+                        source_path: source_path.clone(),
+                        row_group_metadata: row_group.clone().into(),
+                        rows: row_count as u64,
+                        compressed_bytes,
+                    })
+                })
+                .collect();
+            Ok(OrderedRowGroupCopyPlan { row_groups })
+        })
+        .collect()
+}
+
+fn row_group_copy_matches_writer_properties(
+    row_group: &parquet::file::metadata::RowGroupMetaData,
+    requested_compression: Compression,
+    writer_dictionary_enabled: bool,
+) -> bool {
+    row_group.columns().iter().all(|column| {
+        column.compression() == requested_compression
+            && (writer_dictionary_enabled
+                || !column.encodings().iter().any(|encoding| {
+                    matches!(
+                        encoding,
+                        Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                    )
+                }))
+    })
+}
+
 fn extract_stats_order_key(
     values: &ArrayRef,
     index: usize,
@@ -1476,8 +1603,14 @@ fn parquet_file_writer_schema_and_properties(
 }
 
 #[derive(Clone, Debug)]
+struct OrderedBatchIdentity {
+    rows: usize,
+    columns: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
 struct OrderedBatchSource {
-    key: usize,
+    key: OrderedBatchIdentity,
     batch: RecordBatch,
 }
 
@@ -1496,7 +1629,23 @@ struct OrderedOutputAccumulator {
     rows: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderedFlushMode {
+    Direct,
+    Concat,
+    Interleave,
+}
+
+#[derive(Debug)]
+struct OrderedFlush {
+    batch: RecordBatch,
+    mode: OrderedFlushMode,
+}
+
 impl OrderedOutputAccumulator {
+    const CONCAT_FRAGMENT_LIMIT: usize = 8;
+    const CONCAT_MIN_AVG_FRAGMENT_ROWS: usize = 1024;
+
     fn new(schema: SchemaRef) -> Self {
         Self {
             schema,
@@ -1538,7 +1687,7 @@ impl OrderedOutputAccumulator {
             ));
         }
 
-        let batch_key = batch as *const RecordBatch as usize;
+        let batch_key = ordered_batch_identity(batch);
         let source_index = self
             .batch_sources
             .iter()
@@ -1551,6 +1700,13 @@ impl OrderedOutputAccumulator {
                 });
                 next
             });
+        if let Some(previous) = self.fragments.last_mut() {
+            if previous.source_index == source_index && previous.start + previous.len == start {
+                previous.len += len;
+                self.rows += len;
+                return Ok(());
+            }
+        }
         self.fragments.push(OrderedBatchFragment {
             source_index,
             start,
@@ -1560,12 +1716,17 @@ impl OrderedOutputAccumulator {
         Ok(())
     }
 
+    #[cfg(test)]
     fn flush(&mut self) -> Result<Option<RecordBatch>, String> {
+        Ok(self.flush_with_mode()?.map(|flushed| flushed.batch))
+    }
+
+    fn flush_with_mode(&mut self) -> Result<Option<OrderedFlush>, String> {
         if self.rows == 0 {
             return Ok(None);
         }
 
-        self.rows = 0;
+        let rows = std::mem::take(&mut self.rows);
         if self.fragments.len() == 1 {
             let fragment = self
                 .fragments
@@ -1576,17 +1737,40 @@ impl OrderedOutputAccumulator {
                 .pop()
                 .expect("single fragment has a backing source batch")
                 .batch;
-            return Ok(Some(
-                if fragment.start == 0 && fragment.len == batch.num_rows() {
-                    batch
-                } else {
-                    batch.slice(fragment.start, fragment.len)
-                },
-            ));
+            let batch = if fragment.start == 0 && fragment.len == batch.num_rows() {
+                batch
+            } else {
+                batch.slice(fragment.start, fragment.len)
+            };
+            return Ok(Some(OrderedFlush {
+                batch,
+                mode: OrderedFlushMode::Direct,
+            }));
         }
 
         let batch_sources = std::mem::take(&mut self.batch_sources);
         let fragments = std::mem::take(&mut self.fragments);
+        if Self::should_interleave(&fragments, rows) {
+            let batch_refs = batch_sources
+                .iter()
+                .map(|source| &source.batch)
+                .collect::<Vec<_>>();
+            let mut indices = Vec::with_capacity(rows);
+            for fragment in fragments {
+                for row in fragment.start..fragment.start + fragment.len {
+                    indices.push((fragment.source_index, row));
+                }
+            }
+            return interleave_record_batch(&batch_refs, &indices)
+                .map(|batch| {
+                    Some(OrderedFlush {
+                        batch,
+                        mode: OrderedFlushMode::Interleave,
+                    })
+                })
+                .map_err(|error| format!("failed to interleave ordered output batch: {error}"));
+        }
+
         let batches = fragments
             .into_iter()
             .map(|fragment| {
@@ -1597,8 +1781,39 @@ impl OrderedOutputAccumulator {
             .collect::<Vec<_>>();
 
         concat_batches(&self.schema, batches.iter())
-            .map(Some)
+            .map(|batch| {
+                Some(OrderedFlush {
+                    batch,
+                    mode: OrderedFlushMode::Concat,
+                })
+            })
             .map_err(|error| format!("failed to materialize ordered output batch: {error}"))
+    }
+
+    fn should_interleave(fragments: &[OrderedBatchFragment], rows: usize) -> bool {
+        if fragments.len() <= Self::CONCAT_FRAGMENT_LIMIT {
+            return false;
+        }
+        rows / fragments.len().max(1) < Self::CONCAT_MIN_AVG_FRAGMENT_ROWS
+    }
+}
+
+impl PartialEq for OrderedBatchIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows && self.columns == other.columns
+    }
+}
+
+impl Eq for OrderedBatchIdentity {}
+
+fn ordered_batch_identity(batch: &RecordBatch) -> OrderedBatchIdentity {
+    OrderedBatchIdentity {
+        rows: batch.num_rows(),
+        columns: batch
+            .columns()
+            .iter()
+            .map(|column| Arc::as_ptr(column) as *const () as usize)
+            .collect(),
     }
 }
 
@@ -1609,6 +1824,10 @@ struct ParquetWriterResult {
     encode_duration: Duration,
     sink_duration: Duration,
     close_duration: Duration,
+    copied_row_groups: u64,
+    copied_rows: u64,
+    copied_compressed_bytes: u64,
+    row_group_copy_duration: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -1673,10 +1892,24 @@ struct RowGroupEncodeJob {
     writer_properties: WriterProperties,
 }
 
+#[derive(Clone, Debug)]
+struct RowGroupCopyRequest {
+    source_path: Arc<PathBuf>,
+    row_group_metadata: RowGroupMetaDataPtr,
+    rows: u64,
+    compressed_bytes: u64,
+}
+
+#[derive(Debug)]
+enum EncodedRowGroupData {
+    InMemory(Bytes),
+    Copied(RowGroupCopyRequest),
+}
+
 #[derive(Debug)]
 struct EncodedRowGroup {
     sequence: u64,
-    bytes: Bytes,
+    data: EncodedRowGroupData,
     row_group_metadata: parquet::file::metadata::RowGroupMetaDataPtr,
     encode_duration: Duration,
 }
@@ -1729,9 +1962,14 @@ impl RowGroupBatchAccumulator {
         (self.rows > 0).then(|| self.flush())
     }
 
-    fn flush(&mut self) -> RowGroupEncodeJob {
+    fn next_sequence(&mut self) -> u64 {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
+        sequence
+    }
+
+    fn flush(&mut self) -> RowGroupEncodeJob {
+        let sequence = self.next_sequence();
         RowGroupEncodeJob {
             sequence,
             schema: self.schema.clone(),
@@ -1784,7 +2022,7 @@ fn encode_row_group(job: RowGroupEncodeJob) -> Result<EncodedRowGroup, String> {
     }
     Ok(EncodedRowGroup {
         sequence: job.sequence,
-        bytes,
+        data: EncodedRowGroupData::InMemory(bytes),
         row_group_metadata: row_group_metadata.into(),
         encode_duration: encode_start.elapsed(),
     })
@@ -1793,12 +2031,20 @@ fn encode_row_group(job: RowGroupEncodeJob) -> Result<EncodedRowGroup, String> {
 fn append_encoded_row_group<W: Write + Send>(
     writer: &mut SerializedFileWriter<W>,
     encoded: EncodedRowGroup,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let mut row_group_writer = writer
         .next_row_group()
         .map_err(|error| format!("failed creating output row group: {error}"))?;
     let rows_written = u64::try_from(encoded.row_group_metadata.num_rows())
         .map_err(|_| "encoded row group row count does not fit u64".to_string())?;
+    let copied = matches!(encoded.data, EncodedRowGroupData::Copied(_));
+    let source_file = match &encoded.data {
+        EncodedRowGroupData::InMemory(_) => None,
+        EncodedRowGroupData::Copied(copy) => Some(
+            StdFile::open(copy.source_path.as_ref())
+                .map_err(|error| format!("failed opening copied row group source: {error}"))?,
+        ),
+    };
     for column in encoded.row_group_metadata.columns() {
         let result = ColumnCloseResult {
             bytes_written: column.compressed_size() as u64,
@@ -1808,20 +2054,35 @@ fn append_encoded_row_group<W: Write + Send>(
             column_index: None,
             offset_index: None,
         };
-        row_group_writer
-            .append_column(&encoded.bytes, result)
-            .map_err(|error| format!("failed appending encoded column chunk: {error}"))?;
+        match (&encoded.data, source_file.as_ref()) {
+            (EncodedRowGroupData::InMemory(bytes), _) => row_group_writer
+                .append_column(bytes, result)
+                .map_err(|error| format!("failed appending encoded column chunk: {error}"))?,
+            (EncodedRowGroupData::Copied(_), Some(file)) => row_group_writer
+                .append_column(file, result)
+                .map_err(|error| format!("failed appending copied column chunk: {error}"))?,
+            (EncodedRowGroupData::Copied(_), None) => {
+                return Err("copied row group source file was not opened".to_string());
+            }
+        }
     }
     row_group_writer
         .close()
         .map_err(|error| format!("failed closing output row group: {error}"))?;
-    Ok(())
+    Ok(copied)
+}
+
+#[derive(Debug)]
+enum ParquetOutputItem {
+    Batch(RecordBatch),
+    CopyRowGroup(RowGroupCopyRequest),
 }
 
 #[derive(Debug)]
 struct ParquetOutputWriter {
-    tx: Option<mpsc::Sender<RecordBatch>>,
+    tx: Option<mpsc::Sender<ParquetOutputItem>>,
     handle: Option<tokio::task::JoinHandle<Result<ParquetWriterResult, String>>>,
+    supports_row_group_copy: bool,
 }
 
 impl ParquetOutputWriter {
@@ -1830,11 +2091,17 @@ impl ParquetOutputWriter {
         sink_metrics: Arc<ParquetAsyncSinkMetrics>,
         channel_capacity: usize,
     ) -> Self {
-        let (tx, mut rx) = mpsc::channel::<RecordBatch>(channel_capacity.max(1));
+        let (tx, mut rx) = mpsc::channel::<ParquetOutputItem>(channel_capacity.max(1));
         let handle = tokio::spawn(async move {
             let mut writer = writer;
             let mut result = ParquetWriterResult::default();
-            while let Some(batch) = rx.recv().await {
+            while let Some(item) = rx.recv().await {
+                let ParquetOutputItem::Batch(batch) = item else {
+                    return Err(
+                        "encoded row group copy requires the parallel parquet writer path"
+                            .to_string(),
+                    );
+                };
                 let write_start = Instant::now();
                 let sink_before = sink_metrics.sink_duration();
                 writer
@@ -1866,6 +2133,7 @@ impl ParquetOutputWriter {
         Self {
             tx: Some(tx),
             handle: Some(handle),
+            supports_row_group_copy: false,
         }
     }
 
@@ -1876,7 +2144,7 @@ impl ParquetOutputWriter {
         resolved_parallelism: usize,
         channel_capacity: usize,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<RecordBatch>(channel_capacity.max(1));
+        let (tx, rx) = mpsc::channel::<ParquetOutputItem>(channel_capacity.max(1));
         let handle = tokio::spawn(async move {
             run_parallel_output_writer(
                 rx,
@@ -1891,6 +2159,7 @@ impl ParquetOutputWriter {
         Self {
             tx: Some(tx),
             handle: Some(handle),
+            supports_row_group_copy: true,
         }
     }
 
@@ -1899,12 +2168,33 @@ impl ParquetOutputWriter {
             return Err("ordered writer is no longer accepting batches".to_string());
         };
 
-        if tx.send(batch).await.is_err() {
+        if tx.send(ParquetOutputItem::Batch(batch)).await.is_err() {
             return Err(self
                 .take_failure("ordered writer task closed unexpectedly")
                 .await);
         }
         Ok(())
+    }
+
+    async fn send_row_group_copy(&mut self, copy: RowGroupCopyRequest) -> Result<(), String> {
+        let Some(tx) = self.tx.as_ref().cloned() else {
+            return Err("ordered writer is no longer accepting copied row groups".to_string());
+        };
+
+        if tx
+            .send(ParquetOutputItem::CopyRowGroup(copy))
+            .await
+            .is_err()
+        {
+            return Err(self
+                .take_failure("ordered writer task closed unexpectedly")
+                .await);
+        }
+        Ok(())
+    }
+
+    fn supports_row_group_copy(&self) -> bool {
+        self.supports_row_group_copy
     }
 
     async fn finish(&mut self) -> Result<ParquetWriterResult, String> {
@@ -1932,7 +2222,7 @@ impl ParquetOutputWriter {
 }
 
 async fn run_parallel_output_writer(
-    mut rx: mpsc::Receiver<RecordBatch>,
+    mut rx: mpsc::Receiver<ParquetOutputItem>,
     output_path: PathBuf,
     output_schema: SchemaRef,
     execution_options: ParquetMergeExecutionOptions,
@@ -1961,21 +2251,64 @@ async fn run_parallel_output_writer(
     let mut result = ParquetWriterResult::default();
     let encoder_limit = resolved_parallelism.max(1);
 
-    while let Some(batch) = rx.recv().await {
+    while let Some(item) = rx.recv().await {
         writer_start.get_or_insert_with(Instant::now);
-        result.output_batches += 1;
-        for job in accumulator.push(batch) {
-            while pending.len() >= encoder_limit {
-                drain_one_encoded_row_group(
-                    &mut pending,
+        match item {
+            ParquetOutputItem::Batch(batch) => {
+                result.output_batches += 1;
+                for job in accumulator.push(batch) {
+                    while pending.len() >= encoder_limit {
+                        drain_one_encoded_row_group(
+                            &mut pending,
+                            &mut completed,
+                            &mut file_writer,
+                            &mut next_to_write,
+                            &mut result,
+                        )
+                        .await?;
+                    }
+                    spawn_row_group_encoder(&mut pending, job);
+                }
+            }
+            ParquetOutputItem::CopyRowGroup(copy) => {
+                if let Some(job) = accumulator.finish() {
+                    while pending.len() >= encoder_limit {
+                        drain_one_encoded_row_group(
+                            &mut pending,
+                            &mut completed,
+                            &mut file_writer,
+                            &mut next_to_write,
+                            &mut result,
+                        )
+                        .await?;
+                    }
+                    spawn_row_group_encoder(&mut pending, job);
+                }
+                while pending.len() >= encoder_limit {
+                    drain_one_encoded_row_group(
+                        &mut pending,
+                        &mut completed,
+                        &mut file_writer,
+                        &mut next_to_write,
+                        &mut result,
+                    )
+                    .await?;
+                }
+                let sequence = accumulator.next_sequence();
+                let encoded = EncodedRowGroup {
+                    sequence,
+                    data: EncodedRowGroupData::Copied(copy.clone()),
+                    row_group_metadata: copy.row_group_metadata.clone(),
+                    encode_duration: Duration::default(),
+                };
+                completed.insert(sequence, encoded);
+                write_ready_encoded_row_groups(
                     &mut completed,
                     &mut file_writer,
                     &mut next_to_write,
                     &mut result,
-                )
-                .await?;
+                )?;
             }
-            spawn_row_group_encoder(&mut pending, job);
         }
     }
 
@@ -2051,9 +2384,22 @@ fn write_ready_encoded_row_groups<W: Write + Send>(
     result: &mut ParquetWriterResult,
 ) -> Result<(), String> {
     while let Some(encoded) = completed.remove(&*next_to_write) {
+        let copied_metadata = match &encoded.data {
+            EncodedRowGroupData::Copied(copy) => Some((copy.rows, copy.compressed_bytes)),
+            EncodedRowGroupData::InMemory(_) => None,
+        };
         let sink_start = Instant::now();
-        append_encoded_row_group(writer, encoded)?;
-        result.sink_duration += sink_start.elapsed();
+        let copied = append_encoded_row_group(writer, encoded)?;
+        let elapsed = sink_start.elapsed();
+        result.sink_duration += elapsed;
+        if copied {
+            let (rows, compressed_bytes) = copied_metadata
+                .ok_or_else(|| "copied row group missing copy metadata".to_string())?;
+            result.copied_row_groups += 1;
+            result.copied_rows += rows;
+            result.copied_compressed_bytes += compressed_bytes;
+            result.row_group_copy_duration += elapsed;
+        }
         *next_to_write += 1;
     }
     Ok(())
@@ -2194,6 +2540,7 @@ impl PreparedOrderBatch {
         batch: RecordBatch,
         order_plan: &ParquetOrderPlan,
         row_group_index: usize,
+        row_group_batch_index: usize,
     ) -> Result<Self, String> {
         let order_column = extract_prepared_order_column(&batch, order_plan)?;
         let non_null_prefix_len = order_column.non_null_prefix_len(batch.num_rows());
@@ -2201,6 +2548,7 @@ impl PreparedOrderBatch {
             batch,
             order_column,
             row_group_index,
+            row_group_batch_index,
             non_null_prefix_len,
         })
     }
@@ -2694,6 +3042,10 @@ async fn merge_parquet_files_unordered_preserve_order(
     stats.writer_encode_duration = writer_result.encode_duration;
     stats.writer_sink_duration = writer_result.sink_duration;
     stats.writer_close_duration = writer_result.close_duration;
+    stats.copied_row_groups = writer_result.copied_row_groups;
+    stats.copied_rows = writer_result.copied_rows;
+    stats.copied_compressed_bytes = writer_result.copied_compressed_bytes;
+    stats.row_group_copy_duration = writer_result.row_group_copy_duration;
     stats.read_decode_duration =
         Duration::from_nanos(worker_metrics.read_decode_nanos.load(Ordering::Relaxed));
     stats.source_prepare_duration =
@@ -2797,6 +3149,10 @@ async fn merge_parquet_files_unordered_interleaved(
     stats.writer_encode_duration = writer_result.encode_duration;
     stats.writer_sink_duration = writer_result.sink_duration;
     stats.writer_close_duration = writer_result.close_duration;
+    stats.copied_row_groups = writer_result.copied_row_groups;
+    stats.copied_rows = writer_result.copied_rows;
+    stats.copied_compressed_bytes = writer_result.copied_compressed_bytes;
+    stats.row_group_copy_duration = writer_result.row_group_copy_duration;
     stats.read_decode_duration =
         Duration::from_nanos(worker_metrics.read_decode_nanos.load(Ordering::Relaxed));
     stats.source_prepare_duration =
@@ -2886,6 +3242,7 @@ async fn merge_payload_parquet_files_ordered(
     input_paths: &[PathBuf],
     output_path: &Path,
     output_schema: SchemaRef,
+    source_schemas: Vec<SchemaRef>,
     source_adapters: Vec<Arc<CompiledSourceAdapter>>,
     source_order_metadata: Vec<SourceOrderMetadata>,
     order_plan: ParquetOrderPlan,
@@ -2904,6 +3261,13 @@ async fn merge_payload_parquet_files_ordered(
     )
     .await?;
     let semaphore = Arc::new(Semaphore::new(resolved_parallelism.max(1)));
+    let source_copy_plans = build_ordered_row_group_copy_plans(
+        input_paths,
+        &source_schemas,
+        output_schema.as_ref(),
+        &source_adapters,
+        execution_options,
+    )?;
     let mut receivers = Vec::with_capacity(input_paths.len());
     let mut worker_handles = Vec::with_capacity(input_paths.len());
     for (source_index, (input_path, adapter)) in input_paths
@@ -2964,6 +3328,7 @@ async fn merge_payload_parquet_files_ordered(
                     source_index,
                     &mut sources,
                     &source_order_metadata,
+                    &source_copy_plans,
                     &mut ordered_writer,
                     execution_options,
                     &mut accumulator,
@@ -2980,6 +3345,7 @@ async fn merge_payload_parquet_files_ordered(
             }
         }
 
+        let selection_start = Instant::now();
         let entry = heap
             .pop(&sources)
             .expect("non-empty ordered merge heap always pops");
@@ -2996,6 +3362,7 @@ async fn merge_payload_parquet_files_ordered(
                     .max(1),
             )
         };
+        add_ordered_selection_duration(&mut stats, selection_start.elapsed());
         append_rows_from_source(
             entry.source_index,
             run_len,
@@ -3015,12 +3382,7 @@ async fn merge_payload_parquet_files_ordered(
         }
     }
 
-    let assembly_start = Instant::now();
-    if let Some(batch) = accumulator.flush()? {
-        stats.ordered_output_assembly_duration += assembly_start.elapsed();
-        ordered_writer.send(batch).await?;
-        stats.accumulator_flushes += 1;
-    }
+    flush_ordered_accumulator(&mut accumulator, &mut ordered_writer, &mut stats).await?;
 
     stats.ordered_merge_duration = ordered_merge_start.elapsed();
 
@@ -3038,6 +3400,10 @@ async fn merge_payload_parquet_files_ordered(
     stats.writer_encode_duration = writer_result.encode_duration;
     stats.writer_sink_duration = writer_result.sink_duration;
     stats.writer_close_duration = writer_result.close_duration;
+    stats.copied_row_groups = writer_result.copied_row_groups;
+    stats.copied_rows = writer_result.copied_rows;
+    stats.copied_compressed_bytes = writer_result.copied_compressed_bytes;
+    stats.row_group_copy_duration = writer_result.row_group_copy_duration;
     stats.read_decode_duration =
         Duration::from_nanos(worker_metrics.read_decode_nanos.load(Ordering::Relaxed));
     stats.source_prepare_duration =
@@ -3136,6 +3502,7 @@ async fn drain_fast_path_source(
     source_index: usize,
     sources: &mut [OrderedMergeSource],
     source_order_metadata: &[SourceOrderMetadata],
+    source_copy_plans: &[OrderedRowGroupCopyPlan],
     writer: &mut ParquetOutputWriter,
     execution_options: &ParquetMergeExecutionOptions,
     accumulator: &mut OrderedOutputAccumulator,
@@ -3149,6 +3516,34 @@ async fn drain_fast_path_source(
             .current_row_group_index()
             .expect("fast path requires an active row group");
         drained_row_groups += 1;
+        if let Some(copy) = copy_request_for_current_row_group(
+            source_index,
+            current_row_group_index,
+            sources,
+            source_copy_plans,
+        ) {
+            stats.copy_candidate_row_groups += 1;
+            if writer.supports_row_group_copy() {
+                flush_ordered_accumulator(accumulator, writer, stats).await?;
+                let (batches, rows) = consume_current_row_group_without_writing(
+                    source_index,
+                    current_row_group_index,
+                    sources,
+                    stats,
+                )
+                .await?;
+                drained_batches += batches;
+                stats.rows += rows;
+                if rows != copy.rows {
+                    return Err(format!(
+                        "copied row group row count mismatch: decoded {rows}, metadata {}",
+                        copy.rows
+                    ));
+                }
+                writer.send_row_group_copy(copy).await?;
+                continue;
+            }
+        }
 
         loop {
             let still_on_row_group = sources[source_index]
@@ -3187,6 +3582,97 @@ async fn drain_fast_path_source(
     Ok((drained_row_groups, drained_batches))
 }
 
+fn copy_request_for_current_row_group(
+    source_index: usize,
+    row_group_index: usize,
+    sources: &[OrderedMergeSource],
+    source_copy_plans: &[OrderedRowGroupCopyPlan],
+) -> Option<RowGroupCopyRequest> {
+    let source = sources.get(source_index)?;
+    let current_batch = source.current_batch.as_ref()?;
+    if source.current_row != 0
+        || current_batch.row_group_index != row_group_index
+        || current_batch.row_group_batch_index != 0
+    {
+        return None;
+    }
+    source_copy_plans
+        .get(source_index)?
+        .row_groups
+        .get(row_group_index)?
+        .clone()
+}
+
+async fn consume_current_row_group_without_writing(
+    source_index: usize,
+    row_group_index: usize,
+    sources: &mut [OrderedMergeSource],
+    stats: &mut ParquetMergeRunStats,
+) -> Result<(u64, u64), String> {
+    let mut batches = 0_u64;
+    let mut rows = 0_u64;
+    loop {
+        let still_on_row_group = sources[source_index]
+            .current_batch
+            .as_ref()
+            .map(|batch| batch.row_group_index == row_group_index)
+            .unwrap_or(false);
+        if !still_on_row_group {
+            break;
+        }
+        let remaining_rows = {
+            let source = &sources[source_index];
+            let batch = source
+                .current_batch
+                .as_ref()
+                .expect("row group copy requires an active batch");
+            batch.batch.num_rows() - source.current_row
+        };
+        if sources[source_index].current_row == 0 {
+            batches += 1;
+        }
+        rows += remaining_rows as u64;
+        sources[source_index].current_row += remaining_rows;
+        sources[source_index]
+            .load_next(&mut stats.input_batches)
+            .await?;
+    }
+    Ok((batches, rows))
+}
+
+fn add_ordered_selection_duration(stats: &mut ParquetMergeRunStats, duration: Duration) {
+    stats.ordered_output_selection_duration += duration;
+    stats.ordered_output_assembly_duration += duration;
+}
+
+fn add_ordered_materialization_duration(
+    stats: &mut ParquetMergeRunStats,
+    duration: Duration,
+    mode: OrderedFlushMode,
+) {
+    stats.ordered_output_materialization_duration += duration;
+    stats.ordered_output_assembly_duration += duration;
+    stats.accumulator_flushes += 1;
+    match mode {
+        OrderedFlushMode::Direct => {}
+        OrderedFlushMode::Concat => stats.accumulator_concat_flushes += 1,
+        OrderedFlushMode::Interleave => stats.accumulator_interleave_flushes += 1,
+    }
+}
+
+async fn flush_ordered_accumulator(
+    accumulator: &mut OrderedOutputAccumulator,
+    writer: &mut ParquetOutputWriter,
+    stats: &mut ParquetMergeRunStats,
+) -> Result<(), String> {
+    let flush_start = Instant::now();
+    if let Some(flushed) = accumulator.flush_with_mode()? {
+        add_ordered_materialization_duration(stats, flush_start.elapsed(), flushed.mode);
+        writer.send(flushed.batch).await?;
+    }
+    Ok(())
+}
+
 async fn append_rows_from_source(
     source_index: usize,
     row_count: usize,
@@ -3216,12 +3702,7 @@ async fn append_rows_from_source(
         };
 
         if can_write_whole_batch_directly && !accumulator.is_empty() {
-            let flush_start = Instant::now();
-            if let Some(batch) = accumulator.flush()? {
-                stats.ordered_output_assembly_duration += flush_start.elapsed();
-                writer.send(batch).await?;
-                stats.accumulator_flushes += 1;
-            }
+            flush_ordered_accumulator(accumulator, writer, stats).await?;
             continue;
         }
 
@@ -3250,18 +3731,13 @@ async fn append_rows_from_source(
                 .expect("pending output append requires an active batch");
             let assembly_start = Instant::now();
             accumulator.append_range(&batch.batch, current_row, take)?;
-            stats.ordered_output_assembly_duration += assembly_start.elapsed();
+            add_ordered_selection_duration(stats, assembly_start.elapsed());
             stats.rows += take as u64;
             remaining -= take;
             sources[source_index].current_row += take;
 
             if accumulator.rows() >= execution_options.output_batch_rows {
-                let flush_start = Instant::now();
-                if let Some(batch) = accumulator.flush()? {
-                    stats.ordered_output_assembly_duration += flush_start.elapsed();
-                    writer.send(batch).await?;
-                    stats.accumulator_flushes += 1;
-                }
+                flush_ordered_accumulator(accumulator, writer, stats).await?;
             }
         }
 
@@ -3303,6 +3779,7 @@ async fn parquet_merge_source_worker(
         let mut last_key = None;
 
         for row_group_index in 0..row_group_count {
+            let mut row_group_batch_index = 0_usize;
             let row_group_file = file.try_clone().await.map_err(|error| {
                 format!(
                     "failed cloning parquet handle for `{}` row group {}: {error}",
@@ -3364,8 +3841,13 @@ async fn parquet_merge_source_worker(
                                 row_group_index
                             )
                         })?;
-                    let prepared =
-                        PreparedOrderBatch::new(adapted, order_plan.as_ref(), row_group_index)?;
+                    let prepared = PreparedOrderBatch::new(
+                        adapted,
+                        order_plan.as_ref(),
+                        row_group_index,
+                        row_group_batch_index,
+                    )?;
+                    row_group_batch_index += 1;
                     validate_prepared_ordered_batch(
                         &prepared,
                         &mut last_key,
@@ -3819,12 +4301,21 @@ pub async fn compact_ndjson_to_parquet(
         read_decode_duration: Duration::default(),
         source_prepare_duration: Duration::default(),
         ordered_output_assembly_duration: Duration::default(),
+        ordered_output_selection_duration: Duration::default(),
+        ordered_output_materialization_duration: Duration::default(),
         writer_write_duration: Duration::default(),
         writer_encode_duration: Duration::default(),
         writer_sink_duration: Duration::default(),
         writer_close_duration: Duration::default(),
         direct_batch_writes: 0,
         accumulator_flushes: 0,
+        accumulator_concat_flushes: 0,
+        accumulator_interleave_flushes: 0,
+        copy_candidate_row_groups: 0,
+        copied_row_groups: 0,
+        copied_rows: 0,
+        copied_compressed_bytes: 0,
+        row_group_copy_duration: Duration::default(),
     })
 }
 
@@ -7573,6 +8064,7 @@ mod tests {
             batch,
             order_column: PreparedOrderColumn::Int64(order_array),
             row_group_index: 0,
+            row_group_batch_index: 0,
             non_null_prefix_len: 4,
         };
 
@@ -7600,6 +8092,7 @@ mod tests {
                 batch: competitor_batch,
                 order_column: PreparedOrderColumn::Int64(Int64Array::from(vec![2])),
                 row_group_index: 0,
+                row_group_batch_index: 0,
                 non_null_prefix_len: 1,
             }),
             current_row: 0,
@@ -7633,6 +8126,7 @@ mod tests {
             batch: descending_batch,
             order_column: PreparedOrderColumn::Int64(descending_array),
             row_group_index: 0,
+            row_group_batch_index: 0,
             non_null_prefix_len: 2,
         };
         let mut last_key = None;
@@ -7660,6 +8154,7 @@ mod tests {
             batch: null_then_value_batch,
             order_column: PreparedOrderColumn::Int64(null_then_value_array),
             row_group_index: 0,
+            row_group_batch_index: 0,
             non_null_prefix_len: 0,
         };
         let mut last_key = None;
@@ -7695,6 +8190,7 @@ mod tests {
                     batch,
                     order_column: PreparedOrderColumn::Int64(array),
                     row_group_index: 0,
+                    row_group_batch_index: 0,
                     non_null_prefix_len: values.iter().take_while(|value| value.is_some()).count(),
                 }),
                 current_row: 0,
@@ -8277,6 +8773,76 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn ordered_output_accumulator_uses_interleave_for_dense_fragments() -> Result<(), Box<dyn Error>>
+    {
+        let (left_schema, left_batch, right_schema, right_batch) = sample_payload_inputs();
+        let mut plan = build_compiled_payload_plan(
+            [left_schema.as_ref(), right_schema.as_ref()],
+            &payload_schema_options(),
+        )
+        .map_err(io_error)?;
+        let left = plan.adapt_batch(&left_batch)?;
+        let right = plan.adapt_batch(&right_batch)?;
+        let mut accumulator = OrderedOutputAccumulator::new(plan.output_schema.clone());
+        let mut expected_slices = Vec::new();
+
+        for index in 0..10 {
+            let (batch, row) = if index % 2 == 0 {
+                (left.clone(), 0)
+            } else {
+                (right.clone(), 1)
+            };
+            accumulator.append_range(&batch, row, 1).map_err(io_error)?;
+            expected_slices.push((batch, row, 1));
+        }
+
+        let flushed = accumulator
+            .flush_with_mode()
+            .map_err(io_error)?
+            .expect("flush emits batch");
+        let expected = concat_batch_slices(plan.output_schema.clone(), &expected_slices)?;
+
+        assert_eq!(flushed.mode, OrderedFlushMode::Interleave);
+        assert_eq!(flushed.batch, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_output_accumulator_keeps_long_fragments_on_concat_path() -> Result<(), Box<dyn Error>>
+    {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "event_id",
+            DataType::Int64,
+            false,
+        )]));
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..2_000)) as ArrayRef],
+        )?;
+        let second = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(2_000..4_000)) as ArrayRef],
+        )?;
+        let mut accumulator = OrderedOutputAccumulator::new(schema.clone());
+        accumulator
+            .append_range(&first, 0, 1_500)
+            .map_err(io_error)?;
+        accumulator
+            .append_range(&second, 250, 1_500)
+            .map_err(io_error)?;
+
+        let flushed = accumulator
+            .flush_with_mode()
+            .map_err(io_error)?
+            .expect("flush emits batch");
+        let expected = concat_batch_slices(schema, &[(first, 0, 1_500), (second, 250, 1_500)])?;
+
+        assert_eq!(flushed.mode, OrderedFlushMode::Concat);
+        assert_eq!(flushed.batch, expected);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn ordered_merge_uses_stats_fast_path_for_non_overlapping_row_groups()
     -> Result<(), Box<dyn Error>> {
@@ -8329,6 +8895,149 @@ mod tests {
 
         let _ = tokio::fs::remove_file(first_path).await;
         let _ = tokio::fs::remove_file(second_path).await;
+        let _ = tokio::fs::remove_file(output_path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordered_merge_copies_non_overlapping_exact_schema_row_groups()
+    -> Result<(), Box<dyn Error>> {
+        let payload_fields: Fields =
+            vec![Arc::new(Field::new("score", DataType::Int32, true))].into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int64, false),
+            Field::new("org_id", DataType::Int64, false),
+            Field::new("payload", DataType::Struct(payload_fields.clone()), true),
+        ]));
+        let make_batch =
+            |event_ids: Vec<i64>, org_ids: Vec<i64>| -> Result<RecordBatch, Box<dyn Error>> {
+                let payload = Arc::new(StructArray::new(
+                    payload_fields.clone(),
+                    vec![Arc::new(Int32Array::from(
+                        event_ids
+                            .iter()
+                            .map(|value| Some(*value as i32))
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef],
+                    None,
+                )) as ArrayRef;
+                Ok(RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(event_ids)) as ArrayRef,
+                        Arc::new(Int64Array::from(org_ids)) as ArrayRef,
+                        payload,
+                    ],
+                )?)
+            };
+        let writer_properties = WriterProperties::builder()
+            .set_max_row_group_size(2)
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let first_path = unique_path("ordered_copy_left", "parquet");
+        let second_path = unique_path("ordered_copy_right", "parquet");
+        let output_path = unique_path("ordered_copy_output", "parquet");
+        write_parquet_with_properties(
+            &first_path,
+            schema.clone(),
+            make_batch(vec![1, 2], vec![10, 20])?,
+            Some(writer_properties.clone()),
+        )
+        .await?;
+        write_parquet_with_properties(
+            &second_path,
+            schema.clone(),
+            make_batch(vec![3, 4], vec![30, 40])?,
+            Some(writer_properties),
+        )
+        .await?;
+
+        let report = merge_payload_parquet_files_with_execution(
+            &[first_path.clone(), second_path.clone()],
+            &output_path,
+            &payload_schema_options(),
+            &ParquetMergeExecutionOptions {
+                parallelism: 2,
+                writer_compression: ParquetCompression::Snappy,
+                output_row_group_rows: 2,
+                ..ordered_execution_options("event_id")
+            },
+        )
+        .await?;
+
+        assert_eq!(report.copy_candidate_row_groups, 2);
+        assert_eq!(report.copied_row_groups, 2);
+        assert_eq!(report.copied_rows, 4);
+        assert!(report.copied_compressed_bytes > 0);
+        assert_eq!(
+            collect_int64_column(&read_parquet_batches(&output_path).await?, "event_id"),
+            vec![Some(1), Some(2), Some(3), Some(4)]
+        );
+
+        let _ = tokio::fs::remove_file(first_path).await;
+        let _ = tokio::fs::remove_file(second_path).await;
+        let _ = tokio::fs::remove_file(output_path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordered_merge_copy_falls_back_on_compression_mismatch() -> Result<(), Box<dyn Error>> {
+        let payload_fields: Fields =
+            vec![Arc::new(Field::new("score", DataType::Int32, true))].into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int64, false),
+            Field::new("org_id", DataType::Int64, false),
+            Field::new("payload", DataType::Struct(payload_fields.clone()), true),
+        ]));
+        let payload = Arc::new(StructArray::new(
+            payload_fields,
+            vec![Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef],
+            None,
+        )) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+                payload,
+            ],
+        )?;
+        let input_path = unique_path("ordered_copy_mismatch_input", "parquet");
+        let output_path = unique_path("ordered_copy_mismatch_output", "parquet");
+        write_parquet_with_properties(
+            &input_path,
+            schema,
+            batch,
+            Some(
+                WriterProperties::builder()
+                    .set_max_row_group_size(2)
+                    .set_compression(Compression::UNCOMPRESSED)
+                    .build(),
+            ),
+        )
+        .await?;
+
+        let report = merge_payload_parquet_files_with_execution(
+            &[input_path.clone()],
+            &output_path,
+            &payload_schema_options(),
+            &ParquetMergeExecutionOptions {
+                parallelism: 2,
+                writer_compression: ParquetCompression::Snappy,
+                output_row_group_rows: 2,
+                ..ordered_execution_options("event_id")
+            },
+        )
+        .await?;
+
+        assert_eq!(report.copy_candidate_row_groups, 0);
+        assert_eq!(report.copied_row_groups, 0);
+        assert_eq!(
+            collect_int64_column(&read_parquet_batches(&output_path).await?, "event_id"),
+            vec![Some(1), Some(2)]
+        );
+
+        let _ = tokio::fs::remove_file(input_path).await;
         let _ = tokio::fs::remove_file(output_path).await;
         Ok(())
     }
@@ -8841,6 +9550,75 @@ mod tests {
         let _ = tokio::fs::remove_file(first_right_path).await;
         let _ = tokio::fs::remove_file(second_left_path).await;
         let _ = tokio::fs::remove_file(second_right_path).await;
+        let _ = tokio::fs::remove_file(output_path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordered_merge_dense_interleaved_rows_use_interleave_flush()
+    -> Result<(), Box<dyn Error>> {
+        let payload_fields: Fields =
+            vec![Arc::new(Field::new("score", DataType::Int32, true))].into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int64, false),
+            Field::new("org_id", DataType::Int64, false),
+            Field::new("payload", DataType::Struct(payload_fields.clone()), true),
+        ]));
+        let mut paths = Vec::new();
+        for source_index in 0..10 {
+            let payload = Arc::new(StructArray::new(
+                payload_fields.clone(),
+                vec![Arc::new(Int32Array::from(vec![
+                    Some(source_index as i32),
+                    Some((source_index + 10) as i32),
+                ])) as ArrayRef],
+                None,
+            )) as ArrayRef;
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![
+                        source_index as i64,
+                        (source_index + 10) as i64,
+                    ])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![
+                        (source_index * 10) as i64,
+                        (source_index * 10 + 1) as i64,
+                    ])) as ArrayRef,
+                    payload,
+                ],
+            )?;
+            let path = unique_path(
+                &format!("ordered_dense_interleave_{source_index}"),
+                "parquet",
+            );
+            write_parquet(&path, schema.clone(), batch).await?;
+            paths.push(path);
+        }
+        let output_path = unique_path("ordered_dense_interleave_output", "parquet");
+
+        let report = merge_payload_parquet_files_with_execution(
+            &paths,
+            &output_path,
+            &payload_schema_options(),
+            &ParquetMergeExecutionOptions {
+                output_batch_rows: 10,
+                output_row_group_rows: 10,
+                parallelism: 2,
+                ..ordered_execution_options("event_id")
+            },
+        )
+        .await?;
+
+        assert!(report.accumulator_interleave_flushes > 0);
+        assert_eq!(
+            collect_int64_column(&read_parquet_batches(&output_path).await?, "event_id"),
+            (0..20).map(|value| Some(value as i64)).collect::<Vec<_>>()
+        );
+
+        for path in paths {
+            let _ = tokio::fs::remove_file(path).await;
+        }
         let _ = tokio::fs::remove_file(output_path).await;
         Ok(())
     }
