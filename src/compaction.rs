@@ -4886,10 +4886,20 @@ async fn merge_payload_parquet_files_ordered_typed<K: OrderedKey>(
     let ordered_memory_limiter = execution_options
         .ordered_memory_budget_bytes
         .map(OrderedMemoryLimiter::new);
+    let mut writer_execution_options = execution_options.clone();
+    if matches!(
+        K::KEY_TYPE,
+        ParquetOrderKeyType::Utf8 | ParquetOrderKeyType::LargeUtf8
+    ) && execution_options.ordered_memory_budget_bytes.is_some()
+    {
+        writer_execution_options.output_batch_rows = writer_execution_options
+            .output_batch_rows
+            .max(writer_execution_options.output_row_group_rows);
+    }
     let mut ordered_writer = create_parquet_output_writer(
         output_path,
         output_schema.clone(),
-        execution_options,
+        &writer_execution_options,
         cpu_parallelism,
         execution_options.prefetch_batches_per_source.max(2) * cpu_parallelism.max(1),
     )
@@ -5020,7 +5030,7 @@ async fn merge_payload_parquet_files_ordered_typed<K: OrderedKey>(
             continue;
         }
 
-        if try_dense_int64_merge_window_typed::<K>(
+        if try_dense_ordered_merge_window_typed::<K>(
             &mut sources,
             &mut selector,
             &mut ordered_writer,
@@ -5489,33 +5499,109 @@ async fn decode_pending_copy_candidates_typed<K: OrderedKey>(
     Ok(decoded_any)
 }
 
-const DENSE_INT64_INITIAL_RUN_THRESHOLD: usize = 8;
-const DENSE_INT64_MAX_PARTITIONS_PER_CORE: usize = 2;
+const DENSE_ORDERED_INITIAL_RUN_THRESHOLD: usize = 8;
+const DENSE_ORDERED_MAX_PARTITIONS_PER_CORE: usize = 2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct DenseInt64Boundary {
-    key: i64,
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DenseOrderedKeyValue {
+    Int64(i64),
+    String(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DenseOrderedBoundary {
+    key: DenseOrderedKeyValue,
     source_index: usize,
+    row: usize,
 }
 
 #[derive(Clone, Debug)]
-struct DenseInt64SourceSnapshot {
+enum DenseOrderedColumn {
+    Int64(Int64Array),
+    Utf8(StringArray),
+    LargeUtf8(LargeStringArray),
+}
+
+impl DenseOrderedColumn {
+    fn new(key_type: ParquetOrderKeyType, column: &ArrayRef) -> Option<Self> {
+        match key_type {
+            ParquetOrderKeyType::Int64 => column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .cloned()
+                .map(Self::Int64),
+            ParquetOrderKeyType::Utf8 => column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .cloned()
+                .map(Self::Utf8),
+            ParquetOrderKeyType::LargeUtf8 => column
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .cloned()
+                .map(Self::LargeUtf8),
+            _ => None,
+        }
+    }
+
+    fn key_at(&self, row: usize) -> DenseOrderedKeyValue {
+        match self {
+            Self::Int64(array) => DenseOrderedKeyValue::Int64(array.value(row)),
+            Self::Utf8(array) => DenseOrderedKeyValue::String(array.value(row).to_string()),
+            Self::LargeUtf8(array) => DenseOrderedKeyValue::String(array.value(row).to_string()),
+        }
+    }
+
+    fn compare_row_to_key(&self, row: usize, key: &DenseOrderedKeyValue) -> CmpOrdering {
+        match (self, key) {
+            (Self::Int64(array), DenseOrderedKeyValue::Int64(key)) => array.value(row).cmp(key),
+            (Self::Utf8(array), DenseOrderedKeyValue::String(key)) => array.value(row).cmp(key),
+            (Self::LargeUtf8(array), DenseOrderedKeyValue::String(key)) => {
+                array.value(row).cmp(key)
+            }
+            _ => CmpOrdering::Equal,
+        }
+    }
+
+    fn compare_rows(
+        &self,
+        left_row: usize,
+        other: &DenseOrderedColumn,
+        right_row: usize,
+    ) -> CmpOrdering {
+        match (self, other) {
+            (Self::Int64(left), Self::Int64(right)) => {
+                left.value(left_row).cmp(&right.value(right_row))
+            }
+            (Self::Utf8(left), Self::Utf8(right)) => {
+                left.value(left_row).cmp(right.value(right_row))
+            }
+            (Self::LargeUtf8(left), Self::LargeUtf8(right)) => {
+                left.value(left_row).cmp(right.value(right_row))
+            }
+            _ => CmpOrdering::Equal,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DenseOrderedSourceSnapshot {
     source_index: usize,
     batch: RecordBatch,
-    order_column: Int64Array,
+    order_column: DenseOrderedColumn,
     start: usize,
     end: usize,
 }
 
 #[derive(Debug)]
-struct DenseInt64PartitionJob {
+struct DenseOrderedPartitionJob {
     partition_index: usize,
-    sources: Vec<DenseInt64SourceSnapshot>,
+    sources: Vec<DenseOrderedSourceSnapshot>,
     rows: usize,
 }
 
 #[derive(Debug)]
-struct DenseInt64PartitionOutput {
+struct DenseOrderedPartitionOutput {
     partition_index: usize,
     batch: RecordBatch,
     rows: usize,
@@ -5525,7 +5611,7 @@ struct DenseInt64PartitionOutput {
     comparisons: u64,
 }
 
-async fn try_dense_int64_merge_window_typed<K: OrderedKey>(
+async fn try_dense_ordered_merge_window_typed<K: OrderedKey>(
     sources: &mut [OrderedMergeSourceTyped<K>],
     selector: &mut TypedSourceTournament<K>,
     writer: &mut ParquetOutputWriter,
@@ -5536,7 +5622,7 @@ async fn try_dense_int64_merge_window_typed<K: OrderedKey>(
     cpu_parallelism: usize,
     order_plan: &ParquetOrderPlan,
 ) -> Result<bool, String> {
-    if K::KEY_TYPE != ParquetOrderKeyType::Int64
+    if !dense_ordered_key_supported(K::KEY_TYPE)
         || execution_options.parallelism == 1
         || execution_options.ordered_memory_budget_bytes.is_none()
         || cpu_parallelism <= 1
@@ -5564,10 +5650,10 @@ async fn try_dense_int64_merge_window_typed<K: OrderedKey>(
         let competitor = next_competitor.map(|index| &sources[index]);
         source.contiguous_run_len(
             competitor,
-            DENSE_INT64_INITIAL_RUN_THRESHOLD.saturating_add(1),
+            DENSE_ORDERED_INITIAL_RUN_THRESHOLD.saturating_add(1),
         )
     };
-    if initial_run_len > DENSE_INT64_INITIAL_RUN_THRESHOLD {
+    if initial_run_len > DENSE_ORDERED_INITIAL_RUN_THRESHOLD {
         return Ok(false);
     }
 
@@ -5584,31 +5670,29 @@ async fn try_dense_int64_merge_window_typed<K: OrderedKey>(
             stats.dense_fallback_count += 1;
             return Ok(false);
         }
-        let Some(order_column) = batch
-            .batch
-            .column(order_plan.field_index)
-            .as_any()
-            .downcast_ref::<Int64Array>()
+        let Some(order_column) =
+            DenseOrderedColumn::new(K::KEY_TYPE, batch.batch.column(order_plan.field_index))
         else {
             return Err(format!(
-                "ordering_field `{}` is not Int64 at runtime",
-                order_plan.field_name
+                "ordering_field `{}` is not {} at runtime",
+                order_plan.field_name,
+                K::RUNTIME_NAME
             ));
         };
-        snapshots.push(DenseInt64SourceSnapshot {
+        snapshots.push(DenseOrderedSourceSnapshot {
             source_index,
             batch: batch.batch.clone(),
-            order_column: order_column.clone(),
+            order_column,
             start: source.current_row,
             end: batch.non_null_prefix_len,
         });
     }
 
-    let Some(safe_upper_bound) = dense_int64_safe_upper_bound(&snapshots) else {
+    let Some(safe_upper_bound) = dense_ordered_safe_upper_bound(&snapshots) else {
         return Ok(false);
     };
     for snapshot in &mut snapshots {
-        snapshot.end = dense_int64_bound(snapshot, safe_upper_bound).min(snapshot.end);
+        snapshot.end = dense_ordered_bound(snapshot, &safe_upper_bound).min(snapshot.end);
     }
     snapshots.retain(|snapshot| snapshot.start < snapshot.end);
     if snapshots.len() < 2 {
@@ -5623,14 +5707,13 @@ async fn try_dense_int64_merge_window_typed<K: OrderedKey>(
         return Ok(false);
     }
 
-    let target_partitions = total_rows
-        .div_ceil(execution_options.output_batch_rows.max(1))
-        .max(1);
+    let target_rows = dense_ordered_target_rows(K::KEY_TYPE, execution_options);
+    let target_partitions = total_rows.div_ceil(target_rows).max(1);
     let max_partitions = cpu_parallelism
-        .saturating_mul(DENSE_INT64_MAX_PARTITIONS_PER_CORE)
+        .saturating_mul(DENSE_ORDERED_MAX_PARTITIONS_PER_CORE)
         .max(1);
     let partition_count = target_partitions.min(max_partitions).max(1);
-    let partitions = dense_int64_partition_jobs(&snapshots, partition_count);
+    let partitions = dense_ordered_partition_jobs(&snapshots, partition_count);
     if partitions.is_empty() {
         stats.dense_fallback_count += 1;
         return Ok(false);
@@ -5655,7 +5738,7 @@ async fn try_dense_int64_merge_window_typed<K: OrderedKey>(
     for partition in partitions {
         stats.dense_partition_jobs += 1;
         pending.push(tokio::task::spawn_blocking(move || {
-            dense_int64_materialize_partition(partition)
+            dense_ordered_materialize_partition(partition)
         }));
     }
 
@@ -5725,10 +5808,30 @@ async fn try_dense_int64_merge_window_typed<K: OrderedKey>(
     Ok(true)
 }
 
-fn dense_int64_partition_jobs(
-    snapshots: &[DenseInt64SourceSnapshot],
+fn dense_ordered_key_supported(key_type: ParquetOrderKeyType) -> bool {
+    matches!(
+        key_type,
+        ParquetOrderKeyType::Int64 | ParquetOrderKeyType::Utf8 | ParquetOrderKeyType::LargeUtf8
+    )
+}
+
+fn dense_ordered_target_rows(
+    key_type: ParquetOrderKeyType,
+    execution_options: &ParquetMergeExecutionOptions,
+) -> usize {
+    match key_type {
+        ParquetOrderKeyType::Utf8 | ParquetOrderKeyType::LargeUtf8 => execution_options
+            .output_row_group_rows
+            .max(execution_options.output_batch_rows)
+            .max(1),
+        _ => execution_options.output_batch_rows.max(1),
+    }
+}
+
+fn dense_ordered_partition_jobs(
+    snapshots: &[DenseOrderedSourceSnapshot],
     partition_count: usize,
-) -> Vec<DenseInt64PartitionJob> {
+) -> Vec<DenseOrderedPartitionJob> {
     let total_rows = snapshots
         .iter()
         .map(|snapshot| snapshot.end.saturating_sub(snapshot.start))
@@ -5738,23 +5841,23 @@ fn dense_int64_partition_jobs(
     }
 
     let partition_count = partition_count.min(total_rows).max(1);
-    let boundaries = dense_int64_boundaries(snapshots, partition_count);
+    let boundaries = dense_ordered_boundaries(snapshots, partition_count);
     let mut jobs = Vec::new();
     let mut lower = None;
     for partition_index in 0..=boundaries.len() {
-        let upper = boundaries.get(partition_index).copied();
+        let upper = boundaries.get(partition_index);
         let mut partition_sources = Vec::new();
         let mut rows = 0_usize;
         for snapshot in snapshots {
             let start = lower
-                .map(|boundary| dense_int64_bound(snapshot, boundary))
+                .map(|boundary| dense_ordered_bound(snapshot, boundary))
                 .unwrap_or(snapshot.start);
             let end = upper
-                .map(|boundary| dense_int64_bound(snapshot, boundary))
+                .map(|boundary| dense_ordered_bound(snapshot, boundary))
                 .unwrap_or(snapshot.end);
             if start < end {
                 rows += end - start;
-                partition_sources.push(DenseInt64SourceSnapshot {
+                partition_sources.push(DenseOrderedSourceSnapshot {
                     source_index: snapshot.source_index,
                     batch: snapshot.batch.clone(),
                     order_column: snapshot.order_column.clone(),
@@ -5764,7 +5867,7 @@ fn dense_int64_partition_jobs(
             }
         }
         if rows > 0 {
-            jobs.push(DenseInt64PartitionJob {
+            jobs.push(DenseOrderedPartitionJob {
                 partition_index: jobs.len(),
                 sources: partition_sources,
                 rows,
@@ -5775,23 +5878,24 @@ fn dense_int64_partition_jobs(
     jobs
 }
 
-fn dense_int64_safe_upper_bound(
-    snapshots: &[DenseInt64SourceSnapshot],
-) -> Option<DenseInt64Boundary> {
+fn dense_ordered_safe_upper_bound(
+    snapshots: &[DenseOrderedSourceSnapshot],
+) -> Option<DenseOrderedBoundary> {
     snapshots
         .iter()
         .filter(|snapshot| snapshot.start < snapshot.end)
-        .map(|snapshot| DenseInt64Boundary {
-            key: snapshot.order_column.value(snapshot.end - 1),
-            source_index: snapshot.source_index.saturating_add(1),
+        .map(|snapshot| DenseOrderedBoundary {
+            key: snapshot.order_column.key_at(snapshot.end - 1),
+            source_index: snapshot.source_index,
+            row: snapshot.end,
         })
         .min()
 }
 
-fn dense_int64_boundaries(
-    snapshots: &[DenseInt64SourceSnapshot],
+fn dense_ordered_boundaries(
+    snapshots: &[DenseOrderedSourceSnapshot],
     partition_count: usize,
-) -> Vec<DenseInt64Boundary> {
+) -> Vec<DenseOrderedBoundary> {
     if partition_count <= 1 {
         return Vec::new();
     }
@@ -5806,15 +5910,17 @@ fn dense_int64_boundaries(
         let stride = len.div_ceil(sample_target).max(1);
         let mut row = snapshot.start;
         while row < snapshot.end {
-            samples.push(DenseInt64Boundary {
-                key: snapshot.order_column.value(row),
+            samples.push(DenseOrderedBoundary {
+                key: snapshot.order_column.key_at(row),
                 source_index: snapshot.source_index,
+                row,
             });
             row = row.saturating_add(stride);
         }
-        samples.push(DenseInt64Boundary {
-            key: snapshot.order_column.value(snapshot.end - 1),
+        samples.push(DenseOrderedBoundary {
+            key: snapshot.order_column.key_at(snapshot.end - 1),
             source_index: snapshot.source_index,
+            row: snapshot.end - 1,
         });
     }
     samples.sort_unstable();
@@ -5826,8 +5932,8 @@ fn dense_int64_boundaries(
     let mut boundaries = Vec::new();
     for partition in 1..partition_count {
         let sample_index = samples.len().saturating_mul(partition) / partition_count;
-        if let Some(boundary) = samples.get(sample_index.min(samples.len() - 1)).copied() {
-            if boundaries.last().copied() != Some(boundary) {
+        if let Some(boundary) = samples.get(sample_index.min(samples.len() - 1)).cloned() {
+            if boundaries.last() != Some(&boundary) {
                 boundaries.push(boundary);
             }
         }
@@ -5835,30 +5941,15 @@ fn dense_int64_boundaries(
     boundaries
 }
 
-fn dense_int64_bound(snapshot: &DenseInt64SourceSnapshot, boundary: DenseInt64Boundary) -> usize {
-    if snapshot.source_index < boundary.source_index {
-        dense_int64_upper_bound(
-            &snapshot.order_column,
-            snapshot.start,
-            snapshot.end,
-            boundary.key,
-        )
-    } else {
-        dense_int64_lower_bound(
-            &snapshot.order_column,
-            snapshot.start,
-            snapshot.end,
-            boundary.key,
-        )
-    }
-}
-
-fn dense_int64_lower_bound(array: &Int64Array, start: usize, end: usize, key: i64) -> usize {
-    let mut low = start;
-    let mut high = end;
+fn dense_ordered_bound(
+    snapshot: &DenseOrderedSourceSnapshot,
+    boundary: &DenseOrderedBoundary,
+) -> usize {
+    let mut low = snapshot.start;
+    let mut high = snapshot.end;
     while low < high {
         let mid = low + ((high - low) / 2);
-        if array.value(mid) < key {
+        if dense_ordered_row_before_boundary(snapshot, mid, boundary) {
             low = mid + 1;
         } else {
             high = mid;
@@ -5867,23 +5958,25 @@ fn dense_int64_lower_bound(array: &Int64Array, start: usize, end: usize, key: i6
     low
 }
 
-fn dense_int64_upper_bound(array: &Int64Array, start: usize, end: usize, key: i64) -> usize {
-    let mut low = start;
-    let mut high = end;
-    while low < high {
-        let mid = low + ((high - low) / 2);
-        if array.value(mid) <= key {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
+fn dense_ordered_row_before_boundary(
+    snapshot: &DenseOrderedSourceSnapshot,
+    row: usize,
+    boundary: &DenseOrderedBoundary,
+) -> bool {
+    match snapshot.order_column.compare_row_to_key(row, &boundary.key) {
+        CmpOrdering::Less => true,
+        CmpOrdering::Greater => false,
+        CmpOrdering::Equal => match snapshot.source_index.cmp(&boundary.source_index) {
+            CmpOrdering::Less => true,
+            CmpOrdering::Greater => false,
+            CmpOrdering::Equal => row < boundary.row,
+        },
     }
-    low
 }
 
-fn dense_int64_materialize_partition(
-    partition: DenseInt64PartitionJob,
-) -> Result<DenseInt64PartitionOutput, String> {
+fn dense_ordered_materialize_partition(
+    partition: DenseOrderedPartitionJob,
+) -> Result<DenseOrderedPartitionOutput, String> {
     let selection_start = Instant::now();
     if partition.sources.len() == 1 {
         let source = partition
@@ -5892,7 +5985,7 @@ fn dense_int64_materialize_partition(
             .next()
             .expect("single dense partition source exists");
         let batch = source.batch.slice(source.start, source.end - source.start);
-        return Ok(DenseInt64PartitionOutput {
+        return Ok(DenseOrderedPartitionOutput {
             partition_index: partition.partition_index,
             batch,
             rows: partition.rows,
@@ -5920,7 +6013,7 @@ fn dense_int64_materialize_partition(
                 None => local_index,
                 Some(current) => {
                     comparisons += 1;
-                    if dense_int64_source_row_less(
+                    if dense_ordered_source_row_less(
                         &partition.sources[local_index],
                         positions[local_index],
                         &partition.sources[current],
@@ -5949,7 +6042,7 @@ fn dense_int64_materialize_partition(
         .collect::<Vec<_>>();
     let batch = interleave_record_batch(&batch_refs, &indices)
         .map_err(|error| format!("failed to materialize dense ordered partition: {error}"))?;
-    Ok(DenseInt64PartitionOutput {
+    Ok(DenseOrderedPartitionOutput {
         partition_index: partition.partition_index,
         batch,
         rows: partition.rows,
@@ -5960,20 +6053,23 @@ fn dense_int64_materialize_partition(
     })
 }
 
-fn dense_int64_source_row_less(
-    left: &DenseInt64SourceSnapshot,
+fn dense_ordered_source_row_less(
+    left: &DenseOrderedSourceSnapshot,
     left_row: usize,
-    right: &DenseInt64SourceSnapshot,
+    right: &DenseOrderedSourceSnapshot,
     right_row: usize,
 ) -> bool {
     match left
         .order_column
-        .value(left_row)
-        .cmp(&right.order_column.value(right_row))
+        .compare_rows(left_row, &right.order_column, right_row)
     {
         CmpOrdering::Less => true,
         CmpOrdering::Greater => false,
-        CmpOrdering::Equal => left.source_index < right.source_index,
+        CmpOrdering::Equal => match left.source_index.cmp(&right.source_index) {
+            CmpOrdering::Less => true,
+            CmpOrdering::Greater => false,
+            CmpOrdering::Equal => left_row < right_row,
+        },
     }
 }
 

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_array::types::{Float64Type, Int32Type};
 use arrow_array::{
-    ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
-    StructArray,
+    Array, ArrayRef, Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray,
+    RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
@@ -39,6 +39,9 @@ enum Scenario {
     NestedPayloadPragmatic,
     OrderedPayloadPragmatic,
     OrderedPayloadMixedPragmatic,
+    OrderedPayloadStringPragmatic,
+    OrderedPayloadLargeStringPragmatic,
+    OrderedPayloadStringMixedPragmatic,
 }
 
 impl Scenario {
@@ -48,12 +51,18 @@ impl Scenario {
             Self::NestedPayloadPragmatic => "nested_payload_pragmatic",
             Self::OrderedPayloadPragmatic => "ordered_payload_pragmatic",
             Self::OrderedPayloadMixedPragmatic => "ordered_payload_mixed_pragmatic",
+            Self::OrderedPayloadStringPragmatic => "ordered_payload_string_pragmatic",
+            Self::OrderedPayloadLargeStringPragmatic => "ordered_payload_large_string_pragmatic",
+            Self::OrderedPayloadStringMixedPragmatic => "ordered_payload_string_mixed_pragmatic",
         }
     }
 
     fn ordering_field(self) -> Option<&'static str> {
         match self {
             Self::OrderedPayloadPragmatic | Self::OrderedPayloadMixedPragmatic => Some("event_id"),
+            Self::OrderedPayloadStringPragmatic
+            | Self::OrderedPayloadLargeStringPragmatic
+            | Self::OrderedPayloadStringMixedPragmatic => Some("event_key"),
             _ => None,
         }
     }
@@ -66,6 +75,9 @@ impl Scenario {
                 Self::NestedPayloadPragmatic,
                 Self::OrderedPayloadPragmatic,
                 Self::OrderedPayloadMixedPragmatic,
+                Self::OrderedPayloadStringPragmatic,
+                Self::OrderedPayloadLargeStringPragmatic,
+                Self::OrderedPayloadStringMixedPragmatic,
             ]);
         }
 
@@ -76,9 +88,16 @@ impl Scenario {
                 "nested_payload_pragmatic" => Self::NestedPayloadPragmatic,
                 "ordered_payload_pragmatic" => Self::OrderedPayloadPragmatic,
                 "ordered_payload_mixed_pragmatic" => Self::OrderedPayloadMixedPragmatic,
+                "ordered_payload_string_pragmatic" => Self::OrderedPayloadStringPragmatic,
+                "ordered_payload_large_string_pragmatic" => {
+                    Self::OrderedPayloadLargeStringPragmatic
+                }
+                "ordered_payload_string_mixed_pragmatic" => {
+                    Self::OrderedPayloadStringMixedPragmatic
+                }
                 other => {
                     return Err(format!(
-                        "unsupported RPM_BENCH_SCENARIO value `{other}`; expected `top_level_pragmatic`, `nested_payload_pragmatic`, `ordered_payload_pragmatic`, `ordered_payload_mixed_pragmatic`, or `all`"
+                        "unsupported RPM_BENCH_SCENARIO value `{other}`; expected `top_level_pragmatic`, `nested_payload_pragmatic`, `ordered_payload_pragmatic`, `ordered_payload_mixed_pragmatic`, `ordered_payload_string_pragmatic`, `ordered_payload_large_string_pragmatic`, `ordered_payload_string_mixed_pragmatic`, or `all`"
                     ));
                 }
             };
@@ -93,6 +112,9 @@ impl Scenario {
                 Self::NestedPayloadPragmatic,
                 Self::OrderedPayloadPragmatic,
                 Self::OrderedPayloadMixedPragmatic,
+                Self::OrderedPayloadStringPragmatic,
+                Self::OrderedPayloadLargeStringPragmatic,
+                Self::OrderedPayloadStringMixedPragmatic,
             ])
         } else {
             Ok(scenarios)
@@ -1062,6 +1084,96 @@ fn ordered_mixed_payload_batch(
     (schema, batch)
 }
 
+fn ordered_string_key(layout: ScenarioBatchLayout, row_offset: usize, index: usize) -> String {
+    let value = layout.start_event_id + ((row_offset + index) as i64 * layout.event_step);
+    format!("key_{value:016}")
+}
+
+fn ordered_string_payload_batch(
+    rows: usize,
+    layout: ScenarioBatchLayout,
+    row_offset: usize,
+    large_utf8: bool,
+) -> (SchemaRef, RecordBatch) {
+    let profile_fields: Fields = vec![Arc::new(Field::new("segment", DataType::Utf8, true))].into();
+    let payload_fields: Fields = vec![
+        Arc::new(Field::new("score", DataType::Int32, true)),
+        Arc::new(Field::new(
+            "profile",
+            DataType::Struct(profile_fields.clone()),
+            true,
+        )),
+        Arc::new(Field::new("amount", DataType::Int32, true)),
+    ]
+    .into();
+    let key_type = if large_utf8 {
+        DataType::LargeUtf8
+    } else {
+        DataType::Utf8
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("event_key", key_type, false),
+        Field::new("org_id", DataType::Int64, false),
+        Field::new("payload", DataType::Struct(payload_fields.clone()), true),
+    ]));
+    let keys = (0..rows)
+        .map(|index| ordered_string_key(layout, row_offset, index))
+        .collect::<Vec<_>>();
+    let key_array = if large_utf8 {
+        Arc::new(LargeStringArray::from(keys)) as ArrayRef
+    } else {
+        Arc::new(StringArray::from(keys)) as ArrayRef
+    };
+    let profile_array = Arc::new(StructArray::new(
+        profile_fields,
+        vec![Arc::new(StringArray::from(
+            (0..rows)
+                .map(|index| {
+                    let global_index = row_offset + index;
+                    match global_index % 5 {
+                        0 => Some("enterprise".to_string()),
+                        1 | 2 => Some("growth".to_string()),
+                        3 => Some("starter".to_string()),
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )) as ArrayRef],
+        None,
+    )) as ArrayRef;
+    let payload_array = Arc::new(StructArray::new(
+        payload_fields,
+        vec![
+            Arc::new(Int32Array::from(
+                (0..rows)
+                    .map(|index| Some(((row_offset + index) % 10_000) as i32))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            profile_array,
+            Arc::new(Int32Array::from(
+                (0..rows)
+                    .map(|index| Some((((row_offset + index) * 7) % 100_000) as i32))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+        None,
+    )) as ArrayRef;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            key_array,
+            Arc::new(Int64Array::from(
+                (0..rows)
+                    .map(|index| layout.org_base + ((row_offset + index) % 16) as i64)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            payload_array,
+        ],
+    )
+    .unwrap();
+    (schema, batch)
+}
+
 fn scenario_batch_layout(
     scenario: Scenario,
     file_index: usize,
@@ -1069,21 +1181,25 @@ fn scenario_batch_layout(
     file_count: usize,
 ) -> ScenarioBatchLayout {
     match scenario {
-        Scenario::OrderedPayloadPragmatic => ScenarioBatchLayout {
+        Scenario::OrderedPayloadPragmatic
+        | Scenario::OrderedPayloadStringPragmatic
+        | Scenario::OrderedPayloadLargeStringPragmatic => ScenarioBatchLayout {
             start_event_id: file_index as i64,
             event_step: file_count as i64,
             org_base: 10_000 + ((file_index as i64) * 100),
         },
-        Scenario::OrderedPayloadMixedPragmatic => ScenarioBatchLayout {
-            start_event_id: (file_index as i64 * rows_per_file as i64)
-                - if file_index % 2 == 1 {
-                    rows_per_file as i64 / 10
-                } else {
-                    0
-                },
-            event_step: 1,
-            org_base: 10_000 + ((file_index as i64) * 100),
-        },
+        Scenario::OrderedPayloadMixedPragmatic | Scenario::OrderedPayloadStringMixedPragmatic => {
+            ScenarioBatchLayout {
+                start_event_id: (file_index as i64 * rows_per_file as i64)
+                    - if file_index % 2 == 1 {
+                        rows_per_file as i64 / 10
+                    } else {
+                        0
+                    },
+                event_step: 1,
+                org_base: 10_000 + ((file_index as i64) * 100),
+            }
+        }
         _ => ScenarioBatchLayout {
             start_event_id: (file_index * rows_per_file) as i64,
             event_step: 1,
@@ -1118,6 +1234,15 @@ fn scenario_batch(
         Scenario::OrderedPayloadMixedPragmatic => {
             ordered_mixed_payload_batch(rows, layout, row_offset)
         }
+        Scenario::OrderedPayloadStringPragmatic => {
+            ordered_string_payload_batch(rows, layout, row_offset, false)
+        }
+        Scenario::OrderedPayloadLargeStringPragmatic => {
+            ordered_string_payload_batch(rows, layout, row_offset, true)
+        }
+        Scenario::OrderedPayloadStringMixedPragmatic => {
+            ordered_string_payload_batch(rows, layout, row_offset, false)
+        }
     }
 }
 
@@ -1136,9 +1261,11 @@ async fn write_scenario_file(
         scenario_batch(scenario, schema_family, first_batch_rows, layout, 0);
     let file = File::create(path).await?;
     let writer_properties = match scenario {
-        Scenario::OrderedPayloadMixedPragmatic => WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build(),
+        Scenario::OrderedPayloadMixedPragmatic | Scenario::OrderedPayloadStringMixedPragmatic => {
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build()
+        }
         _ => WriterProperties::new(),
     };
     let mut writer = AsyncArrowWriter::try_new(file, schema, Some(writer_properties))?;
@@ -1311,28 +1438,115 @@ async fn parquet_row_count_and_schema(
         .transpose()?;
     let mut stream = builder.build()?;
     let mut rows = 0_u64;
-    let mut previous_event_id = None;
+    let mut previous_order_value = None;
+    let mut seen_order_null = false;
     let mut is_sorted = ordering_index.map(|_| true);
     while let Some(batch) = futures_util::StreamExt::next(&mut stream).await {
         let batch = batch?;
         rows += batch.num_rows() as u64;
         if let Some(index) = ordering_index {
-            let event_ids = batch
-                .column(index)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "ordered validation expects Int64 ordering column".to_string())?;
-            for value in event_ids.iter().flatten() {
-                if let Some(previous) = previous_event_id {
-                    if value < previous {
-                        is_sorted = Some(false);
-                    }
-                }
-                previous_event_id = Some(value);
-            }
+            validate_ordered_batch(
+                batch.column(index),
+                &mut previous_order_value,
+                &mut seen_order_null,
+                &mut is_sorted,
+            )?;
         }
     }
     Ok((rows, schema, is_sorted))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ValidationOrderValue {
+    Int64(i64),
+    String(String),
+}
+
+fn validate_ordered_value(
+    value: ValidationOrderValue,
+    previous_order_value: &mut Option<ValidationOrderValue>,
+    seen_order_null: &mut bool,
+    is_sorted: &mut Option<bool>,
+) {
+    if *seen_order_null {
+        *is_sorted = Some(false);
+    }
+    if let Some(previous) = previous_order_value.as_ref() {
+        if value < *previous {
+            *is_sorted = Some(false);
+        }
+    }
+    *previous_order_value = Some(value);
+}
+
+fn validate_ordered_batch(
+    column: &ArrayRef,
+    previous_order_value: &mut Option<ValidationOrderValue>,
+    seen_order_null: &mut bool,
+    is_sorted: &mut Option<bool>,
+) -> Result<(), Box<dyn Error>> {
+    match column.data_type() {
+        DataType::Int64 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "ordered validation expects Int64 ordering column".to_string())?;
+            for row in 0..values.len() {
+                if values.is_null(row) {
+                    *seen_order_null = true;
+                } else {
+                    validate_ordered_value(
+                        ValidationOrderValue::Int64(values.value(row)),
+                        previous_order_value,
+                        seen_order_null,
+                        is_sorted,
+                    );
+                }
+            }
+        }
+        DataType::Utf8 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "ordered validation expects Utf8 ordering column".to_string())?;
+            for row in 0..values.len() {
+                if values.is_null(row) {
+                    *seen_order_null = true;
+                } else {
+                    validate_ordered_value(
+                        ValidationOrderValue::String(values.value(row).to_string()),
+                        previous_order_value,
+                        seen_order_null,
+                        is_sorted,
+                    );
+                }
+            }
+        }
+        DataType::LargeUtf8 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    "ordered validation expects LargeUtf8 ordering column".to_string()
+                })?;
+            for row in 0..values.len() {
+                if values.is_null(row) {
+                    *seen_order_null = true;
+                } else {
+                    validate_ordered_value(
+                        ValidationOrderValue::String(values.value(row).to_string()),
+                        previous_order_value,
+                        seen_order_null,
+                        is_sorted,
+                    );
+                }
+            }
+        }
+        other => {
+            return Err(format!("ordered validation does not support {other:?}").into());
+        }
+    }
+    Ok(())
 }
 
 fn data_type_shape(data_type: &DataType) -> String {
@@ -1347,6 +1561,7 @@ fn data_type_shape(data_type: &DataType) -> String {
         ),
         DataType::List(child) => format!("List({})", data_type_shape(child.data_type())),
         DataType::LargeList(child) => format!("LargeList({})", data_type_shape(child.data_type())),
+        DataType::LargeUtf8 => "Utf8".to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -1445,9 +1660,12 @@ fn apply_benchmark_tuning(config: &BenchmarkConfig, options: &mut ParquetMergeEx
     }
 }
 
-fn ordered_benchmark_execution_options(config: &BenchmarkConfig) -> ParquetMergeExecutionOptions {
+fn ordered_benchmark_execution_options(
+    config: &BenchmarkConfig,
+    ordering_field: &str,
+) -> ParquetMergeExecutionOptions {
     let mut options = ParquetMergeExecutionOptions {
-        ordering_field: Some("event_id".to_string()),
+        ordering_field: Some(ordering_field.to_string()),
         read_batch_size: 131_072,
         output_batch_rows: 131_072,
         prefetch_batches_per_source: 4,
@@ -1564,12 +1782,21 @@ async fn run_rust_merge(
             )
             .await?
         }
-        Scenario::OrderedPayloadPragmatic | Scenario::OrderedPayloadMixedPragmatic => {
+        Scenario::OrderedPayloadPragmatic
+        | Scenario::OrderedPayloadMixedPragmatic
+        | Scenario::OrderedPayloadStringPragmatic
+        | Scenario::OrderedPayloadLargeStringPragmatic
+        | Scenario::OrderedPayloadStringMixedPragmatic => {
             merge_payload_parquet_files_with_execution(
                 input_paths,
                 output_path,
                 &PayloadMergeOptions::default(),
-                &ordered_benchmark_execution_options(config),
+                &ordered_benchmark_execution_options(
+                    config,
+                    scenario
+                        .ordering_field()
+                        .expect("ordered scenarios have an ordering field"),
+                ),
             )
             .await?
         }
@@ -1818,9 +2045,15 @@ async fn validate_outputs(
             "DuckDB output row count mismatch: expected {expected_rows}, got {duckdb_rows}"
         ))
     } else if rust_is_sorted == Some(false) {
-        Some("Rust output is not sorted by event_id".to_string())
+        Some(format!(
+            "Rust output is not sorted by {}",
+            scenario.ordering_field().unwrap_or("ordering field")
+        ))
     } else if duckdb_is_sorted == Some(false) {
-        Some("DuckDB output is not sorted by event_id".to_string())
+        Some(format!(
+            "DuckDB output is not sorted by {}",
+            scenario.ordering_field().unwrap_or("ordering field")
+        ))
     } else if rust_shape != duckdb_shape {
         Some("Rust and DuckDB output schemas differ".to_string())
     } else if rust_minus_duckdb_rows.unwrap_or(0) != 0 || duckdb_minus_rust_rows.unwrap_or(0) != 0 {
