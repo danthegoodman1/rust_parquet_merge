@@ -113,14 +113,14 @@ It reports:
 
 - one strict top-level merge workload using the new top-level merge path
 - one nested payload merge workload using the payload-aware merge path
-- one ordered payload merge workload using the ordered k-way merge path
+- ordered payload merge workloads using the ordered k-way merge path, including dense interleaving and mixed row-group-copy shapes
 - side-by-side Rust and DuckDB timings for the exact same Parquet inputs
 - row-count and merged-schema validation before timings are accepted
 - a JSON summary written into the benchmark artifact directory
 
 Useful env vars:
 
-- `RPM_BENCH_SCENARIO=top_level_pragmatic`, `nested_payload_pragmatic`, `ordered_payload_pragmatic`, or `all`
+- `RPM_BENCH_SCENARIO=top_level_pragmatic`, `nested_payload_pragmatic`, `ordered_payload_pragmatic`, `ordered_payload_mixed_pragmatic`, or `all`
 - `RPM_BENCH_TARGET_INPUT_GIB=<float>` to scale generated input size by approximate total GiB
 - `RPM_BENCH_FILE_COUNT=<int>` to change the number of input files
 - `RPM_BENCH_MEASURED_RUNS=<int>` to reduce or increase measured repetitions
@@ -132,6 +132,7 @@ Useful env vars:
 - `RPM_BENCH_RUST_OUTPUT_BATCH_ROWS=<int>` to tune Rust output batch materialization size
 - `RPM_BENCH_RUST_OUTPUT_ROW_GROUP_ROWS=<int>` to tune Rust output row group size
 - `RPM_BENCH_RUST_PREFETCH_BATCHES_PER_SOURCE=<int>` to tune per-source buffering
+- `RPM_BENCH_RUST_ORDERED_MEMORY_BUDGET_MIB=<int>` to opt ordered merge into the higher-throughput byte-bounded pipeline; `4096` is the current speed target
 - `RPM_BENCH_EXACT_VALIDATION=true` to add DuckDB `EXCEPT ALL` validation both ways
 - `RPM_BENCH_DUCKDB_THREADS=<int>` to set DuckDB `PRAGMA threads`
 - `RPM_BENCH_DUCKDB_COMPRESSION=snappy`, `uncompressed`, `zstd`, or `lz4` to set DuckDB output compression
@@ -162,19 +163,42 @@ Snappy is the DuckDB-comparable Rust benchmark setting because it matches DuckDB
 
 The benchmark JSON includes cumulative row-group encode worker time and ordered materialization work. Those values are summed across parallel workers, so they can be larger than the corresponding elapsed wall time.
 
-### 1 GiB ordered payload snapshot
+### 1 GiB ordered payload snapshots
 
-`RPM_BENCH_SCENARIO=ordered_payload_pragmatic RPM_BENCH_TARGET_INPUT_GIB=1 RPM_BENCH_MEASURED_RUNS=1 RPM_BENCH_RUST_PARALLELISM=0 RPM_BENCH_RUST_COMPRESSION=snappy RPM_BENCH_EXACT_VALIDATION=true cargo run --release --example rust_vs_duckdb_benchmark`
+Environment: M3 Max MBP, DuckDB CLI `v1.4.1`, `--release`, one measured run, Rust Snappy output, `RPM_BENCH_RUST_PARALLELISM=0`, and `RPM_BENCH_RUST_ORDERED_MEMORY_BUDGET_MIB=4096`.
 
-- total input: `941.89 MiB`
+Mixed ordered target:
+
+`RPM_BENCH_SCENARIO=ordered_payload_mixed_pragmatic RPM_BENCH_TARGET_INPUT_GIB=1 RPM_BENCH_MEASURED_RUNS=1 RPM_BENCH_RUST_PARALLELISM=0 RPM_BENCH_RUST_COMPRESSION=snappy RPM_BENCH_RUST_ORDERED_MEMORY_BUDGET_MIB=4096 RPM_BENCH_EXACT_VALIDATION=true cargo run --release --example rust_vs_duckdb_benchmark`
+
+- total input: `602.26 MiB`; rows: `74,253,696`
 - Rust resolved parallelism: `6`
-- Rust `3857 ms`, output `366,706,298` bytes, Snappy
-- Rust peak RSS `1945.06 MiB`; CPU `11723 ms` total (`10599 ms` user, `1123 ms` sys, `304%` of wall)
-- DuckDB `1153 ms`, output `315,281,804` bytes, Snappy
-- DuckDB peak RSS `5473.56 MiB`; CPU `10616 ms` total (`9107 ms` user, `1508 ms` sys, `921%` of wall)
-- Delta: Rust `+2704 ms` wall, `-3528.50 MiB` peak RSS, `+1107 ms` total CPU
-- Rust ordered breakdown: decode `1399 ms`, prepare `206 ms`, assembly work `3631 ms` (`1768 ms` selection, `1863 ms` materialization work, `15 ms` materialization wait), writer elapsed `3685 ms`, encode work `4352 ms`, sink `187 ms`, close `1 ms`
-- Ordered output used `186` interleave flushes, `0` concat flushes, and `0` direct writes for the dense row-interleaved workload.
+- Rust `745 ms`, output `651,237,782` bytes, Snappy
+- Rust peak RSS `1052.20 MiB`; CPU `2545 ms` total (`1859 ms` user, `685 ms` sys, `341%` of wall)
+- DuckDB `1212 ms`, output `755,614,694` bytes, Snappy
+- DuckDB peak RSS `6292.09 MiB`; CPU `11021 ms` total (`9531 ms` user, `1490 ms` sys, `909%` of wall)
+- Delta: Rust `-467 ms` wall, `-5239.89 MiB` peak RSS, `-8476 ms` total CPU
+- Rust ordered breakdown: merge `346 ms`, decode `393 ms`, prepare `23 ms`, assembly `284 ms` (`33 ms` selection, `250 ms` materialization work, `0 ms` materialization wait), writer elapsed `743 ms`, encode work `1388 ms`, sink `486 ms`, close `1 ms`, stats fast path `42 ms`
+- Copy path: `60` copied row groups, `62,292,672` copied rows, `528,922,842` copied bytes, copy time `391 ms`
+- Dense path: `72` partition jobs, `7,425,360` rows, `33 ms` selection work, `246 ms` materialization work, `0` fallbacks
+- Buffer peaks: ordered pipeline `1210.00 MiB`, writer `409.68 MiB`
+- Exact validation passed with `rust_minus_duckdb=0` and `duckdb_minus_rust=0`.
+
+Dense interleaved stress:
+
+`RPM_BENCH_SCENARIO=ordered_payload_pragmatic RPM_BENCH_TARGET_INPUT_GIB=1 RPM_BENCH_MEASURED_RUNS=1 RPM_BENCH_RUST_PARALLELISM=0 RPM_BENCH_RUST_COMPRESSION=snappy RPM_BENCH_RUST_ORDERED_MEMORY_BUDGET_MIB=4096 RPM_BENCH_EXACT_VALIDATION=true cargo run --release --example rust_vs_duckdb_benchmark`
+
+- total input: `941.89 MiB`; rows: `24,266,406`
+- Rust resolved parallelism: `6`
+- Rust `894 ms`, output `394,970,517` bytes, Snappy
+- Rust peak RSS `3650.72 MiB`; CPU `10526 ms` total (`9130 ms` user, `1396 ms` sys, `1177%` of wall)
+- DuckDB `1081 ms`, output `315,281,804` bytes, Snappy
+- DuckDB peak RSS `5379.41 MiB`; CPU `9766 ms` total (`8451 ms` user, `1314 ms` sys, `903%` of wall)
+- Delta: Rust `-187 ms` wall, `-1728.69 MiB` peak RSS, `+760 ms` total CPU
+- Rust ordered breakdown: merge `594 ms`, decode `2333 ms`, prepare `266 ms`, assembly `3269 ms` (`518 ms` selection, `2750 ms` materialization work, `0 ms` materialization wait), writer elapsed `830 ms`, encode work `6807 ms`, sink `407 ms`, close `1 ms`
+- Dense path: `186` partition jobs, `24,266,326` rows, `518 ms` selection work, `2705 ms` materialization work, `0` fallbacks
+- Dense output used `186` interleave flushes, `16` concat flushes, `0` direct writes, and no row-group copies.
+- Buffer peaks: ordered pipeline `2666.00 MiB`, writer `701.50 MiB`
 - Exact validation passed with `rust_minus_duckdb=0` and `duckdb_minus_rust=0`.
 
 Important: the comparison should be run in `--release`. A debug-mode `cargo run` makes the Rust merge path look artificially slow and is not a fair comparison against the optimized DuckDB CLI binary.

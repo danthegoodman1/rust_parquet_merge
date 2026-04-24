@@ -56,6 +56,7 @@ fn ordered_execution_options(ordering_field: &str) -> ParquetMergeExecutionOptio
         writer_compression: ParquetCompression::Uncompressed,
         writer_dictionary_enabled: true,
         stats_fast_path: true,
+        ordered_memory_budget_bytes: None,
     }
 }
 
@@ -1299,15 +1300,39 @@ fn parquet_parallelism_resolution_handles_auto_serial_and_caps() {
     let mut options = ParquetMergeExecutionOptions::default();
     assert_eq!(resolve_parquet_parallelism(&options, 0), 0);
     assert_eq!(resolve_parquet_parallelism(&options, 4), 1);
+    assert_eq!(resolve_parquet_cpu_parallelism(&options), 1);
 
     options.parallelism = 0;
     assert_eq!(
         resolve_parquet_parallelism(&options, 4),
         default_scan_parallelism().min(4)
     );
+    assert_eq!(
+        resolve_parquet_cpu_parallelism(&options),
+        default_scan_parallelism()
+    );
 
     options.parallelism = 99;
     assert_eq!(resolve_parquet_parallelism(&options, 3), 3);
+    assert_eq!(resolve_parquet_cpu_parallelism(&options), 99);
+}
+
+#[test]
+fn ordered_memory_budget_option_defaults_and_validates() {
+    let defaults = ParquetMergeExecutionOptions::default();
+    assert_eq!(defaults.ordered_memory_budget_bytes, None);
+
+    let valid = ParquetMergeExecutionOptions {
+        ordered_memory_budget_bytes: Some(4 * 1024 * 1024 * 1024),
+        ..ParquetMergeExecutionOptions::default()
+    };
+    assert!(validate_parquet_merge_execution_options(&valid).is_ok());
+
+    let invalid = ParquetMergeExecutionOptions {
+        ordered_memory_budget_bytes: Some(0),
+        ..ParquetMergeExecutionOptions::default()
+    };
+    assert!(validate_parquet_merge_execution_options(&invalid).is_err());
 }
 
 #[tokio::test]
@@ -1991,8 +2016,13 @@ async fn ordered_output_pipeline_preserves_out_of_order_completion_sequence()
     let mut writer = create_parquet_output_writer(&output_path, schema.clone(), &options, 1, 2)
         .await
         .map_err(io_error)?;
-    let mut pipeline = OrderedOutputPipeline::new(2);
+    let limiter = OrderedMemoryLimiter::new(2 * 1024 * 1024);
+    let mut pipeline = OrderedOutputPipeline::new(2, Some(limiter.clone()));
     let mut stats = ParquetMergeRunStats::default();
+    let first_bytes = first.get_array_memory_size();
+    let second_bytes = second.get_array_memory_size();
+    let second_permit = limiter.acquire(second_bytes).await?;
+    let first_permit = limiter.acquire(first_bytes).await?;
 
     pipeline
         .record_completed(
@@ -2006,6 +2036,8 @@ async fn ordered_output_pipeline_preserves_out_of_order_completion_sequence()
                     count_materialization: false,
                 },
                 materialization_duration: Duration::default(),
+                memory_permit: second_permit,
+                estimated_bytes: second_bytes,
             },
             &mut writer,
             &mut stats,
@@ -2024,6 +2056,8 @@ async fn ordered_output_pipeline_preserves_out_of_order_completion_sequence()
                     count_materialization: false,
                 },
                 materialization_duration: Duration::default(),
+                memory_permit: first_permit,
+                estimated_bytes: first_bytes,
             },
             &mut writer,
             &mut stats,
@@ -2040,6 +2074,7 @@ async fn ordered_output_pipeline_preserves_out_of_order_completion_sequence()
         collect_int64_column(&read_parquet_batches(&output_path).await?, "event_id"),
         vec![Some(1), Some(2)]
     );
+    assert!(limiter.peak_bytes() > 0);
     let _ = tokio::fs::remove_file(output_path).await;
     Ok(())
 }
@@ -2380,6 +2415,100 @@ async fn ordered_merge_copies_non_overlapping_exact_schema_row_groups() -> Resul
     assert_eq!(
         collect_int64_column(&read_parquet_batches(&output_path).await?, "event_id"),
         vec![Some(1), Some(2), Some(3), Some(4)]
+    );
+
+    let _ = tokio::fs::remove_file(first_path).await;
+    let _ = tokio::fs::remove_file(second_path).await;
+    let _ = tokio::fs::remove_file(output_path).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordered_merge_mixed_overlap_and_copy_uses_budgeted_path() -> Result<(), Box<dyn Error>> {
+    let payload_fields: Fields = vec![Arc::new(Field::new("score", DataType::Int32, true))].into();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("event_id", DataType::Int64, false),
+        Field::new("org_id", DataType::Int64, false),
+        Field::new("payload", DataType::Struct(payload_fields.clone()), true),
+    ]));
+    let make_batch =
+        |event_ids: Vec<i64>, org_ids: Vec<i64>| -> Result<RecordBatch, Box<dyn Error>> {
+            let payload = Arc::new(StructArray::new(
+                payload_fields.clone(),
+                vec![Arc::new(Int32Array::from(
+                    event_ids
+                        .iter()
+                        .map(|value| Some(*value as i32))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef],
+                None,
+            )) as ArrayRef;
+            Ok(RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(event_ids)) as ArrayRef,
+                    Arc::new(Int64Array::from(org_ids)) as ArrayRef,
+                    payload,
+                ],
+            )?)
+        };
+    let writer_properties = WriterProperties::builder()
+        .set_max_row_group_size(2)
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let first_path = unique_path("ordered_mixed_copy_left", "parquet");
+    let second_path = unique_path("ordered_mixed_copy_right", "parquet");
+    let output_path = unique_path("ordered_mixed_copy_output", "parquet");
+    write_parquet_with_properties(
+        &first_path,
+        schema.clone(),
+        make_batch(vec![1, 3, 100, 101], vec![10, 30, 1000, 1010])?,
+        Some(writer_properties.clone()),
+    )
+    .await?;
+    write_parquet_with_properties(
+        &second_path,
+        schema.clone(),
+        make_batch(vec![2, 4, 200, 201], vec![20, 40, 2000, 2010])?,
+        Some(writer_properties),
+    )
+    .await?;
+
+    let report = merge_payload_parquet_files_with_execution(
+        &[first_path.clone(), second_path.clone()],
+        &output_path,
+        &payload_schema_options(),
+        &ParquetMergeExecutionOptions {
+            parallelism: 0,
+            writer_compression: ParquetCompression::Snappy,
+            output_batch_rows: 4,
+            output_row_group_rows: 2,
+            ordered_memory_budget_bytes: Some(16 * 1024 * 1024),
+            ..ordered_execution_options("event_id")
+        },
+    )
+    .await?;
+
+    assert_eq!(report.rows, 8);
+    assert_eq!(report.input_batches, 2);
+    assert!(report.fallback_batches > 0);
+    assert!(report.copy_candidate_row_groups > 0);
+    assert!(report.copied_row_groups > 0);
+    assert_eq!(report.copied_rows, 4);
+    assert!(report.ordered_pipeline_peak_buffered_bytes > 0);
+    assert!(report.writer_peak_buffered_bytes > 0);
+    assert_eq!(
+        collect_int64_column(&read_parquet_batches(&output_path).await?, "event_id"),
+        vec![
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(100),
+            Some(101),
+            Some(200),
+            Some(201),
+        ]
     );
 
     let _ = tokio::fs::remove_file(first_path).await;
@@ -3021,6 +3150,308 @@ async fn ordered_merge_dense_interleaved_rows_use_interleave_flush() -> Result<(
     for path in paths {
         let _ = tokio::fs::remove_file(path).await;
     }
+    let _ = tokio::fs::remove_file(output_path).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordered_merge_dense_int64_path_preserves_interleaved_output() -> Result<(), Box<dyn Error>>
+{
+    let payload_fields: Fields = vec![Arc::new(Field::new("score", DataType::Int32, true))].into();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("event_id", DataType::Int64, false),
+        Field::new("org_id", DataType::Int64, false),
+        Field::new("payload", DataType::Struct(payload_fields.clone()), true),
+    ]));
+    let mut paths = Vec::new();
+    let source_count = 4;
+    let rows_per_source = 8;
+    for source_index in 0..source_count {
+        let event_ids = (0..rows_per_source)
+            .map(|row| (row * source_count + source_index) as i64)
+            .collect::<Vec<_>>();
+        let org_ids = (0..rows_per_source)
+            .map(|row| (source_index * 100 + row) as i64)
+            .collect::<Vec<_>>();
+        let payload = Arc::new(StructArray::new(
+            payload_fields.clone(),
+            vec![Arc::new(Int32Array::from(
+                (0..rows_per_source)
+                    .map(|row| Some((source_index * 10 + row) as i32))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef],
+            None,
+        )) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(event_ids)) as ArrayRef,
+                Arc::new(Int64Array::from(org_ids)) as ArrayRef,
+                payload,
+            ],
+        )?;
+        let path = unique_path(&format!("ordered_dense_path_{source_index}"), "parquet");
+        write_parquet(&path, schema.clone(), batch).await?;
+        paths.push(path);
+    }
+    let output_path = unique_path("ordered_dense_path_output", "parquet");
+
+    let report = merge_payload_parquet_files_with_execution(
+        &paths,
+        &output_path,
+        &payload_schema_options(),
+        &ParquetMergeExecutionOptions {
+            read_batch_size: rows_per_source,
+            output_batch_rows: rows_per_source,
+            output_row_group_rows: rows_per_source,
+            parallelism: 0,
+            ordered_memory_budget_bytes: Some(64 * 1024 * 1024),
+            ..ordered_execution_options("event_id")
+        },
+    )
+    .await?;
+
+    assert_eq!(report.rows, (source_count * rows_per_source) as u64);
+    assert!(report.dense_partition_jobs > 0);
+    assert!(report.dense_rows > report.rows / 2);
+    assert!(
+        report.dense_selection_duration > Duration::default()
+            || report.dense_materialization_duration > Duration::default()
+    );
+    assert_eq!(
+        collect_int64_column(&read_parquet_batches(&output_path).await?, "event_id"),
+        (0..source_count * rows_per_source)
+            .map(|value| Some(value as i64))
+            .collect::<Vec<_>>()
+    );
+
+    for path in paths {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    let _ = tokio::fs::remove_file(output_path).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordered_merge_dense_int64_path_preserves_stable_ties() -> Result<(), Box<dyn Error>> {
+    let payload_fields: Fields = vec![Arc::new(Field::new("score", DataType::Int32, true))].into();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("event_id", DataType::Int64, false),
+        Field::new("org_id", DataType::Int64, false),
+        Field::new("payload", DataType::Struct(payload_fields.clone()), true),
+    ]));
+    let inputs = [
+        (vec![1, 1, 2], vec![0, 1, 2]),
+        (vec![1, 1, 2], vec![10, 11, 12]),
+        (vec![1, 3], vec![20, 21]),
+    ];
+    let mut paths = Vec::new();
+    for (source_index, (event_ids, org_ids)) in inputs.into_iter().enumerate() {
+        let payload = Arc::new(StructArray::new(
+            payload_fields.clone(),
+            vec![Arc::new(Int32Array::from(vec![
+                Some(source_index as i32);
+                event_ids.len()
+            ])) as ArrayRef],
+            None,
+        )) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(event_ids)) as ArrayRef,
+                Arc::new(Int64Array::from(org_ids)) as ArrayRef,
+                payload,
+            ],
+        )?;
+        let path = unique_path(&format!("ordered_dense_ties_{source_index}"), "parquet");
+        write_parquet(&path, schema.clone(), batch).await?;
+        paths.push(path);
+    }
+    let output_path = unique_path("ordered_dense_ties_output", "parquet");
+
+    let report = merge_payload_parquet_files_with_execution(
+        &paths,
+        &output_path,
+        &payload_schema_options(),
+        &ParquetMergeExecutionOptions {
+            read_batch_size: 8,
+            output_batch_rows: 4,
+            output_row_group_rows: 4,
+            parallelism: 0,
+            ordered_memory_budget_bytes: Some(64 * 1024 * 1024),
+            ..ordered_execution_options("event_id")
+        },
+    )
+    .await?;
+
+    let batches = read_parquet_batches(&output_path).await?;
+    assert!(report.dense_rows > 0);
+    assert_eq!(
+        collect_int64_column(&batches, "event_id"),
+        vec![
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(2),
+            Some(2),
+            Some(3),
+        ]
+    );
+    assert_eq!(
+        collect_int64_column(&batches, "org_id"),
+        vec![
+            Some(0),
+            Some(1),
+            Some(10),
+            Some(11),
+            Some(20),
+            Some(2),
+            Some(12),
+            Some(21),
+        ]
+    );
+
+    for path in paths {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    let _ = tokio::fs::remove_file(output_path).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordered_merge_dense_int64_null_tail_falls_back() -> Result<(), Box<dyn Error>> {
+    let payload_fields: Fields = vec![Arc::new(Field::new("score", DataType::Int32, true))].into();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("event_id", DataType::Int64, true),
+        Field::new("org_id", DataType::Int64, false),
+        Field::new("payload", DataType::Struct(payload_fields.clone()), true),
+    ]));
+    let make_batch =
+        |event_ids: Vec<Option<i64>>, org_ids: Vec<i64>| -> Result<RecordBatch, Box<dyn Error>> {
+            let payload = Arc::new(StructArray::new(
+                payload_fields.clone(),
+                vec![Arc::new(Int32Array::from(vec![Some(1); event_ids.len()])) as ArrayRef],
+                None,
+            )) as ArrayRef;
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(event_ids)) as ArrayRef,
+                    Arc::new(Int64Array::from(org_ids)) as ArrayRef,
+                    payload,
+                ],
+            )
+            .map_err(|error| io_error(error.to_string()).into())
+        };
+    let left_path = unique_path("ordered_dense_null_left", "parquet");
+    let right_path = unique_path("ordered_dense_null_right", "parquet");
+    let output_path = unique_path("ordered_dense_null_output", "parquet");
+    write_parquet(
+        &left_path,
+        schema.clone(),
+        make_batch(vec![Some(1), Some(3), None], vec![10, 20, 30])?,
+    )
+    .await?;
+    write_parquet(
+        &right_path,
+        schema.clone(),
+        make_batch(vec![Some(2), Some(4)], vec![40, 50])?,
+    )
+    .await?;
+
+    let report = merge_payload_parquet_files_with_execution(
+        &[left_path.clone(), right_path.clone()],
+        &output_path,
+        &payload_schema_options(),
+        &ParquetMergeExecutionOptions {
+            parallelism: 0,
+            ordered_memory_budget_bytes: Some(64 * 1024 * 1024),
+            ..ordered_execution_options("event_id")
+        },
+    )
+    .await?;
+
+    assert!(report.dense_rows > 0);
+    assert!(report.dense_rows < report.rows);
+    assert_eq!(
+        collect_int64_column(&read_parquet_batches(&output_path).await?, "event_id"),
+        vec![Some(1), Some(2), Some(3), Some(4), None]
+    );
+
+    let _ = tokio::fs::remove_file(left_path).await;
+    let _ = tokio::fs::remove_file(right_path).await;
+    let _ = tokio::fs::remove_file(output_path).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordered_merge_dense_path_skips_non_int64_keys() -> Result<(), Box<dyn Error>> {
+    let payload_fields: Fields = vec![Arc::new(Field::new("score", DataType::Int32, true))].into();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("order_key", DataType::Utf8, false),
+        Field::new("org_id", DataType::Int64, false),
+        Field::new("payload", DataType::Struct(payload_fields.clone()), true),
+    ]));
+    let make_batch = |keys: Vec<&str>, org_ids: Vec<i64>| -> Result<RecordBatch, Box<dyn Error>> {
+        let payload = Arc::new(StructArray::new(
+            payload_fields.clone(),
+            vec![Arc::new(Int32Array::from(vec![Some(1); keys.len()])) as ArrayRef],
+            None,
+        )) as ArrayRef;
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(keys)) as ArrayRef,
+                Arc::new(Int64Array::from(org_ids)) as ArrayRef,
+                payload,
+            ],
+        )
+        .map_err(|error| io_error(error.to_string()).into())
+    };
+    let left_path = unique_path("ordered_dense_string_left", "parquet");
+    let right_path = unique_path("ordered_dense_string_right", "parquet");
+    let output_path = unique_path("ordered_dense_string_output", "parquet");
+    write_parquet(
+        &left_path,
+        schema.clone(),
+        make_batch(vec!["a", "c"], vec![1, 3])?,
+    )
+    .await?;
+    write_parquet(
+        &right_path,
+        schema.clone(),
+        make_batch(vec!["b", "d"], vec![2, 4])?,
+    )
+    .await?;
+
+    let report = merge_payload_parquet_files_with_execution(
+        &[left_path.clone(), right_path.clone()],
+        &output_path,
+        &payload_schema_options(),
+        &ParquetMergeExecutionOptions {
+            parallelism: 0,
+            ordered_memory_budget_bytes: Some(64 * 1024 * 1024),
+            ..ordered_execution_options("order_key")
+        },
+    )
+    .await?;
+
+    assert_eq!(report.dense_rows, 0);
+    assert_eq!(report.dense_partition_jobs, 0);
+    assert_eq!(
+        collect_order_key_column(&read_parquet_batches(&output_path).await?, "order_key"),
+        vec![
+            Some("a".to_string()),
+            Some("b".to_string()),
+            Some("c".to_string()),
+            Some("d".to_string()),
+        ]
+    );
+
+    let _ = tokio::fs::remove_file(left_path).await;
+    let _ = tokio::fs::remove_file(right_path).await;
     let _ = tokio::fs::remove_file(output_path).await;
     Ok(())
 }

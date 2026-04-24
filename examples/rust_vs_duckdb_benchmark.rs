@@ -16,6 +16,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_writer::AsyncArrowWriter;
+use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use rust_parquet_merge::{
@@ -37,6 +38,7 @@ enum Scenario {
     TopLevelPragmatic,
     NestedPayloadPragmatic,
     OrderedPayloadPragmatic,
+    OrderedPayloadMixedPragmatic,
 }
 
 impl Scenario {
@@ -45,12 +47,13 @@ impl Scenario {
             Self::TopLevelPragmatic => "top_level_pragmatic",
             Self::NestedPayloadPragmatic => "nested_payload_pragmatic",
             Self::OrderedPayloadPragmatic => "ordered_payload_pragmatic",
+            Self::OrderedPayloadMixedPragmatic => "ordered_payload_mixed_pragmatic",
         }
     }
 
     fn ordering_field(self) -> Option<&'static str> {
         match self {
-            Self::OrderedPayloadPragmatic => Some("event_id"),
+            Self::OrderedPayloadPragmatic | Self::OrderedPayloadMixedPragmatic => Some("event_id"),
             _ => None,
         }
     }
@@ -62,6 +65,7 @@ impl Scenario {
                 Self::TopLevelPragmatic,
                 Self::NestedPayloadPragmatic,
                 Self::OrderedPayloadPragmatic,
+                Self::OrderedPayloadMixedPragmatic,
             ]);
         }
 
@@ -71,9 +75,10 @@ impl Scenario {
                 "top_level_pragmatic" => Self::TopLevelPragmatic,
                 "nested_payload_pragmatic" => Self::NestedPayloadPragmatic,
                 "ordered_payload_pragmatic" => Self::OrderedPayloadPragmatic,
+                "ordered_payload_mixed_pragmatic" => Self::OrderedPayloadMixedPragmatic,
                 other => {
                     return Err(format!(
-                        "unsupported RPM_BENCH_SCENARIO value `{other}`; expected `top_level_pragmatic`, `nested_payload_pragmatic`, `ordered_payload_pragmatic`, or `all`"
+                        "unsupported RPM_BENCH_SCENARIO value `{other}`; expected `top_level_pragmatic`, `nested_payload_pragmatic`, `ordered_payload_pragmatic`, `ordered_payload_mixed_pragmatic`, or `all`"
                     ));
                 }
             };
@@ -87,6 +92,7 @@ impl Scenario {
                 Self::TopLevelPragmatic,
                 Self::NestedPayloadPragmatic,
                 Self::OrderedPayloadPragmatic,
+                Self::OrderedPayloadMixedPragmatic,
             ])
         } else {
             Ok(scenarios)
@@ -196,6 +202,7 @@ struct BenchmarkConfig {
     rust_output_batch_rows: Option<usize>,
     rust_output_row_group_rows: Option<usize>,
     rust_prefetch_batches_per_source: Option<usize>,
+    rust_ordered_memory_budget_bytes: Option<usize>,
     exact_validation: bool,
     duckdb_threads: Option<usize>,
     duckdb_compression: Option<String>,
@@ -294,6 +301,14 @@ struct OrderedMetricsSummary {
     copied_rows: u64,
     copied_compressed_bytes: u64,
     row_group_copy_ms: u128,
+    ordered_pipeline_peak_buffered_bytes: u64,
+    writer_peak_buffered_bytes: u64,
+    ordered_selector_comparisons: u64,
+    dense_partition_jobs: u64,
+    dense_rows: u64,
+    dense_selection_ms: u128,
+    dense_materialization_ms: u128,
+    dense_fallback_count: u64,
 }
 
 #[derive(Serialize)]
@@ -433,6 +448,8 @@ fn load_config() -> Result<BenchmarkConfig, Box<dyn Error>> {
         parse_env_optional_usize("RPM_BENCH_RUST_OUTPUT_ROW_GROUP_ROWS")?;
     let rust_prefetch_batches_per_source =
         parse_env_optional_usize("RPM_BENCH_RUST_PREFETCH_BATCHES_PER_SOURCE")?;
+    let rust_ordered_memory_budget_mib =
+        parse_env_optional_usize("RPM_BENCH_RUST_ORDERED_MEMORY_BUDGET_MIB")?;
     let exact_validation = parse_env_bool("RPM_BENCH_EXACT_VALIDATION", false)?;
     let duckdb_threads = parse_env_optional_usize("RPM_BENCH_DUCKDB_THREADS")?;
     let duckdb_compression = parse_duckdb_compression()?;
@@ -467,6 +484,11 @@ fn load_config() -> Result<BenchmarkConfig, Box<dyn Error>> {
     if rust_prefetch_batches_per_source == Some(0) {
         return Err("RPM_BENCH_RUST_PREFETCH_BATCHES_PER_SOURCE must be > 0 when set".into());
     }
+    if rust_ordered_memory_budget_mib == Some(0) {
+        return Err("RPM_BENCH_RUST_ORDERED_MEMORY_BUDGET_MIB must be > 0 when set".into());
+    }
+    let rust_ordered_memory_budget_bytes =
+        rust_ordered_memory_budget_mib.map(|mib| mib.saturating_mul(1024 * 1024));
 
     Ok(BenchmarkConfig {
         file_count,
@@ -482,6 +504,7 @@ fn load_config() -> Result<BenchmarkConfig, Box<dyn Error>> {
         rust_output_batch_rows,
         rust_output_row_group_rows,
         rust_prefetch_batches_per_source,
+        rust_ordered_memory_budget_bytes,
         exact_validation,
         duckdb_threads,
         duckdb_compression,
@@ -962,6 +985,83 @@ fn ordered_payload_batch(
     }
 }
 
+fn ordered_mixed_payload_batch(
+    rows: usize,
+    layout: ScenarioBatchLayout,
+    row_offset: usize,
+) -> (SchemaRef, RecordBatch) {
+    let profile_fields: Fields = vec![Arc::new(Field::new("segment", DataType::Utf8, true))].into();
+    let payload_fields: Fields = vec![
+        Arc::new(Field::new("score", DataType::Int32, true)),
+        Arc::new(Field::new(
+            "profile",
+            DataType::Struct(profile_fields.clone()),
+            true,
+        )),
+        Arc::new(Field::new("amount", DataType::Int32, true)),
+    ]
+    .into();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("event_id", DataType::Int64, false),
+        Field::new("org_id", DataType::Int64, false),
+        Field::new("payload", DataType::Struct(payload_fields.clone()), true),
+    ]));
+    let profile_array = Arc::new(StructArray::new(
+        profile_fields,
+        vec![Arc::new(StringArray::from(
+            (0..rows)
+                .map(|index| {
+                    let global_index = row_offset + index;
+                    match global_index % 5 {
+                        0 => Some("enterprise".to_string()),
+                        1 | 2 => Some("growth".to_string()),
+                        3 => Some("starter".to_string()),
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )) as ArrayRef],
+        None,
+    )) as ArrayRef;
+    let payload_array = Arc::new(StructArray::new(
+        payload_fields,
+        vec![
+            Arc::new(Int32Array::from(
+                (0..rows)
+                    .map(|index| Some(((row_offset + index) % 10_000) as i32))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            profile_array,
+            Arc::new(Int32Array::from(
+                (0..rows)
+                    .map(|index| Some((((row_offset + index) * 7) % 100_000) as i32))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+        None,
+    )) as ArrayRef;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(
+                (0..rows)
+                    .map(|index| {
+                        layout.start_event_id + ((row_offset + index) as i64 * layout.event_step)
+                    })
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Int64Array::from(
+                (0..rows)
+                    .map(|index| layout.org_base + ((row_offset + index) % 16) as i64)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            payload_array,
+        ],
+    )
+    .unwrap();
+    (schema, batch)
+}
+
 fn scenario_batch_layout(
     scenario: Scenario,
     file_index: usize,
@@ -972,6 +1072,16 @@ fn scenario_batch_layout(
         Scenario::OrderedPayloadPragmatic => ScenarioBatchLayout {
             start_event_id: file_index as i64,
             event_step: file_count as i64,
+            org_base: 10_000 + ((file_index as i64) * 100),
+        },
+        Scenario::OrderedPayloadMixedPragmatic => ScenarioBatchLayout {
+            start_event_id: (file_index as i64 * rows_per_file as i64)
+                - if file_index % 2 == 1 {
+                    rows_per_file as i64 / 10
+                } else {
+                    0
+                },
+            event_step: 1,
             org_base: 10_000 + ((file_index as i64) * 100),
         },
         _ => ScenarioBatchLayout {
@@ -1005,6 +1115,9 @@ fn scenario_batch(
         Scenario::OrderedPayloadPragmatic => {
             ordered_payload_batch(schema_family, rows, layout, row_offset)
         }
+        Scenario::OrderedPayloadMixedPragmatic => {
+            ordered_mixed_payload_batch(rows, layout, row_offset)
+        }
     }
 }
 
@@ -1022,7 +1135,13 @@ async fn write_scenario_file(
     let (schema, first_batch) =
         scenario_batch(scenario, schema_family, first_batch_rows, layout, 0);
     let file = File::create(path).await?;
-    let mut writer = AsyncArrowWriter::try_new(file, schema, Some(WriterProperties::new()))?;
+    let writer_properties = match scenario {
+        Scenario::OrderedPayloadMixedPragmatic => WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build(),
+        _ => WriterProperties::new(),
+    };
+    let mut writer = AsyncArrowWriter::try_new(file, schema, Some(writer_properties))?;
     writer.write(&first_batch).await?;
 
     let mut row_offset = first_batch_rows;
@@ -1338,7 +1457,14 @@ fn ordered_benchmark_execution_options(config: &BenchmarkConfig) -> ParquetMerge
         writer_compression: config.rust_compression.execution_compression(),
         writer_dictionary_enabled: config.rust_dictionary_enabled,
         stats_fast_path: true,
+        ordered_memory_budget_bytes: config.rust_ordered_memory_budget_bytes,
     };
+    if config.rust_ordered_memory_budget_bytes.is_some() {
+        options.read_batch_size = 262_144;
+        options.output_batch_rows = 131_072;
+        options.prefetch_batches_per_source = 8;
+        options.output_row_group_rows = 262_144;
+    }
     apply_benchmark_tuning(config, &mut options);
     options
 }
@@ -1438,7 +1564,7 @@ async fn run_rust_merge(
             )
             .await?
         }
-        Scenario::OrderedPayloadPragmatic => {
+        Scenario::OrderedPayloadPragmatic | Scenario::OrderedPayloadMixedPragmatic => {
             merge_payload_parquet_files_with_execution(
                 input_paths,
                 output_path,
@@ -1580,6 +1706,8 @@ fn ordered_metrics_from_report(report: &CompactionReport) -> Option<OrderedMetri
         && report.accumulator_flushes == 0
         && report.copy_candidate_row_groups == 0
         && report.copied_row_groups == 0
+        && report.dense_partition_jobs == 0
+        && report.dense_rows == 0
     {
         return None;
     }
@@ -1612,6 +1740,14 @@ fn ordered_metrics_from_report(report: &CompactionReport) -> Option<OrderedMetri
         copied_rows: report.copied_rows,
         copied_compressed_bytes: report.copied_compressed_bytes,
         row_group_copy_ms: duration_millis(report.row_group_copy_duration),
+        ordered_pipeline_peak_buffered_bytes: report.ordered_pipeline_peak_buffered_bytes,
+        writer_peak_buffered_bytes: report.writer_peak_buffered_bytes,
+        ordered_selector_comparisons: report.ordered_selector_comparisons,
+        dense_partition_jobs: report.dense_partition_jobs,
+        dense_rows: report.dense_rows,
+        dense_selection_ms: duration_millis(report.dense_selection_duration),
+        dense_materialization_ms: duration_millis(report.dense_materialization_duration),
+        dense_fallback_count: report.dense_fallback_count,
     })
 }
 
@@ -1931,11 +2067,16 @@ fn print_summary(summary: &BenchmarkSummary) {
     println!("DuckDB CLI: {}", summary.duckdb_version);
     println!("Benchmark artifacts: {}", summary.benchmark_dir);
     println!(
-        "Rust settings: parallelism={} unordered_order={} compression={} dictionary={} | DuckDB threads={} compression={}",
+        "Rust settings: parallelism={} unordered_order={} compression={} dictionary={} ordered_memory_budget={} | DuckDB threads={} compression={}",
         summary.config.rust_parallelism,
         summary.config.rust_unordered_order.label(),
         summary.config.rust_compression.label(),
         summary.config.rust_dictionary_enabled,
+        summary
+            .config
+            .rust_ordered_memory_budget_bytes
+            .map(|bytes| format!("{:.0} MiB", bytes as f64 / (1024.0 * 1024.0)))
+            .unwrap_or_else(|| "default".to_string()),
         summary
             .config
             .duckdb_threads
@@ -1956,11 +2097,16 @@ fn print_summary(summary: &BenchmarkSummary) {
             scenario.input_bytes as f64 / (1024.0 * 1024.0)
         );
         println!(
-            "  Rust execution: resolved_parallelism={} unordered_order={} compression={} dictionary={}",
+            "  Rust execution: resolved_parallelism={} unordered_order={} compression={} dictionary={} ordered_memory_budget={}",
             scenario.rust_resolved_parallelism,
             scenario.rust_unordered_order,
             scenario.rust_compression,
-            scenario.rust_dictionary_enabled
+            scenario.rust_dictionary_enabled,
+            summary
+                .config
+                .rust_ordered_memory_budget_bytes
+                .map(|bytes| format!("{:.0} MiB", bytes as f64 / (1024.0 * 1024.0)))
+                .unwrap_or_else(|| "default".to_string())
         );
         println!(
             "  DuckDB execution: threads={} compression={}",
@@ -2061,6 +2207,20 @@ fn print_summary(summary: &BenchmarkSummary) {
                 metrics.copied_rows,
                 metrics.copied_compressed_bytes,
                 metrics.row_group_copy_ms,
+            );
+            println!(
+                "                ordered_buffer_peak={:.2} MiB writer_buffer_peak={:.2} MiB selector_comparisons={}",
+                metrics.ordered_pipeline_peak_buffered_bytes as f64 / (1024.0 * 1024.0),
+                metrics.writer_peak_buffered_bytes as f64 / (1024.0 * 1024.0),
+                metrics.ordered_selector_comparisons,
+            );
+            println!(
+                "                dense_jobs={} dense_rows={} dense_selection={} ms dense_materialization={} ms dense_fallbacks={}",
+                metrics.dense_partition_jobs,
+                metrics.dense_rows,
+                metrics.dense_selection_ms,
+                metrics.dense_materialization_ms,
+                metrics.dense_fallback_count,
             );
         }
         println!(

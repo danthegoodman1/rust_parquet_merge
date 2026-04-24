@@ -50,7 +50,7 @@ use simd_json::prelude::{TypedScalarValue, ValueAsArray, ValueAsObject, ValueAsS
 use simd_json::{Buffers, to_borrowed_value_with_buffers};
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompactionOptions {
@@ -94,6 +94,7 @@ pub struct ParquetMergeExecutionOptions {
     pub writer_compression: ParquetCompression,
     pub writer_dictionary_enabled: bool,
     pub stats_fast_path: bool,
+    pub ordered_memory_budget_bytes: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -127,6 +128,7 @@ impl Default for ParquetMergeExecutionOptions {
             writer_compression: ParquetCompression::Uncompressed,
             writer_dictionary_enabled: true,
             stats_fast_path: true,
+            ordered_memory_budget_bytes: None,
         }
     }
 }
@@ -160,6 +162,14 @@ pub struct CompactionReport {
     pub ordered_output_selection_duration: Duration,
     pub ordered_output_materialization_duration: Duration,
     pub ordered_output_materialization_wait_duration: Duration,
+    pub ordered_pipeline_peak_buffered_bytes: u64,
+    pub writer_peak_buffered_bytes: u64,
+    pub ordered_selector_comparisons: u64,
+    pub dense_partition_jobs: u64,
+    pub dense_rows: u64,
+    pub dense_selection_duration: Duration,
+    pub dense_materialization_duration: Duration,
+    pub dense_fallback_count: u64,
     pub writer_write_duration: Duration,
     pub writer_encode_duration: Duration,
     pub writer_sink_duration: Duration,
@@ -218,6 +228,14 @@ struct ParquetMergeRunStats {
     ordered_output_selection_duration: Duration,
     ordered_output_materialization_duration: Duration,
     ordered_output_materialization_wait_duration: Duration,
+    ordered_pipeline_peak_buffered_bytes: u64,
+    writer_peak_buffered_bytes: u64,
+    ordered_selector_comparisons: u64,
+    dense_partition_jobs: u64,
+    dense_rows: u64,
+    dense_selection_duration: Duration,
+    dense_materialization_duration: Duration,
+    dense_fallback_count: u64,
     writer_write_duration: Duration,
     writer_encode_duration: Duration,
     writer_sink_duration: Duration,
@@ -740,6 +758,7 @@ trait OrderedKey: Send + Sync + 'static {
     ) -> CmpOrdering;
     fn compare_to_value(array: &Self::Array, row: usize, value: &OrderKeyValue) -> CmpOrdering;
     fn key_at(array: &Self::Array, row: usize) -> OrderKeyValue;
+    fn null_key_value() -> OrderKeyValue;
 
     fn is_null(array: &Self::Array, row: usize) -> bool {
         array.is_null(row)
@@ -833,6 +852,10 @@ macro_rules! primitive_order_key {
                 OrderKeyValue::$value_variant(
                     (!array.is_null(row)).then(|| array.value(row) as $value_type),
                 )
+            }
+
+            fn null_key_value() -> OrderKeyValue {
+                OrderKeyValue::$value_variant(None)
             }
         }
     };
@@ -941,6 +964,10 @@ macro_rules! timestamp_order_key {
             fn key_at(array: &Self::Array, row: usize) -> OrderKeyValue {
                 OrderKeyValue::Timestamp((!array.is_null(row)).then(|| array.value(row)))
             }
+
+            fn null_key_value() -> OrderKeyValue {
+                OrderKeyValue::Timestamp(None)
+            }
         }
     };
 }
@@ -1015,6 +1042,10 @@ impl OrderedKey for Utf8OrderKey {
     fn key_at(array: &Self::Array, row: usize) -> OrderKeyValue {
         OrderKeyValue::Utf8((!array.is_null(row)).then(|| array.value(row).to_string()))
     }
+
+    fn null_key_value() -> OrderKeyValue {
+        OrderKeyValue::Utf8(None)
+    }
 }
 
 impl OrderedKey for LargeUtf8OrderKey {
@@ -1051,6 +1082,10 @@ impl OrderedKey for LargeUtf8OrderKey {
 
     fn key_at(array: &Self::Array, row: usize) -> OrderKeyValue {
         OrderKeyValue::LargeUtf8((!array.is_null(row)).then(|| array.value(row).to_string()))
+    }
+
+    fn null_key_value() -> OrderKeyValue {
+        OrderKeyValue::LargeUtf8(None)
     }
 }
 
@@ -1241,55 +1276,128 @@ struct HeapEntry {
     source_index: usize,
 }
 
+#[derive(Clone, Debug)]
+struct OrderedRowGroupCandidate {
+    row_group_index: usize,
+    range: RowGroupOrderRange,
+    copy: RowGroupCopyRequest,
+}
+
+#[derive(Debug)]
+enum OrderedSourceMessage<K: OrderedKey> {
+    Batch(PreparedOrderBatchTyped<K>),
+    CopyCandidate(OrderedRowGroupCandidate),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderedSourceCommand {
+    Decode,
+    Skip,
+}
+
 #[derive(Debug)]
 struct OrderedMergeSourceTyped<K: OrderedKey> {
     source_index: usize,
-    receiver: mpsc::Receiver<Result<PreparedOrderBatchTyped<K>, String>>,
+    receiver: mpsc::Receiver<Result<OrderedSourceMessage<K>, String>>,
+    command_tx: mpsc::Sender<OrderedSourceCommand>,
     current_batch: Option<PreparedOrderBatchTyped<K>>,
+    current_candidate: Option<OrderedRowGroupCandidate>,
     current_row: usize,
 }
 
 impl<K: OrderedKey> OrderedMergeSourceTyped<K> {
     fn new(
         source_index: usize,
-        receiver: mpsc::Receiver<Result<PreparedOrderBatchTyped<K>, String>>,
+        receiver: mpsc::Receiver<Result<OrderedSourceMessage<K>, String>>,
+        command_tx: mpsc::Sender<OrderedSourceCommand>,
     ) -> Self {
         Self {
             source_index,
             receiver,
+            command_tx,
             current_batch: None,
+            current_candidate: None,
             current_row: 0,
         }
     }
 
     async fn load_next(&mut self, input_batches: &mut u64) -> Result<bool, String> {
         match self.receiver.recv().await {
-            Some(Ok(batch)) => {
+            Some(Ok(OrderedSourceMessage::Batch(batch))) => {
                 *input_batches += 1;
                 self.current_batch = Some(batch);
+                self.current_candidate = None;
+                self.current_row = 0;
+                Ok(true)
+            }
+            Some(Ok(OrderedSourceMessage::CopyCandidate(candidate))) => {
+                self.current_batch = None;
+                self.current_candidate = Some(candidate);
                 self.current_row = 0;
                 Ok(true)
             }
             Some(Err(error)) => Err(error),
             None => {
                 self.current_batch = None;
+                self.current_candidate = None;
                 self.current_row = 0;
                 Ok(false)
             }
         }
     }
 
+    async fn decode_current_candidate(&mut self, input_batches: &mut u64) -> Result<bool, String> {
+        if self.current_candidate.is_none() {
+            return Ok(self.current_batch.is_some());
+        }
+        self.command_tx
+            .send(OrderedSourceCommand::Decode)
+            .await
+            .map_err(|_| "ordered source worker closed before decoding row group".to_string())?;
+        self.load_next(input_batches).await
+    }
+
+    async fn skip_current_candidate(&mut self, input_batches: &mut u64) -> Result<bool, String> {
+        if self.current_candidate.is_none() {
+            return Ok(self.current_batch.is_some());
+        }
+        self.command_tx
+            .send(OrderedSourceCommand::Skip)
+            .await
+            .map_err(|_| "ordered source worker closed before skipping row group".to_string())?;
+        self.load_next(input_batches).await
+    }
+
     fn current_row_group_index(&self) -> Option<usize> {
         self.current_batch
             .as_ref()
             .map(|batch| batch.row_group_index)
+            .or_else(|| {
+                self.current_candidate
+                    .as_ref()
+                    .map(|candidate| candidate.row_group_index)
+            })
     }
 
     fn has_non_null_remaining(&self) -> bool {
+        if let Some(candidate) = self.current_candidate.as_ref() {
+            return candidate.range.null_kind == RowGroupNullKind::NoNulls;
+        }
         let Some(batch) = self.current_batch.as_ref() else {
             return false;
         };
         self.current_row < batch.non_null_prefix_len
+    }
+
+    fn may_have_non_null_remaining(&self) -> bool {
+        if let Some(candidate) = self.current_candidate.as_ref() {
+            return !matches!(candidate.range.null_kind, RowGroupNullKind::AllNulls);
+        }
+        self.has_non_null_remaining()
+    }
+
+    fn has_active_head(&self) -> bool {
+        self.current_batch.is_some() || self.current_candidate.is_some()
     }
 
     fn compare_head_to_source(&self, other: &Self) -> CmpOrdering {
@@ -1360,100 +1468,131 @@ impl<K: OrderedKey> OrderedMergeSourceTyped<K> {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct TypedSourceHeadHeap<K: OrderedKey> {
-    indices: Vec<usize>,
+struct TypedSourceTournament<K: OrderedKey> {
+    tree_size: usize,
+    tree: Vec<Option<usize>>,
+    active: Vec<bool>,
+    active_count: usize,
+    comparisons: u64,
     _key: PhantomData<K>,
 }
 
-impl<K: OrderedKey> TypedSourceHeadHeap<K> {
-    fn new() -> Self {
+impl<K: OrderedKey> TypedSourceTournament<K> {
+    fn new(source_count: usize) -> Self {
+        let tree_size = source_count.max(1).next_power_of_two();
         Self {
-            indices: Vec::new(),
+            tree_size,
+            tree: vec![None; tree_size * 2],
+            active: vec![false; source_count],
+            active_count: 0,
+            comparisons: 0,
             _key: PhantomData,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.indices.is_empty()
+        self.active_count == 0
     }
 
-    fn push(&mut self, source_index: usize, sources: &[OrderedMergeSourceTyped<K>]) {
-        self.indices.push(source_index);
-        let last = self.indices.len() - 1;
-        self.sift_up(last, sources);
-    }
-
-    fn pop(&mut self, sources: &[OrderedMergeSourceTyped<K>]) -> Option<HeapEntry> {
-        if self.indices.is_empty() {
-            return None;
-        }
-        let source_index = self.indices.swap_remove(0);
-        if !self.indices.is_empty() {
-            self.sift_down(0, sources);
-        }
-        Some(HeapEntry { source_index })
-    }
-
-    fn peek(&self) -> Option<HeapEntry> {
-        self.indices
-            .first()
-            .copied()
+    fn winner(&self) -> Option<HeapEntry> {
+        self.tree
+            .get(1)
+            .and_then(|source| *source)
             .map(|source_index| HeapEntry { source_index })
     }
 
-    fn remove(&mut self, source_index: usize, sources: &[OrderedMergeSourceTyped<K>]) -> bool {
-        let Some(position) = self.indices.iter().position(|index| *index == source_index) else {
-            return false;
-        };
-        self.indices.swap_remove(position);
-        if position < self.indices.len() {
-            self.sift_down(position, sources);
-            self.sift_up(position, sources);
+    fn set_active(
+        &mut self,
+        source_index: usize,
+        active: bool,
+        sources: &[OrderedMergeSourceTyped<K>],
+    ) {
+        if self.active[source_index] == active {
+            if active {
+                self.recompute_path(source_index, sources);
+            }
+            return;
         }
+        self.active[source_index] = active;
+        if active {
+            self.active_count += 1;
+        } else {
+            self.active_count -= 1;
+        }
+        let leaf = self.tree_size + source_index;
+        self.tree[leaf] = active.then_some(source_index);
+        self.recompute_path(source_index, sources);
+    }
+
+    fn remove(&mut self, source_index: usize, sources: &[OrderedMergeSourceTyped<K>]) -> bool {
+        if !self.active.get(source_index).copied().unwrap_or(false) {
+            return false;
+        }
+        self.set_active(source_index, false, sources);
         true
     }
 
-    fn sift_up(&mut self, mut position: usize, sources: &[OrderedMergeSourceTyped<K>]) {
+    fn next_competitor(
+        &mut self,
+        winner_index: usize,
+        sources: &[OrderedMergeSourceTyped<K>],
+    ) -> Option<HeapEntry> {
+        if !self.active.get(winner_index).copied().unwrap_or(false) {
+            return None;
+        }
+        let mut position = self.tree_size + winner_index;
+        let mut best = None;
+        while position > 1 {
+            let sibling = if position % 2 == 0 {
+                position + 1
+            } else {
+                position - 1
+            };
+            if let Some(candidate) = self.tree.get(sibling).and_then(|source| *source) {
+                best = Some(match best {
+                    None => candidate,
+                    Some(current) => self.pick_winner(candidate, current, sources),
+                });
+            }
+            position /= 2;
+        }
+        best.map(|source_index| HeapEntry { source_index })
+    }
+
+    fn take_comparisons(&mut self) -> u64 {
+        std::mem::take(&mut self.comparisons)
+    }
+
+    fn recompute_path(&mut self, source_index: usize, sources: &[OrderedMergeSourceTyped<K>]) {
+        let mut position = (self.tree_size + source_index) / 2;
         while position > 0 {
-            let parent = (position - 1) / 2;
-            if !self.less(self.indices[position], self.indices[parent], sources) {
+            let left = self.tree[position * 2];
+            let right = self.tree[(position * 2) + 1];
+            self.tree[position] = match (left, right) {
+                (Some(left), Some(right)) => Some(self.pick_winner(left, right, sources)),
+                (Some(left), None) => Some(left),
+                (None, Some(right)) => Some(right),
+                (None, None) => None,
+            };
+            if position == 1 {
                 break;
             }
-            self.indices.swap(position, parent);
-            position = parent;
+            position /= 2;
         }
     }
 
-    fn sift_down(&mut self, mut position: usize, sources: &[OrderedMergeSourceTyped<K>]) {
-        loop {
-            let left = position * 2 + 1;
-            let right = left + 1;
-            let mut smallest = position;
-            if left < self.indices.len()
-                && self.less(self.indices[left], self.indices[smallest], sources)
-            {
-                smallest = left;
-            }
-            if right < self.indices.len()
-                && self.less(self.indices[right], self.indices[smallest], sources)
-            {
-                smallest = right;
-            }
-            if smallest == position {
-                break;
-            }
-            self.indices.swap(position, smallest);
-            position = smallest;
-        }
-    }
-
-    fn less(
-        &self,
+    fn pick_winner(
+        &mut self,
         left_index: usize,
         right_index: usize,
         sources: &[OrderedMergeSourceTyped<K>],
-    ) -> bool {
-        sources[left_index].compare_head_to_source(&sources[right_index]) == CmpOrdering::Less
+    ) -> usize {
+        self.comparisons += 1;
+        if sources[left_index].compare_head_to_source(&sources[right_index]) == CmpOrdering::Less {
+            left_index
+        } else {
+            right_index
+        }
     }
 }
 
@@ -1688,6 +1827,14 @@ pub async fn merge_top_level_parquet_files_with_execution(
         ordered_output_materialization_duration: run_stats.ordered_output_materialization_duration,
         ordered_output_materialization_wait_duration: run_stats
             .ordered_output_materialization_wait_duration,
+        ordered_pipeline_peak_buffered_bytes: run_stats.ordered_pipeline_peak_buffered_bytes,
+        writer_peak_buffered_bytes: run_stats.writer_peak_buffered_bytes,
+        ordered_selector_comparisons: run_stats.ordered_selector_comparisons,
+        dense_partition_jobs: run_stats.dense_partition_jobs,
+        dense_rows: run_stats.dense_rows,
+        dense_selection_duration: run_stats.dense_selection_duration,
+        dense_materialization_duration: run_stats.dense_materialization_duration,
+        dense_fallback_count: run_stats.dense_fallback_count,
         writer_write_duration: run_stats.writer_write_duration,
         writer_encode_duration: run_stats.writer_encode_duration,
         writer_sink_duration: run_stats.writer_sink_duration,
@@ -1821,6 +1968,14 @@ pub async fn merge_payload_parquet_files_with_execution(
         ordered_output_materialization_duration: run_stats.ordered_output_materialization_duration,
         ordered_output_materialization_wait_duration: run_stats
             .ordered_output_materialization_wait_duration,
+        ordered_pipeline_peak_buffered_bytes: run_stats.ordered_pipeline_peak_buffered_bytes,
+        writer_peak_buffered_bytes: run_stats.writer_peak_buffered_bytes,
+        ordered_selector_comparisons: run_stats.ordered_selector_comparisons,
+        dense_partition_jobs: run_stats.dense_partition_jobs,
+        dense_rows: run_stats.dense_rows,
+        dense_selection_duration: run_stats.dense_selection_duration,
+        dense_materialization_duration: run_stats.dense_materialization_duration,
+        dense_fallback_count: run_stats.dense_fallback_count,
         writer_write_duration: run_stats.writer_write_duration,
         writer_encode_duration: run_stats.writer_encode_duration,
         writer_sink_duration: run_stats.writer_sink_duration,
@@ -1852,6 +2007,9 @@ fn validate_parquet_merge_execution_options(
     if options.output_row_group_rows == 0 {
         return Err("output_row_group_rows must be greater than zero".to_string());
     }
+    if options.ordered_memory_budget_bytes == Some(0) {
+        return Err("ordered_memory_budget_bytes must be greater than zero when set".to_string());
+    }
     if let ParquetCompression::Zstd { level } = options.writer_compression {
         if !(1..=22).contains(&level) {
             return Err(format!(
@@ -1881,6 +2039,15 @@ fn resolve_parquet_parallelism(
         options.parallelism
     };
     requested.max(1).min(input_count)
+}
+
+fn resolve_parquet_cpu_parallelism(options: &ParquetMergeExecutionOptions) -> usize {
+    let requested = if options.parallelism == 0 {
+        default_scan_parallelism()
+    } else {
+        options.parallelism
+    };
+    requested.max(1)
 }
 
 fn build_parquet_order_plan(
@@ -2035,7 +2202,6 @@ fn build_ordered_row_group_copy_plans(
                     let row_count = row_group.num_rows();
                     if !file_copy_safe
                         || row_count < 0
-                        || row_count as usize > execution_options.output_row_group_rows
                         || !row_group_copy_matches_writer_properties(
                             row_group,
                             requested_compression,
@@ -2259,6 +2425,14 @@ struct OrderedMaterializationJob {
 }
 
 impl OrderedMaterializationJob {
+    fn estimated_bytes(&self) -> usize {
+        self.batch_sources
+            .iter()
+            .map(|source| source.batch.get_array_memory_size())
+            .sum::<usize>()
+            .max(self.rows.saturating_mul(8))
+    }
+
     fn materialize(self) -> Result<OrderedFlush, String> {
         match self.mode {
             OrderedFlushMode::Direct => Err(
@@ -2301,6 +2475,21 @@ impl OrderedMaterializationJob {
                     })
                     .map_err(|error| format!("failed to materialize ordered output batch: {error}"))
             }
+        }
+    }
+}
+
+impl OrderedFlush {
+    fn estimated_bytes(&self) -> usize {
+        self.batch.get_array_memory_size()
+    }
+}
+
+impl OrderedFlushSegment {
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::Completed(flush) => flush.estimated_bytes(),
+            Self::Materialize(job) => job.estimated_bytes(),
         }
     }
 }
@@ -2467,6 +2656,121 @@ fn ordered_batch_identity(batch: &RecordBatch) -> OrderedBatchIdentity {
     }
 }
 
+const ORDERED_MEMORY_PERMIT_BYTES: usize = 1 << 20;
+
+#[derive(Debug)]
+struct OrderedMemoryLimiter {
+    semaphore: Arc<Semaphore>,
+    bytes_per_permit: usize,
+    total_permits: usize,
+    current_permits: AtomicUsize,
+    peak_permits: AtomicUsize,
+}
+
+impl OrderedMemoryLimiter {
+    fn new(budget_bytes: usize) -> Arc<Self> {
+        let total_permits = budget_bytes
+            .div_ceil(ORDERED_MEMORY_PERMIT_BYTES)
+            .max(1)
+            .min(u32::MAX as usize);
+        Arc::new(Self {
+            semaphore: Arc::new(Semaphore::new(total_permits)),
+            bytes_per_permit: ORDERED_MEMORY_PERMIT_BYTES,
+            total_permits,
+            current_permits: AtomicUsize::new(0),
+            peak_permits: AtomicUsize::new(0),
+        })
+    }
+
+    #[cfg(test)]
+    async fn acquire(self: &Arc<Self>, bytes: usize) -> Result<OrderedMemoryPermit, String> {
+        let permits = self.permits_for(bytes);
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_many_owned(permits as u32)
+            .await
+            .map_err(|_| "ordered memory budget semaphore closed".to_string())?;
+        let current = self.current_permits.fetch_add(permits, Ordering::Relaxed) + permits;
+        self.update_peak(current);
+        Ok(OrderedMemoryPermit {
+            _permit: Some(permit),
+            limiter: Some(self.clone()),
+            permits,
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<OrderedMemoryPermit> {
+        let permits = self.permits_for(bytes);
+        let permit = self
+            .semaphore
+            .clone()
+            .try_acquire_many_owned(permits as u32)
+            .ok()?;
+        let current = self.current_permits.fetch_add(permits, Ordering::Relaxed) + permits;
+        self.update_peak(current);
+        Some(OrderedMemoryPermit {
+            _permit: Some(permit),
+            limiter: Some(self.clone()),
+            permits,
+        })
+    }
+
+    fn permits_for(&self, bytes: usize) -> usize {
+        bytes
+            .max(1)
+            .div_ceil(self.bytes_per_permit)
+            .max(1)
+            .min(self.total_permits)
+    }
+
+    fn update_peak(&self, current: usize) {
+        let mut observed = self.peak_permits.load(Ordering::Relaxed);
+        while current > observed {
+            match self.peak_permits.compare_exchange_weak(
+                observed,
+                current,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    fn peak_bytes(&self) -> u64 {
+        self.peak_permits.load(Ordering::Relaxed) as u64 * self.bytes_per_permit as u64
+    }
+}
+
+#[derive(Debug)]
+struct OrderedMemoryPermit {
+    _permit: Option<OwnedSemaphorePermit>,
+    limiter: Option<Arc<OrderedMemoryLimiter>>,
+    permits: usize,
+}
+
+impl OrderedMemoryPermit {
+    fn none() -> Self {
+        Self {
+            _permit: None,
+            limiter: None,
+            permits: 0,
+        }
+    }
+}
+
+impl Drop for OrderedMemoryPermit {
+    fn drop(&mut self) {
+        if let Some(limiter) = &self.limiter {
+            limiter
+                .current_permits
+                .fetch_sub(self.permits, Ordering::Relaxed);
+        }
+    }
+}
+
 #[derive(Debug)]
 enum OrderedCompletedOutputItem {
     Batch {
@@ -2481,6 +2785,8 @@ struct OrderedCompletedOutput {
     sequence: u64,
     item: OrderedCompletedOutputItem,
     materialization_duration: Duration,
+    memory_permit: OrderedMemoryPermit,
+    estimated_bytes: usize,
 }
 
 type OrderedMaterializationHandle = tokio::task::JoinHandle<Result<OrderedCompletedOutput, String>>;
@@ -2492,16 +2798,18 @@ struct OrderedOutputPipeline {
     next_sequence: u64,
     next_to_send: u64,
     limit: usize,
+    memory_limiter: Option<Arc<OrderedMemoryLimiter>>,
 }
 
 impl OrderedOutputPipeline {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, memory_limiter: Option<Arc<OrderedMemoryLimiter>>) -> Self {
         Self {
             pending: FuturesUnordered::new(),
             completed: BTreeMap::new(),
             next_sequence: 0,
             next_to_send: 0,
             limit: limit.max(1),
+            memory_limiter,
         }
     }
 
@@ -2514,6 +2822,8 @@ impl OrderedOutputPipeline {
     ) -> Result<(), String> {
         self.ensure_capacity(writer, stats).await?;
         let sequence = self.next_sequence();
+        let estimated_bytes = segment.estimated_bytes();
+        let memory_permit = self.acquire_memory(estimated_bytes, writer, stats).await?;
         match segment {
             OrderedFlushSegment::Completed(flush) => {
                 self.record_completed(
@@ -2524,6 +2834,8 @@ impl OrderedOutputPipeline {
                             count_materialization: true,
                         },
                         materialization_duration: direct_materialization_duration,
+                        memory_permit,
+                        estimated_bytes,
                     },
                     writer,
                     stats,
@@ -2534,6 +2846,7 @@ impl OrderedOutputPipeline {
                 self.pending.push(tokio::task::spawn_blocking(move || {
                     let materialization_start = Instant::now();
                     let flush = job.materialize()?;
+                    let estimated_bytes = flush.estimated_bytes();
                     Ok(OrderedCompletedOutput {
                         sequence,
                         item: OrderedCompletedOutputItem::Batch {
@@ -2541,6 +2854,8 @@ impl OrderedOutputPipeline {
                             count_materialization: true,
                         },
                         materialization_duration: materialization_start.elapsed(),
+                        memory_permit,
+                        estimated_bytes,
                     })
                 }));
                 self.flush_ready(writer, stats).await
@@ -2556,6 +2871,8 @@ impl OrderedOutputPipeline {
     ) -> Result<(), String> {
         self.ensure_capacity(writer, stats).await?;
         let sequence = self.next_sequence();
+        let estimated_bytes = batch.get_array_memory_size();
+        let memory_permit = self.acquire_memory(estimated_bytes, writer, stats).await?;
         self.record_completed(
             OrderedCompletedOutput {
                 sequence,
@@ -2567,6 +2884,37 @@ impl OrderedOutputPipeline {
                     count_materialization: false,
                 },
                 materialization_duration: Duration::default(),
+                memory_permit,
+                estimated_bytes,
+            },
+            writer,
+            stats,
+        )
+        .await
+    }
+
+    async fn submit_materialized_batch(
+        &mut self,
+        batch: RecordBatch,
+        mode: OrderedFlushMode,
+        materialization_duration: Duration,
+        writer: &mut ParquetOutputWriter,
+        stats: &mut ParquetMergeRunStats,
+    ) -> Result<(), String> {
+        self.ensure_capacity(writer, stats).await?;
+        let sequence = self.next_sequence();
+        let estimated_bytes = batch.get_array_memory_size();
+        let memory_permit = self.acquire_memory(estimated_bytes, writer, stats).await?;
+        self.record_completed(
+            OrderedCompletedOutput {
+                sequence,
+                item: OrderedCompletedOutputItem::Batch {
+                    flush: OrderedFlush { batch, mode },
+                    count_materialization: true,
+                },
+                materialization_duration,
+                memory_permit,
+                estimated_bytes,
             },
             writer,
             stats,
@@ -2582,11 +2930,15 @@ impl OrderedOutputPipeline {
     ) -> Result<(), String> {
         self.ensure_capacity(writer, stats).await?;
         let sequence = self.next_sequence();
+        let estimated_bytes = copy.compressed_bytes as usize;
+        let memory_permit = self.acquire_memory(estimated_bytes, writer, stats).await?;
         self.record_completed(
             OrderedCompletedOutput {
                 sequence,
                 item: OrderedCompletedOutputItem::CopyRowGroup(copy),
                 materialization_duration: Duration::default(),
+                memory_permit,
+                estimated_bytes,
             },
             writer,
             stats,
@@ -2613,6 +2965,29 @@ impl OrderedOutputPipeline {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
         sequence
+    }
+
+    async fn acquire_memory(
+        &mut self,
+        estimated_bytes: usize,
+        writer: &mut ParquetOutputWriter,
+        stats: &mut ParquetMergeRunStats,
+    ) -> Result<OrderedMemoryPermit, String> {
+        match self.memory_limiter.clone() {
+            Some(limiter) => loop {
+                if let Some(permit) = limiter.try_acquire(estimated_bytes) {
+                    return Ok(permit);
+                }
+                if self.pending.is_empty() {
+                    // The ordered budget is a soft queue budget. If downstream writer
+                    // stages already hold the permits, waiting here can deadlock the
+                    // producer before the writer receives enough rows to flush.
+                    return Ok(OrderedMemoryPermit::none());
+                }
+                self.drain_one(writer, stats).await?;
+            },
+            None => Ok(OrderedMemoryPermit::none()),
+        }
     }
 
     async fn ensure_capacity(
@@ -2676,12 +3051,22 @@ impl OrderedOutputPipeline {
         stats: &mut ParquetMergeRunStats,
     ) -> Result<(), String> {
         while let Some(completed) = self.completed.remove(&self.next_to_send) {
-            match completed.item {
+            let OrderedCompletedOutput {
+                item,
+                memory_permit,
+                estimated_bytes,
+                ..
+            } = completed;
+            match item {
                 OrderedCompletedOutputItem::Batch { flush, .. } => {
-                    writer.send(flush.batch).await?;
+                    writer
+                        .send_with_memory(flush.batch, memory_permit, estimated_bytes)
+                        .await?;
                 }
                 OrderedCompletedOutputItem::CopyRowGroup(copy) => {
-                    writer.send_row_group_copy(copy).await?;
+                    writer
+                        .send_row_group_copy_with_memory(copy, memory_permit, estimated_bytes)
+                        .await?;
                 }
             }
             self.next_to_send += 1;
@@ -2704,6 +3089,7 @@ struct ParquetWriterResult {
     copied_rows: u64,
     copied_compressed_bytes: u64,
     row_group_copy_duration: Duration,
+    writer_peak_buffered_bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -2765,6 +3151,8 @@ struct RowGroupEncodeJob {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
     rows: usize,
+    estimated_bytes: usize,
+    _memory_permits: Vec<OrderedMemoryPermit>,
     writer_properties: WriterProperties,
 }
 
@@ -2788,6 +3176,8 @@ struct EncodedRowGroup {
     data: EncodedRowGroupData,
     row_group_metadata: parquet::file::metadata::RowGroupMetaDataPtr,
     encode_duration: Duration,
+    estimated_bytes: usize,
+    _memory_permits: Vec<OrderedMemoryPermit>,
 }
 
 #[derive(Debug)]
@@ -2797,6 +3187,8 @@ struct RowGroupBatchAccumulator {
     writer_properties: WriterProperties,
     batches: Vec<RecordBatch>,
     rows: usize,
+    buffered_bytes: usize,
+    memory_permits: Vec<OrderedMemoryPermit>,
     next_sequence: u64,
 }
 
@@ -2808,13 +3200,20 @@ impl RowGroupBatchAccumulator {
             writer_properties,
             batches: Vec::new(),
             rows: 0,
+            buffered_bytes: 0,
+            memory_permits: Vec::new(),
             next_sequence: 0,
         }
     }
 
-    fn push(&mut self, batch: RecordBatch) -> Vec<RowGroupEncodeJob> {
+    fn push(
+        &mut self,
+        batch: RecordBatch,
+        memory_permit: OrderedMemoryPermit,
+    ) -> Vec<RowGroupEncodeJob> {
         let mut jobs = Vec::new();
         let mut offset = 0;
+        self.memory_permits.push(memory_permit);
         while offset < batch.num_rows() {
             let available = self.target_rows - self.rows;
             let take_rows = available.min(batch.num_rows() - offset);
@@ -2823,6 +3222,9 @@ impl RowGroupBatchAccumulator {
             } else {
                 batch.slice(offset, take_rows)
             };
+            self.buffered_bytes = self
+                .buffered_bytes
+                .saturating_add(slice.get_array_memory_size());
             self.batches.push(slice);
             self.rows += take_rows;
             offset += take_rows;
@@ -2851,6 +3253,8 @@ impl RowGroupBatchAccumulator {
             schema: self.schema.clone(),
             batches: std::mem::take(&mut self.batches),
             rows: std::mem::take(&mut self.rows),
+            estimated_bytes: std::mem::take(&mut self.buffered_bytes),
+            _memory_permits: std::mem::take(&mut self.memory_permits),
             writer_properties: self.writer_properties.clone(),
         }
     }
@@ -2901,6 +3305,8 @@ fn encode_row_group(job: RowGroupEncodeJob) -> Result<EncodedRowGroup, String> {
         data: EncodedRowGroupData::InMemory(bytes),
         row_group_metadata: row_group_metadata.into(),
         encode_duration: encode_start.elapsed(),
+        estimated_bytes: job.estimated_bytes,
+        _memory_permits: job._memory_permits,
     })
 }
 
@@ -2950,8 +3356,16 @@ fn append_encoded_row_group<W: Write + Send>(
 
 #[derive(Debug)]
 enum ParquetOutputItem {
-    Batch(RecordBatch),
-    CopyRowGroup(RowGroupCopyRequest),
+    Batch {
+        batch: RecordBatch,
+        memory_permit: OrderedMemoryPermit,
+        estimated_bytes: usize,
+    },
+    CopyRowGroup {
+        copy: RowGroupCopyRequest,
+        memory_permit: OrderedMemoryPermit,
+        estimated_bytes: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -2972,12 +3386,20 @@ impl ParquetOutputWriter {
             let mut writer = writer;
             let mut result = ParquetWriterResult::default();
             while let Some(item) = rx.recv().await {
-                let ParquetOutputItem::Batch(batch) = item else {
+                let ParquetOutputItem::Batch {
+                    batch,
+                    memory_permit: _memory_permit,
+                    estimated_bytes,
+                } = item
+                else {
                     return Err(
                         "encoded row group copy requires the parallel parquet writer path"
                             .to_string(),
                     );
                 };
+                result.writer_peak_buffered_bytes = result
+                    .writer_peak_buffered_bytes
+                    .max(estimated_bytes as u64);
                 let write_start = Instant::now();
                 let sink_before = sink_metrics.sink_duration();
                 writer
@@ -3040,11 +3462,29 @@ impl ParquetOutputWriter {
     }
 
     async fn send(&mut self, batch: RecordBatch) -> Result<(), String> {
+        self.send_with_memory(batch, OrderedMemoryPermit::none(), 0)
+            .await
+    }
+
+    async fn send_with_memory(
+        &mut self,
+        batch: RecordBatch,
+        memory_permit: OrderedMemoryPermit,
+        estimated_bytes: usize,
+    ) -> Result<(), String> {
         let Some(tx) = self.tx.as_ref().cloned() else {
             return Err("ordered writer is no longer accepting batches".to_string());
         };
 
-        if tx.send(ParquetOutputItem::Batch(batch)).await.is_err() {
+        if tx
+            .send(ParquetOutputItem::Batch {
+                batch,
+                memory_permit,
+                estimated_bytes,
+            })
+            .await
+            .is_err()
+        {
             return Err(self
                 .take_failure("ordered writer task closed unexpectedly")
                 .await);
@@ -3052,13 +3492,22 @@ impl ParquetOutputWriter {
         Ok(())
     }
 
-    async fn send_row_group_copy(&mut self, copy: RowGroupCopyRequest) -> Result<(), String> {
+    async fn send_row_group_copy_with_memory(
+        &mut self,
+        copy: RowGroupCopyRequest,
+        memory_permit: OrderedMemoryPermit,
+        estimated_bytes: usize,
+    ) -> Result<(), String> {
         let Some(tx) = self.tx.as_ref().cloned() else {
             return Err("ordered writer is no longer accepting copied row groups".to_string());
         };
 
         if tx
-            .send(ParquetOutputItem::CopyRowGroup(copy))
+            .send(ParquetOutputItem::CopyRowGroup {
+                copy,
+                memory_permit,
+                estimated_bytes,
+            })
             .await
             .is_err()
         {
@@ -3126,13 +3575,26 @@ async fn run_parallel_output_writer(
     let mut next_to_write = 0_u64;
     let mut result = ParquetWriterResult::default();
     let encoder_limit = resolved_parallelism.max(1);
+    let mut writer_buffered_bytes = 0_u64;
 
     while let Some(item) = rx.recv().await {
         writer_start.get_or_insert_with(Instant::now);
         match item {
-            ParquetOutputItem::Batch(batch) => {
+            ParquetOutputItem::Batch {
+                batch,
+                memory_permit,
+                estimated_bytes,
+            } => {
                 result.output_batches += 1;
-                for job in accumulator.push(batch) {
+                let force_partial_row_group = execution_options
+                    .ordered_memory_budget_bytes
+                    .map(|budget| estimated_bytes >= budget.saturating_div(2).max(1))
+                    .unwrap_or(false);
+                writer_buffered_bytes =
+                    writer_buffered_bytes.saturating_add(estimated_bytes as u64);
+                result.writer_peak_buffered_bytes =
+                    result.writer_peak_buffered_bytes.max(writer_buffered_bytes);
+                for job in accumulator.push(batch, memory_permit) {
                     while pending.len() >= encoder_limit {
                         drain_one_encoded_row_group(
                             &mut pending,
@@ -3140,13 +3602,52 @@ async fn run_parallel_output_writer(
                             &mut file_writer,
                             &mut next_to_write,
                             &mut result,
+                            &mut writer_buffered_bytes,
                         )
                         .await?;
                     }
                     spawn_row_group_encoder(&mut pending, job);
                 }
+                if force_partial_row_group {
+                    if let Some(job) = accumulator.finish() {
+                        while pending.len() >= encoder_limit {
+                            drain_one_encoded_row_group(
+                                &mut pending,
+                                &mut completed,
+                                &mut file_writer,
+                                &mut next_to_write,
+                                &mut result,
+                                &mut writer_buffered_bytes,
+                            )
+                            .await?;
+                        }
+                        spawn_row_group_encoder(&mut pending, job);
+                    }
+                }
+                if let Some(budget) = execution_options.ordered_memory_budget_bytes {
+                    let pressure_bytes = budget.saturating_div(2).max(1) as u64;
+                    while writer_buffered_bytes >= pressure_bytes && !pending.is_empty() {
+                        drain_one_encoded_row_group(
+                            &mut pending,
+                            &mut completed,
+                            &mut file_writer,
+                            &mut next_to_write,
+                            &mut result,
+                            &mut writer_buffered_bytes,
+                        )
+                        .await?;
+                    }
+                }
             }
-            ParquetOutputItem::CopyRowGroup(copy) => {
+            ParquetOutputItem::CopyRowGroup {
+                copy,
+                memory_permit,
+                estimated_bytes,
+            } => {
+                writer_buffered_bytes =
+                    writer_buffered_bytes.saturating_add(estimated_bytes as u64);
+                result.writer_peak_buffered_bytes =
+                    result.writer_peak_buffered_bytes.max(writer_buffered_bytes);
                 if let Some(job) = accumulator.finish() {
                     while pending.len() >= encoder_limit {
                         drain_one_encoded_row_group(
@@ -3155,6 +3656,7 @@ async fn run_parallel_output_writer(
                             &mut file_writer,
                             &mut next_to_write,
                             &mut result,
+                            &mut writer_buffered_bytes,
                         )
                         .await?;
                     }
@@ -3167,6 +3669,7 @@ async fn run_parallel_output_writer(
                         &mut file_writer,
                         &mut next_to_write,
                         &mut result,
+                        &mut writer_buffered_bytes,
                     )
                     .await?;
                 }
@@ -3176,6 +3679,8 @@ async fn run_parallel_output_writer(
                     data: EncodedRowGroupData::Copied(copy.clone()),
                     row_group_metadata: copy.row_group_metadata.clone(),
                     encode_duration: Duration::default(),
+                    estimated_bytes,
+                    _memory_permits: vec![memory_permit],
                 };
                 completed.insert(sequence, encoded);
                 write_ready_encoded_row_groups(
@@ -3183,6 +3688,7 @@ async fn run_parallel_output_writer(
                     &mut file_writer,
                     &mut next_to_write,
                     &mut result,
+                    &mut writer_buffered_bytes,
                 )?;
             }
         }
@@ -3196,6 +3702,7 @@ async fn run_parallel_output_writer(
                 &mut file_writer,
                 &mut next_to_write,
                 &mut result,
+                &mut writer_buffered_bytes,
             )
             .await?;
         }
@@ -3209,6 +3716,7 @@ async fn run_parallel_output_writer(
             &mut file_writer,
             &mut next_to_write,
             &mut result,
+            &mut writer_buffered_bytes,
         )
         .await?;
     }
@@ -3217,6 +3725,7 @@ async fn run_parallel_output_writer(
         &mut file_writer,
         &mut next_to_write,
         &mut result,
+        &mut writer_buffered_bytes,
     )?;
     if !completed.is_empty() {
         return Err("encoded row group assembly ended with out-of-order gaps".to_string());
@@ -3239,6 +3748,7 @@ async fn drain_one_encoded_row_group<W: Write + Send>(
     writer: &mut SerializedFileWriter<W>,
     next_to_write: &mut u64,
     result: &mut ParquetWriterResult,
+    writer_buffered_bytes: &mut u64,
 ) -> Result<(), String> {
     let Some(join_result) = pending.next().await else {
         return Ok(());
@@ -3250,7 +3760,13 @@ async fn drain_one_encoded_row_group<W: Write + Send>(
     };
     result.encode_duration += encoded.encode_duration;
     completed.insert(encoded.sequence, encoded);
-    write_ready_encoded_row_groups(completed, writer, next_to_write, result)
+    write_ready_encoded_row_groups(
+        completed,
+        writer,
+        next_to_write,
+        result,
+        writer_buffered_bytes,
+    )
 }
 
 fn write_ready_encoded_row_groups<W: Write + Send>(
@@ -3258,8 +3774,10 @@ fn write_ready_encoded_row_groups<W: Write + Send>(
     writer: &mut SerializedFileWriter<W>,
     next_to_write: &mut u64,
     result: &mut ParquetWriterResult,
+    writer_buffered_bytes: &mut u64,
 ) -> Result<(), String> {
     while let Some(encoded) = completed.remove(&*next_to_write) {
+        let estimated_bytes = encoded.estimated_bytes as u64;
         let copied_metadata = match &encoded.data {
             EncodedRowGroupData::Copied(copy) => Some((copy.rows, copy.compressed_bytes)),
             EncodedRowGroupData::InMemory(_) => None,
@@ -3276,6 +3794,7 @@ fn write_ready_encoded_row_groups<W: Write + Send>(
             result.copied_compressed_bytes += compressed_bytes;
             result.row_group_copy_duration += elapsed;
         }
+        *writer_buffered_bytes = writer_buffered_bytes.saturating_sub(estimated_bytes);
         *next_to_write += 1;
     }
     Ok(())
@@ -3997,6 +4516,7 @@ async fn merge_parquet_files_unordered_preserve_order(
     stats.copied_rows = writer_result.copied_rows;
     stats.copied_compressed_bytes = writer_result.copied_compressed_bytes;
     stats.row_group_copy_duration = writer_result.row_group_copy_duration;
+    stats.writer_peak_buffered_bytes = writer_result.writer_peak_buffered_bytes;
     stats.read_decode_duration =
         Duration::from_nanos(worker_metrics.read_decode_nanos.load(Ordering::Relaxed));
     stats.source_prepare_duration =
@@ -4104,6 +4624,7 @@ async fn merge_parquet_files_unordered_interleaved(
     stats.copied_rows = writer_result.copied_rows;
     stats.copied_compressed_bytes = writer_result.copied_compressed_bytes;
     stats.row_group_copy_duration = writer_result.row_group_copy_duration;
+    stats.writer_peak_buffered_bytes = writer_result.writer_peak_buffered_bytes;
     stats.read_decode_duration =
         Duration::from_nanos(worker_metrics.read_decode_nanos.load(Ordering::Relaxed));
     stats.source_prepare_duration =
@@ -4360,24 +4881,38 @@ async fn merge_payload_parquet_files_ordered_typed<K: OrderedKey>(
     let execution_start = Instant::now();
     let order_plan = Arc::new(order_plan);
     let worker_metrics = Arc::new(ParquetWorkerMetrics::default());
-    let resolved_parallelism = resolve_parquet_parallelism(execution_options, input_paths.len());
+    let source_parallelism = resolve_parquet_parallelism(execution_options, input_paths.len());
+    let cpu_parallelism = resolve_parquet_cpu_parallelism(execution_options);
+    let ordered_memory_limiter = execution_options
+        .ordered_memory_budget_bytes
+        .map(OrderedMemoryLimiter::new);
     let mut ordered_writer = create_parquet_output_writer(
         output_path,
         output_schema.clone(),
         execution_options,
-        resolved_parallelism,
-        execution_options.prefetch_batches_per_source.max(2) * resolved_parallelism.max(1),
+        cpu_parallelism,
+        execution_options.prefetch_batches_per_source.max(2) * cpu_parallelism.max(1),
     )
     .await?;
-    let mut ordered_output_pipeline = OrderedOutputPipeline::new(resolved_parallelism.max(1));
-    let semaphore = Arc::new(Semaphore::new(resolved_parallelism.max(1)));
-    let source_copy_plans = build_ordered_row_group_copy_plans(
-        input_paths,
-        &source_schemas,
-        output_schema.as_ref(),
-        &source_adapters,
-        execution_options,
-    )?;
+    let pipeline_limit = if execution_options.ordered_memory_budget_bytes.is_some() {
+        cpu_parallelism.saturating_mul(4).max(1)
+    } else {
+        source_parallelism.max(1)
+    };
+    let mut ordered_output_pipeline =
+        OrderedOutputPipeline::new(pipeline_limit, ordered_memory_limiter.clone());
+    let semaphore = Arc::new(Semaphore::new(source_parallelism.max(1)));
+    let source_copy_plans = if execution_options.stats_fast_path {
+        build_ordered_row_group_copy_plans(
+            input_paths,
+            &source_schemas,
+            output_schema.as_ref(),
+            &source_adapters,
+            execution_options,
+        )?
+    } else {
+        vec![OrderedRowGroupCopyPlan::default(); input_paths.len()]
+    };
     let mut receivers = Vec::with_capacity(input_paths.len());
     let mut worker_handles = Vec::with_capacity(input_paths.len());
     for (source_index, (input_path, adapter)) in input_paths
@@ -4387,11 +4922,20 @@ async fn merge_payload_parquet_files_ordered_typed<K: OrderedKey>(
         .enumerate()
     {
         let (tx, rx) = mpsc::channel(execution_options.prefetch_batches_per_source);
+        let (command_tx, command_rx) = mpsc::channel(1);
         let output_schema = output_schema.clone();
         let order_plan = order_plan.clone();
         let execution_options = execution_options.clone();
         let worker_metrics = worker_metrics.clone();
         let semaphore = semaphore.clone();
+        let source_order_metadata = source_order_metadata
+            .get(source_index)
+            .cloned()
+            .unwrap_or_default();
+        let source_copy_plan = source_copy_plans
+            .get(source_index)
+            .cloned()
+            .unwrap_or_default();
         let handle = tokio::spawn(async move {
             parquet_merge_source_worker_typed::<K>(
                 source_index,
@@ -4402,11 +4946,14 @@ async fn merge_payload_parquet_files_ordered_typed<K: OrderedKey>(
                 execution_options,
                 semaphore,
                 worker_metrics,
+                source_order_metadata,
+                source_copy_plan,
+                command_rx,
                 tx,
             )
             .await
         });
-        receivers.push(rx);
+        receivers.push((rx, command_tx));
         worker_handles.push(handle);
     }
 
@@ -4416,25 +4963,30 @@ async fn merge_payload_parquet_files_ordered_typed<K: OrderedKey>(
     let mut sources = receivers
         .into_iter()
         .enumerate()
-        .map(|(source_index, receiver)| OrderedMergeSourceTyped::<K>::new(source_index, receiver))
+        .map(|(source_index, (receiver, command_tx))| {
+            OrderedMergeSourceTyped::<K>::new(source_index, receiver, command_tx)
+        })
         .collect::<Vec<_>>();
-    let mut heap = TypedSourceHeadHeap::<K>::new();
+    let mut selector = TypedSourceTournament::<K>::new(sources.len());
 
     for source_index in 0..sources.len() {
         if sources[source_index]
             .load_next(&mut stats.input_batches)
             .await?
+            && sources[source_index].current_batch.is_some()
         {
-            heap.push(source_index, &sources);
+            selector.set_active(source_index, true, &sources);
         }
     }
 
-    while !heap.is_empty() {
+    while sources.iter().any(OrderedMergeSourceTyped::has_active_head) {
         if execution_options.stats_fast_path {
             if let Some(source_index) =
                 select_fast_path_source_typed::<K>(&sources, &source_order_metadata)
             {
-                heap.remove(source_index, &sources);
+                if sources[source_index].current_batch.is_some() {
+                    selector.remove(source_index, &sources);
+                }
                 let fast_path_start = Instant::now();
                 let (row_groups, batches) = drain_fast_path_source_typed::<K>(
                     source_index,
@@ -4452,17 +5004,49 @@ async fn merge_payload_parquet_files_ordered_typed<K: OrderedKey>(
                 stats.fast_path_row_groups += row_groups;
                 stats.fast_path_batches += batches;
                 if sources[source_index].current_batch.is_some() {
-                    heap.push(source_index, &sources);
+                    selector.set_active(source_index, true, &sources);
+                } else {
+                    selector.set_active(source_index, false, &sources);
                 }
+                stats.ordered_selector_comparisons += selector.take_comparisons();
                 continue;
             }
         }
 
+        if decode_pending_copy_candidates_typed::<K>(&mut sources, &mut selector, &mut stats)
+            .await?
+        {
+            stats.ordered_selector_comparisons += selector.take_comparisons();
+            continue;
+        }
+
+        if try_dense_int64_merge_window_typed::<K>(
+            &mut sources,
+            &mut selector,
+            &mut ordered_writer,
+            &mut ordered_output_pipeline,
+            execution_options,
+            &mut accumulator,
+            &mut stats,
+            cpu_parallelism,
+            order_plan.as_ref(),
+        )
+        .await?
+        {
+            continue;
+        }
+
+        if selector.is_empty() {
+            break;
+        }
+
         let selection_start = Instant::now();
-        let entry = heap
-            .pop(&sources)
-            .expect("non-empty ordered merge heap always pops");
-        let next_competitor = heap.peek().map(|entry| entry.source_index);
+        let entry = selector
+            .winner()
+            .expect("non-empty ordered merge selector always has a winner");
+        let next_competitor = selector
+            .next_competitor(entry.source_index, &sources)
+            .map(|entry| entry.source_index);
         let counts_as_fallback_batch = sources[entry.source_index].current_row == 0;
         let run_len = {
             let source = &sources[entry.source_index];
@@ -4492,8 +5076,11 @@ async fn merge_payload_parquet_files_ordered_typed<K: OrderedKey>(
         }
 
         if sources[entry.source_index].current_batch.is_some() {
-            heap.push(entry.source_index, &sources);
+            selector.set_active(entry.source_index, true, &sources);
+        } else {
+            selector.set_active(entry.source_index, false, &sources);
         }
+        stats.ordered_selector_comparisons += selector.take_comparisons();
     }
 
     flush_ordered_accumulator(
@@ -4527,6 +5114,11 @@ async fn merge_payload_parquet_files_ordered_typed<K: OrderedKey>(
     stats.copied_rows = writer_result.copied_rows;
     stats.copied_compressed_bytes = writer_result.copied_compressed_bytes;
     stats.row_group_copy_duration = writer_result.row_group_copy_duration;
+    stats.writer_peak_buffered_bytes = writer_result.writer_peak_buffered_bytes;
+    stats.ordered_pipeline_peak_buffered_bytes = ordered_memory_limiter
+        .as_ref()
+        .map(|limiter| limiter.peak_bytes())
+        .unwrap_or_default();
     stats.read_decode_duration =
         Duration::from_nanos(worker_metrics.read_decode_nanos.load(Ordering::Relaxed));
     stats.source_prepare_duration =
@@ -4547,8 +5139,8 @@ fn select_fast_path_source_typed<K: OrderedKey>(
         match selected {
             None => selected = Some(source_index),
             Some(current) => {
-                if sources[source_index].compare_head_to_source(&sources[current])
-                    == CmpOrdering::Less
+                if compare_source_heads_for_fast_path_typed::<K>(source_index, current, sources)
+                    == Some(CmpOrdering::Less)
                 {
                     selected = Some(source_index);
                 }
@@ -4566,13 +5158,17 @@ fn row_group_fast_path_safe_typed<K: OrderedKey>(
     let Some(source) = sources.get(candidate_index) else {
         return false;
     };
-    let Some(current_batch) = source.current_batch.as_ref() else {
-        return false;
-    };
-    let Some(range) = source_order_metadata
-        .get(candidate_index)
-        .and_then(|metadata| metadata.row_groups.get(current_batch.row_group_index))
-    else {
+    let range = if let Some(candidate) = source.current_candidate.as_ref() {
+        &candidate.range
+    } else if let Some(current_batch) = source.current_batch.as_ref() {
+        let Some(range) = source_order_metadata
+            .get(candidate_index)
+            .and_then(|metadata| metadata.row_groups.get(current_batch.row_group_index))
+        else {
+            return false;
+        };
+        range
+    } else {
         return false;
     };
 
@@ -4586,10 +5182,13 @@ fn row_group_fast_path_safe_typed<K: OrderedKey>(
                 return false;
             }
             for (competitor_index, competitor) in sources.iter().enumerate() {
-                if competitor_index == candidate_index || competitor.current_batch.is_none() {
+                if competitor_index == candidate_index || !competitor.has_active_head() {
                     continue;
                 }
-                let ordering = compare_value_to_source_head_typed::<K>(max, competitor);
+                let Some(ordering) = compare_value_to_source_head_typed::<K>(max, competitor)
+                else {
+                    return false;
+                };
                 if ordering == CmpOrdering::Greater
                     || (ordering == CmpOrdering::Equal && candidate_index > competitor_index)
                 {
@@ -4600,10 +5199,10 @@ fn row_group_fast_path_safe_typed<K: OrderedKey>(
         }
         RowGroupNullKind::AllNulls => {
             for (competitor_index, competitor) in sources.iter().enumerate() {
-                if competitor_index == candidate_index || competitor.current_batch.is_none() {
+                if competitor_index == candidate_index || !competitor.has_active_head() {
                     continue;
                 }
-                if competitor.has_non_null_remaining() || candidate_index > competitor_index {
+                if competitor.may_have_non_null_remaining() || candidate_index > competitor_index {
                     return false;
                 }
             }
@@ -4615,12 +5214,82 @@ fn row_group_fast_path_safe_typed<K: OrderedKey>(
 fn compare_value_to_source_head_typed<K: OrderedKey>(
     value: &OrderKeyValue,
     source: &OrderedMergeSourceTyped<K>,
-) -> CmpOrdering {
-    let batch = source
-        .current_batch
-        .as_ref()
-        .expect("source head comparison requires an active batch");
-    K::compare_to_value(&batch.order_column, source.current_row, value).reverse()
+) -> Option<CmpOrdering> {
+    if let Some(batch) = source.current_batch.as_ref() {
+        return Some(K::compare_to_value(&batch.order_column, source.current_row, value).reverse());
+    }
+
+    let candidate = source.current_candidate.as_ref()?;
+    compare_value_to_candidate_head_typed::<K>(value, candidate)
+}
+
+fn compare_value_to_candidate_head_typed<K: OrderedKey>(
+    value: &OrderKeyValue,
+    candidate: &OrderedRowGroupCandidate,
+) -> Option<CmpOrdering> {
+    match candidate.range.null_kind {
+        RowGroupNullKind::MixedOrUnknown => None,
+        RowGroupNullKind::NoNulls => candidate
+            .range
+            .min
+            .as_ref()
+            .map(|min| compare_order_key_values(value, min)),
+        RowGroupNullKind::AllNulls => Some(compare_order_key_values(value, &K::null_key_value())),
+    }
+}
+
+fn compare_candidate_head_to_source_typed<K: OrderedKey>(
+    candidate: &OrderedRowGroupCandidate,
+    source: &OrderedMergeSourceTyped<K>,
+) -> Option<CmpOrdering> {
+    match candidate.range.null_kind {
+        RowGroupNullKind::MixedOrUnknown => None,
+        RowGroupNullKind::NoNulls => {
+            let min = candidate.range.min.as_ref()?;
+            compare_value_to_source_head_typed::<K>(min, source)
+        }
+        RowGroupNullKind::AllNulls => {
+            if let Some(other_candidate) = source.current_candidate.as_ref() {
+                return match other_candidate.range.null_kind {
+                    RowGroupNullKind::MixedOrUnknown => None,
+                    RowGroupNullKind::NoNulls => Some(CmpOrdering::Greater),
+                    RowGroupNullKind::AllNulls => Some(CmpOrdering::Equal),
+                };
+            }
+            if source.current_batch.is_some() {
+                if source.has_non_null_remaining() {
+                    Some(CmpOrdering::Greater)
+                } else {
+                    Some(CmpOrdering::Equal)
+                }
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn compare_source_heads_for_fast_path_typed<K: OrderedKey>(
+    left_index: usize,
+    right_index: usize,
+    sources: &[OrderedMergeSourceTyped<K>],
+) -> Option<CmpOrdering> {
+    let left = sources.get(left_index)?;
+    let right = sources.get(right_index)?;
+    let ordering = if left.current_batch.is_some() && right.current_batch.is_some() {
+        left.compare_head_to_source(right)
+    } else if let Some(candidate) = left.current_candidate.as_ref() {
+        compare_candidate_head_to_source_typed::<K>(candidate, right)?
+    } else if let Some(candidate) = right.current_candidate.as_ref() {
+        compare_candidate_head_to_source_typed::<K>(candidate, left)?.reverse()
+    } else {
+        return None;
+    };
+    if ordering == CmpOrdering::Equal {
+        Some(left_index.cmp(&right_index))
+    } else {
+        Some(ordering)
+    }
 }
 
 async fn drain_fast_path_source_typed<K: OrderedKey>(
@@ -4642,13 +5311,41 @@ async fn drain_fast_path_source_typed<K: OrderedKey>(
             .current_row_group_index()
             .expect("fast path requires an active row group");
         drained_row_groups += 1;
+        let mut counted_copy_candidate = false;
+
+        if let Some(candidate) = sources[source_index].current_candidate.clone() {
+            stats.copy_candidate_row_groups += 1;
+            counted_copy_candidate = true;
+            if writer.supports_row_group_copy() {
+                flush_ordered_accumulator(accumulator, output_pipeline, writer, stats).await?;
+                let copy = candidate.copy;
+                stats.rows += copy.rows;
+                sources[source_index]
+                    .skip_current_candidate(&mut stats.input_batches)
+                    .await?;
+                output_pipeline
+                    .submit_row_group_copy(copy, writer, stats)
+                    .await?;
+                continue;
+            }
+
+            sources[source_index]
+                .decode_current_candidate(&mut stats.input_batches)
+                .await?;
+            if sources[source_index].current_batch.is_none() {
+                break;
+            }
+        }
+
         if let Some(copy) = copy_request_for_current_row_group_typed(
             source_index,
             current_row_group_index,
             sources,
             source_copy_plans,
         ) {
-            stats.copy_candidate_row_groups += 1;
+            if !counted_copy_candidate {
+                stats.copy_candidate_row_groups += 1;
+            }
             if writer.supports_row_group_copy() {
                 flush_ordered_accumulator(accumulator, output_pipeline, writer, stats).await?;
                 let (batches, rows) = consume_current_row_group_without_writing_typed(
@@ -4767,6 +5464,517 @@ async fn consume_current_row_group_without_writing_typed<K: OrderedKey>(
             .await?;
     }
     Ok((batches, rows))
+}
+
+async fn decode_pending_copy_candidates_typed<K: OrderedKey>(
+    sources: &mut [OrderedMergeSourceTyped<K>],
+    selector: &mut TypedSourceTournament<K>,
+    stats: &mut ParquetMergeRunStats,
+) -> Result<bool, String> {
+    let mut decoded_any = false;
+    for source_index in 0..sources.len() {
+        if sources[source_index].current_candidate.is_none() {
+            continue;
+        }
+        decoded_any = true;
+        sources[source_index]
+            .decode_current_candidate(&mut stats.input_batches)
+            .await?;
+        if sources[source_index].current_batch.is_some() {
+            selector.set_active(source_index, true, sources);
+        } else {
+            selector.set_active(source_index, false, sources);
+        }
+    }
+    Ok(decoded_any)
+}
+
+const DENSE_INT64_INITIAL_RUN_THRESHOLD: usize = 8;
+const DENSE_INT64_MAX_PARTITIONS_PER_CORE: usize = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DenseInt64Boundary {
+    key: i64,
+    source_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct DenseInt64SourceSnapshot {
+    source_index: usize,
+    batch: RecordBatch,
+    order_column: Int64Array,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug)]
+struct DenseInt64PartitionJob {
+    partition_index: usize,
+    sources: Vec<DenseInt64SourceSnapshot>,
+    rows: usize,
+}
+
+#[derive(Debug)]
+struct DenseInt64PartitionOutput {
+    partition_index: usize,
+    batch: RecordBatch,
+    rows: usize,
+    mode: OrderedFlushMode,
+    selection_duration: Duration,
+    materialization_duration: Duration,
+    comparisons: u64,
+}
+
+async fn try_dense_int64_merge_window_typed<K: OrderedKey>(
+    sources: &mut [OrderedMergeSourceTyped<K>],
+    selector: &mut TypedSourceTournament<K>,
+    writer: &mut ParquetOutputWriter,
+    output_pipeline: &mut OrderedOutputPipeline,
+    execution_options: &ParquetMergeExecutionOptions,
+    accumulator: &mut OrderedOutputAccumulator,
+    stats: &mut ParquetMergeRunStats,
+    cpu_parallelism: usize,
+    order_plan: &ParquetOrderPlan,
+) -> Result<bool, String> {
+    if K::KEY_TYPE != ParquetOrderKeyType::Int64
+        || execution_options.parallelism == 1
+        || execution_options.ordered_memory_budget_bytes.is_none()
+        || cpu_parallelism <= 1
+        || selector.active_count < 2
+    {
+        return Ok(false);
+    }
+
+    if sources
+        .iter()
+        .any(|source| source.current_candidate.is_some())
+    {
+        stats.dense_fallback_count += 1;
+        return Ok(false);
+    }
+
+    let Some(entry) = selector.winner() else {
+        return Ok(false);
+    };
+    let next_competitor = selector
+        .next_competitor(entry.source_index, sources)
+        .map(|entry| entry.source_index);
+    let initial_run_len = {
+        let source = &sources[entry.source_index];
+        let competitor = next_competitor.map(|index| &sources[index]);
+        source.contiguous_run_len(
+            competitor,
+            DENSE_INT64_INITIAL_RUN_THRESHOLD.saturating_add(1),
+        )
+    };
+    if initial_run_len > DENSE_INT64_INITIAL_RUN_THRESHOLD {
+        return Ok(false);
+    }
+
+    let mut snapshots = Vec::new();
+    for (source_index, source) in sources.iter().enumerate() {
+        if !selector.active.get(source_index).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(batch) = source.current_batch.as_ref() else {
+            stats.dense_fallback_count += 1;
+            return Ok(false);
+        };
+        if source.current_row >= batch.non_null_prefix_len {
+            stats.dense_fallback_count += 1;
+            return Ok(false);
+        }
+        let Some(order_column) = batch
+            .batch
+            .column(order_plan.field_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+        else {
+            return Err(format!(
+                "ordering_field `{}` is not Int64 at runtime",
+                order_plan.field_name
+            ));
+        };
+        snapshots.push(DenseInt64SourceSnapshot {
+            source_index,
+            batch: batch.batch.clone(),
+            order_column: order_column.clone(),
+            start: source.current_row,
+            end: batch.non_null_prefix_len,
+        });
+    }
+
+    let Some(safe_upper_bound) = dense_int64_safe_upper_bound(&snapshots) else {
+        return Ok(false);
+    };
+    for snapshot in &mut snapshots {
+        snapshot.end = dense_int64_bound(snapshot, safe_upper_bound).min(snapshot.end);
+    }
+    snapshots.retain(|snapshot| snapshot.start < snapshot.end);
+    if snapshots.len() < 2 {
+        return Ok(false);
+    }
+
+    let total_rows = snapshots
+        .iter()
+        .map(|snapshot| snapshot.end.saturating_sub(snapshot.start))
+        .sum::<usize>();
+    if total_rows == 0 {
+        return Ok(false);
+    }
+
+    let target_partitions = total_rows
+        .div_ceil(execution_options.output_batch_rows.max(1))
+        .max(1);
+    let max_partitions = cpu_parallelism
+        .saturating_mul(DENSE_INT64_MAX_PARTITIONS_PER_CORE)
+        .max(1);
+    let partition_count = target_partitions.min(max_partitions).max(1);
+    let partitions = dense_int64_partition_jobs(&snapshots, partition_count);
+    if partitions.is_empty() {
+        stats.dense_fallback_count += 1;
+        return Ok(false);
+    }
+    if partitions.len() > 1 {
+        let largest_partition = partitions
+            .iter()
+            .map(|partition| partition.rows)
+            .max()
+            .unwrap_or_default();
+        if largest_partition > total_rows.saturating_mul(9) / 10 {
+            stats.dense_fallback_count += 1;
+            return Ok(false);
+        }
+    }
+
+    if !accumulator.is_empty() {
+        flush_ordered_accumulator(accumulator, output_pipeline, writer, stats).await?;
+    }
+
+    let mut pending = FuturesUnordered::new();
+    for partition in partitions {
+        stats.dense_partition_jobs += 1;
+        pending.push(tokio::task::spawn_blocking(move || {
+            dense_int64_materialize_partition(partition)
+        }));
+    }
+
+    let mut completed = BTreeMap::new();
+    let mut dense_selection_duration = Duration::default();
+    let mut dense_materialization_duration = Duration::default();
+    let mut dense_comparisons = 0_u64;
+    while let Some(join_result) = pending.next().await {
+        let output = match join_result {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => return Err(error),
+            Err(error) => {
+                return Err(format!(
+                    "dense ordered materialization task failed to join: {error}"
+                ));
+            }
+        };
+        dense_selection_duration += output.selection_duration;
+        dense_materialization_duration += output.materialization_duration;
+        dense_comparisons += output.comparisons;
+        completed.insert(output.partition_index, output);
+    }
+
+    add_ordered_selection_duration(stats, dense_selection_duration);
+    stats.dense_selection_duration += dense_selection_duration;
+    stats.dense_materialization_duration += dense_materialization_duration;
+    stats.ordered_selector_comparisons += dense_comparisons + selector.take_comparisons();
+
+    for (_, output) in completed {
+        stats.rows += output.rows as u64;
+        stats.dense_rows += output.rows as u64;
+        output_pipeline
+            .submit_materialized_batch(
+                output.batch,
+                output.mode,
+                output.materialization_duration,
+                writer,
+                stats,
+            )
+            .await?;
+    }
+
+    for snapshot in snapshots {
+        let source_index = snapshot.source_index;
+        if sources[source_index].current_row == 0 {
+            stats.fallback_batches += 1;
+        }
+        sources[source_index].current_row = snapshot.end;
+        let exhausted_batch = sources[source_index]
+            .current_batch
+            .as_ref()
+            .map(|batch| sources[source_index].current_row >= batch.batch.num_rows())
+            .unwrap_or(false);
+        if exhausted_batch {
+            sources[source_index]
+                .load_next(&mut stats.input_batches)
+                .await?;
+        }
+        selector.set_active(
+            source_index,
+            sources[source_index].current_batch.is_some(),
+            sources,
+        );
+    }
+    stats.ordered_selector_comparisons += selector.take_comparisons();
+
+    Ok(true)
+}
+
+fn dense_int64_partition_jobs(
+    snapshots: &[DenseInt64SourceSnapshot],
+    partition_count: usize,
+) -> Vec<DenseInt64PartitionJob> {
+    let total_rows = snapshots
+        .iter()
+        .map(|snapshot| snapshot.end.saturating_sub(snapshot.start))
+        .sum::<usize>();
+    if total_rows == 0 {
+        return Vec::new();
+    }
+
+    let partition_count = partition_count.min(total_rows).max(1);
+    let boundaries = dense_int64_boundaries(snapshots, partition_count);
+    let mut jobs = Vec::new();
+    let mut lower = None;
+    for partition_index in 0..=boundaries.len() {
+        let upper = boundaries.get(partition_index).copied();
+        let mut partition_sources = Vec::new();
+        let mut rows = 0_usize;
+        for snapshot in snapshots {
+            let start = lower
+                .map(|boundary| dense_int64_bound(snapshot, boundary))
+                .unwrap_or(snapshot.start);
+            let end = upper
+                .map(|boundary| dense_int64_bound(snapshot, boundary))
+                .unwrap_or(snapshot.end);
+            if start < end {
+                rows += end - start;
+                partition_sources.push(DenseInt64SourceSnapshot {
+                    source_index: snapshot.source_index,
+                    batch: snapshot.batch.clone(),
+                    order_column: snapshot.order_column.clone(),
+                    start,
+                    end,
+                });
+            }
+        }
+        if rows > 0 {
+            jobs.push(DenseInt64PartitionJob {
+                partition_index: jobs.len(),
+                sources: partition_sources,
+                rows,
+            });
+        }
+        lower = upper;
+    }
+    jobs
+}
+
+fn dense_int64_safe_upper_bound(
+    snapshots: &[DenseInt64SourceSnapshot],
+) -> Option<DenseInt64Boundary> {
+    snapshots
+        .iter()
+        .filter(|snapshot| snapshot.start < snapshot.end)
+        .map(|snapshot| DenseInt64Boundary {
+            key: snapshot.order_column.value(snapshot.end - 1),
+            source_index: snapshot.source_index.saturating_add(1),
+        })
+        .min()
+}
+
+fn dense_int64_boundaries(
+    snapshots: &[DenseInt64SourceSnapshot],
+    partition_count: usize,
+) -> Vec<DenseInt64Boundary> {
+    if partition_count <= 1 {
+        return Vec::new();
+    }
+
+    let sample_target = partition_count.saturating_mul(8).max(1);
+    let mut samples = Vec::new();
+    for snapshot in snapshots {
+        let len = snapshot.end.saturating_sub(snapshot.start);
+        if len == 0 {
+            continue;
+        }
+        let stride = len.div_ceil(sample_target).max(1);
+        let mut row = snapshot.start;
+        while row < snapshot.end {
+            samples.push(DenseInt64Boundary {
+                key: snapshot.order_column.value(row),
+                source_index: snapshot.source_index,
+            });
+            row = row.saturating_add(stride);
+        }
+        samples.push(DenseInt64Boundary {
+            key: snapshot.order_column.value(snapshot.end - 1),
+            source_index: snapshot.source_index,
+        });
+    }
+    samples.sort_unstable();
+    samples.dedup();
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    let mut boundaries = Vec::new();
+    for partition in 1..partition_count {
+        let sample_index = samples.len().saturating_mul(partition) / partition_count;
+        if let Some(boundary) = samples.get(sample_index.min(samples.len() - 1)).copied() {
+            if boundaries.last().copied() != Some(boundary) {
+                boundaries.push(boundary);
+            }
+        }
+    }
+    boundaries
+}
+
+fn dense_int64_bound(snapshot: &DenseInt64SourceSnapshot, boundary: DenseInt64Boundary) -> usize {
+    if snapshot.source_index < boundary.source_index {
+        dense_int64_upper_bound(
+            &snapshot.order_column,
+            snapshot.start,
+            snapshot.end,
+            boundary.key,
+        )
+    } else {
+        dense_int64_lower_bound(
+            &snapshot.order_column,
+            snapshot.start,
+            snapshot.end,
+            boundary.key,
+        )
+    }
+}
+
+fn dense_int64_lower_bound(array: &Int64Array, start: usize, end: usize, key: i64) -> usize {
+    let mut low = start;
+    let mut high = end;
+    while low < high {
+        let mid = low + ((high - low) / 2);
+        if array.value(mid) < key {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
+fn dense_int64_upper_bound(array: &Int64Array, start: usize, end: usize, key: i64) -> usize {
+    let mut low = start;
+    let mut high = end;
+    while low < high {
+        let mid = low + ((high - low) / 2);
+        if array.value(mid) <= key {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
+fn dense_int64_materialize_partition(
+    partition: DenseInt64PartitionJob,
+) -> Result<DenseInt64PartitionOutput, String> {
+    let selection_start = Instant::now();
+    if partition.sources.len() == 1 {
+        let source = partition
+            .sources
+            .into_iter()
+            .next()
+            .expect("single dense partition source exists");
+        let batch = source.batch.slice(source.start, source.end - source.start);
+        return Ok(DenseInt64PartitionOutput {
+            partition_index: partition.partition_index,
+            batch,
+            rows: partition.rows,
+            mode: OrderedFlushMode::Direct,
+            selection_duration: selection_start.elapsed(),
+            materialization_duration: Duration::default(),
+            comparisons: 0,
+        });
+    }
+
+    let mut positions = partition
+        .sources
+        .iter()
+        .map(|source| source.start)
+        .collect::<Vec<_>>();
+    let mut indices = Vec::with_capacity(partition.rows);
+    let mut comparisons = 0_u64;
+    while indices.len() < partition.rows {
+        let mut winner = None;
+        for local_index in 0..partition.sources.len() {
+            if positions[local_index] >= partition.sources[local_index].end {
+                continue;
+            }
+            winner = Some(match winner {
+                None => local_index,
+                Some(current) => {
+                    comparisons += 1;
+                    if dense_int64_source_row_less(
+                        &partition.sources[local_index],
+                        positions[local_index],
+                        &partition.sources[current],
+                        positions[current],
+                    ) {
+                        local_index
+                    } else {
+                        current
+                    }
+                }
+            });
+        }
+        let Some(winner) = winner else {
+            return Err("dense ordered partition exhausted before expected row count".to_string());
+        };
+        indices.push((winner, positions[winner]));
+        positions[winner] += 1;
+    }
+    let selection_duration = selection_start.elapsed();
+
+    let materialization_start = Instant::now();
+    let batch_refs = partition
+        .sources
+        .iter()
+        .map(|source| &source.batch)
+        .collect::<Vec<_>>();
+    let batch = interleave_record_batch(&batch_refs, &indices)
+        .map_err(|error| format!("failed to materialize dense ordered partition: {error}"))?;
+    Ok(DenseInt64PartitionOutput {
+        partition_index: partition.partition_index,
+        batch,
+        rows: partition.rows,
+        mode: OrderedFlushMode::Interleave,
+        selection_duration,
+        materialization_duration: materialization_start.elapsed(),
+        comparisons,
+    })
+}
+
+fn dense_int64_source_row_less(
+    left: &DenseInt64SourceSnapshot,
+    left_row: usize,
+    right: &DenseInt64SourceSnapshot,
+    right_row: usize,
+) -> bool {
+    match left
+        .order_column
+        .value(left_row)
+        .cmp(&right.order_column.value(right_row))
+    {
+        CmpOrdering::Less => true,
+        CmpOrdering::Greater => false,
+        CmpOrdering::Equal => left.source_index < right.source_index,
+    }
 }
 
 fn add_ordered_selection_duration(stats: &mut ParquetMergeRunStats, duration: Duration) {
@@ -4900,7 +6108,10 @@ async fn parquet_merge_source_worker_typed<K: OrderedKey>(
     execution_options: ParquetMergeExecutionOptions,
     semaphore: Arc<Semaphore>,
     worker_metrics: Arc<ParquetWorkerMetrics>,
-    tx: mpsc::Sender<Result<PreparedOrderBatchTyped<K>, String>>,
+    source_order_metadata: SourceOrderMetadata,
+    source_copy_plan: OrderedRowGroupCopyPlan,
+    mut command_rx: mpsc::Receiver<OrderedSourceCommand>,
+    tx: mpsc::Sender<Result<OrderedSourceMessage<K>, String>>,
 ) -> Result<(), String> {
     let result: Result<(), String> = async {
         let mut file = File::open(&input_path)
@@ -4914,6 +6125,50 @@ async fn parquet_merge_source_worker_typed<K: OrderedKey>(
         let mut last_key = None;
 
         for row_group_index in 0..row_group_count {
+            if let Some(copy) = source_copy_plan
+                .row_groups
+                .get(row_group_index)
+                .and_then(Clone::clone)
+            {
+                let range = source_order_metadata
+                    .row_groups
+                    .get(row_group_index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "missing order metadata for `{}` row group {}",
+                            input_path.display(),
+                            row_group_index
+                        )
+                    })?;
+                let candidate = OrderedRowGroupCandidate {
+                    row_group_index,
+                    range,
+                    copy,
+                };
+                if tx
+                    .send(Ok(OrderedSourceMessage::CopyCandidate(candidate.clone())))
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                match command_rx.recv().await {
+                    Some(OrderedSourceCommand::Skip) => {
+                        validate_skipped_ordered_row_group_typed::<K>(
+                            &candidate.range,
+                            &mut last_key,
+                            &input_path,
+                            &order_plan.field_name,
+                            source_index,
+                        )?;
+                        continue;
+                    }
+                    Some(OrderedSourceCommand::Decode) => {}
+                    None => return Ok(()),
+                }
+            }
+
             let mut row_group_batch_index = 0_usize;
             let row_group_file = file.try_clone().await.map_err(|error| {
                 format!(
@@ -4995,7 +6250,11 @@ async fn parquet_merge_source_worker_typed<K: OrderedKey>(
                         .fetch_add(prepare_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     prepared
                 };
-                if tx.send(Ok(prepared)).await.is_err() {
+                if tx
+                    .send(Ok(OrderedSourceMessage::Batch(prepared)))
+                    .await
+                    .is_err()
+                {
                     return Ok(());
                 }
             }
@@ -5045,6 +6304,60 @@ fn validate_prepared_ordered_batch_typed<K: OrderedKey>(
     }
 
     *last_key = Some(K::key_at(&batch.order_column, batch.batch.num_rows() - 1));
+    Ok(())
+}
+
+fn validate_skipped_ordered_row_group_typed<K: OrderedKey>(
+    range: &RowGroupOrderRange,
+    last_key: &mut Option<OrderKeyValue>,
+    input_path: &Path,
+    field_name: &str,
+    source_index: usize,
+) -> Result<(), String> {
+    let (first_key, last_row_key) = match range.null_kind {
+        RowGroupNullKind::NoNulls => {
+            let (Some(min), Some(max)) = (range.min.as_ref(), range.max.as_ref()) else {
+                return Err(format!(
+                    "copyable row group {} in `{}` is missing exact `{}` min/max statistics",
+                    range.row_group_index,
+                    input_path.display(),
+                    field_name
+                ));
+            };
+            if compare_order_key_values(min, max) == CmpOrdering::Greater {
+                return Err(format!(
+                    "copyable row group {} in `{}` has inverted `{}` statistics",
+                    range.row_group_index,
+                    input_path.display(),
+                    field_name
+                ));
+            }
+            (min.clone(), max.clone())
+        }
+        RowGroupNullKind::AllNulls => {
+            let null_key = K::null_key_value();
+            (null_key.clone(), null_key)
+        }
+        RowGroupNullKind::MixedOrUnknown => {
+            return Err(format!(
+                "copyable row group {} in `{}` cannot be skipped without exact null-order metadata",
+                range.row_group_index,
+                input_path.display()
+            ));
+        }
+    };
+
+    if let Some(previous_key) = last_key.as_ref() {
+        if compare_order_key_values(previous_key, &first_key) == CmpOrdering::Greater {
+            return Err(format!(
+                "input parquet file `{}` is not sorted ascending by `{}` for source {}",
+                input_path.display(),
+                field_name,
+                source_index
+            ));
+        }
+    }
+    *last_key = Some(last_row_key);
     Ok(())
 }
 
@@ -5477,6 +6790,14 @@ pub async fn compact_ndjson_to_parquet(
         ordered_output_selection_duration: Duration::default(),
         ordered_output_materialization_duration: Duration::default(),
         ordered_output_materialization_wait_duration: Duration::default(),
+        ordered_pipeline_peak_buffered_bytes: 0,
+        writer_peak_buffered_bytes: 0,
+        ordered_selector_comparisons: 0,
+        dense_partition_jobs: 0,
+        dense_rows: 0,
+        dense_selection_duration: Duration::default(),
+        dense_materialization_duration: Duration::default(),
+        dense_fallback_count: 0,
         writer_write_duration: Duration::default(),
         writer_encode_duration: Duration::default(),
         writer_sink_duration: Duration::default(),
