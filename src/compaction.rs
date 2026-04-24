@@ -40,11 +40,12 @@ use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_writer::AsyncArrowWriter;
 use parquet::arrow::async_writer::AsyncFileWriter;
 use parquet::arrow::{ArrowSchemaConverter, ArrowWriter, add_encoded_arrow_schema_to_metadata};
-use parquet::basic::{Compression, Encoding, ZstdLevel};
+use parquet::basic::{Compression, Encoding, Type as PhysicalType, ZstdLevel};
 use parquet::column::writer::ColumnCloseResult;
 use parquet::file::metadata::{ParquetMetaDataReader, RowGroupMetaDataPtr};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{WriterProperties, WriterVersion};
 use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::types::{ColumnPath, SchemaDescriptor};
 use simd_json::borrowed::Value as BorrowedValue;
 use simd_json::prelude::{TypedScalarValue, ValueAsArray, ValueAsObject, ValueAsScalar};
 use simd_json::{Buffers, to_borrowed_value_with_buffers};
@@ -93,6 +94,11 @@ pub struct ParquetMergeExecutionOptions {
     pub unordered_merge_order: UnorderedMergeOrder,
     pub writer_compression: ParquetCompression,
     pub writer_dictionary_enabled: bool,
+    pub writer_column_options: Vec<ParquetWriterColumnOptions>,
+    pub writer_version: ParquetWriterVersion,
+    pub writer_data_page_size_limit: Option<usize>,
+    pub writer_dictionary_page_size_limit: Option<usize>,
+    pub writer_data_page_row_count_limit: Option<usize>,
     pub stats_fast_path: bool,
     pub ordered_memory_budget_bytes: Option<usize>,
 }
@@ -115,6 +121,30 @@ pub enum ParquetCompression {
     },
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParquetWriterColumnOptions {
+    pub path: Vec<String>,
+    pub dictionary_enabled: Option<bool>,
+    pub encoding: Option<ParquetEncoding>,
+    pub compression: Option<ParquetCompression>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParquetEncoding {
+    Plain,
+    DeltaBinaryPacked,
+    DeltaLengthByteArray,
+    DeltaByteArray,
+    ByteStreamSplit,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParquetWriterVersion {
+    #[default]
+    Parquet1,
+    Parquet2,
+}
+
 impl Default for ParquetMergeExecutionOptions {
     fn default() -> Self {
         Self {
@@ -127,6 +157,11 @@ impl Default for ParquetMergeExecutionOptions {
             unordered_merge_order: UnorderedMergeOrder::PreserveInputOrder,
             writer_compression: ParquetCompression::Uncompressed,
             writer_dictionary_enabled: true,
+            writer_column_options: Vec::new(),
+            writer_version: ParquetWriterVersion::Parquet1,
+            writer_data_page_size_limit: None,
+            writer_dictionary_page_size_limit: None,
+            writer_data_page_row_count_limit: None,
             stats_fast_path: true,
             ordered_memory_budget_bytes: None,
         }
@@ -2010,16 +2045,77 @@ fn validate_parquet_merge_execution_options(
     if options.ordered_memory_budget_bytes == Some(0) {
         return Err("ordered_memory_budget_bytes must be greater than zero when set".to_string());
     }
-    if let ParquetCompression::Zstd { level } = options.writer_compression {
-        if !(1..=22).contains(&level) {
+    if options.writer_data_page_size_limit == Some(0) {
+        return Err("writer_data_page_size_limit must be greater than zero when set".to_string());
+    }
+    if options.writer_dictionary_page_size_limit == Some(0) {
+        return Err(
+            "writer_dictionary_page_size_limit must be greater than zero when set".to_string(),
+        );
+    }
+    if options.writer_data_page_row_count_limit == Some(0) {
+        return Err(
+            "writer_data_page_row_count_limit must be greater than zero when set".to_string(),
+        );
+    }
+    validate_parquet_compression(options.writer_compression, "writer_compression")?;
+    let mut seen_column_paths = HashSet::new();
+    for column_options in &options.writer_column_options {
+        if column_options.path.is_empty() {
+            return Err("writer_column_options path must not be empty".to_string());
+        }
+        if column_options
+            .path
+            .iter()
+            .any(|part| part.trim().is_empty())
+        {
             return Err(format!(
-                "writer_compression zstd level must be between 1 and 22, got {level}"
+                "writer_column_options path `{}` contains an empty component",
+                format_writer_column_path(&column_options.path)
             ));
+        }
+        if column_options.dictionary_enabled.is_none()
+            && column_options.encoding.is_none()
+            && column_options.compression.is_none()
+        {
+            return Err(format!(
+                "writer_column_options path `{}` must set dictionary_enabled, encoding, or compression",
+                format_writer_column_path(&column_options.path)
+            ));
+        }
+        if !seen_column_paths.insert(column_options.path.clone()) {
+            return Err(format!(
+                "duplicate writer_column_options path `{}`",
+                format_writer_column_path(&column_options.path)
+            ));
+        }
+        if let Some(compression) = column_options.compression {
+            validate_parquet_compression(
+                compression,
+                &format!(
+                    "writer_column_options `{}` compression",
+                    format_writer_column_path(&column_options.path)
+                ),
+            )?;
         }
     }
     if let Some(ordering_field) = options.ordering_field.as_ref() {
         if ordering_field.trim().is_empty() {
             return Err("ordering_field must not be empty when provided".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_parquet_compression(
+    compression: ParquetCompression,
+    label: &str,
+) -> Result<(), String> {
+    if let ParquetCompression::Zstd { level } = compression {
+        if !(1..=22).contains(&level) {
+            return Err(format!(
+                "{label} zstd level must be between 1 and 22, got {level}"
+            ));
         }
     }
     Ok(())
@@ -2177,10 +2273,11 @@ fn build_ordered_row_group_copy_plans(
     source_adapters: &[Arc<CompiledSourceAdapter>],
     execution_options: &ParquetMergeExecutionOptions,
 ) -> Result<Vec<OrderedRowGroupCopyPlan>, String> {
-    let (output_parquet_schema, _) =
-        parquet_file_writer_schema_and_properties(output_schema, execution_options)?;
-    let requested_compression = parquet_compression(execution_options.writer_compression)
-        .map_err(|error| format!("invalid parquet writer compression: {error}"))?;
+    let output_parquet_descriptor = ArrowSchemaConverter::new()
+        .convert(output_schema)
+        .map_err(|error| format!("failed converting arrow schema to parquet schema: {error}"))?;
+    let output_parquet_schema = output_parquet_descriptor.root_schema_ptr();
+    let copy_policies = writer_column_policies(&output_parquet_descriptor, execution_options)?;
     input_paths
         .iter()
         .zip(source_schemas.iter())
@@ -2202,11 +2299,7 @@ fn build_ordered_row_group_copy_plans(
                     let row_count = row_group.num_rows();
                     if !file_copy_safe
                         || row_count < 0
-                        || !row_group_copy_matches_writer_properties(
-                            row_group,
-                            requested_compression,
-                            execution_options.writer_dictionary_enabled,
-                        )
+                        || !row_group_copy_matches_writer_properties(row_group, &copy_policies)
                     {
                         return None;
                     }
@@ -2230,18 +2323,33 @@ fn build_ordered_row_group_copy_plans(
 
 fn row_group_copy_matches_writer_properties(
     row_group: &parquet::file::metadata::RowGroupMetaData,
-    requested_compression: Compression,
-    writer_dictionary_enabled: bool,
+    column_policies: &[WriterColumnPolicy],
 ) -> bool {
-    row_group.columns().iter().all(|column| {
-        column.compression() == requested_compression
-            && (writer_dictionary_enabled
-                || !column.encodings().iter().any(|encoding| {
-                    matches!(
-                        encoding,
-                        Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
-                    )
-                }))
+    row_group.columns().len() == column_policies.len()
+        && row_group
+            .columns()
+            .iter()
+            .zip(column_policies.iter())
+            .all(|(column, policy)| {
+                column.column_path() == &policy.path
+                    && column.compression() == policy.compression
+                    && (policy.dictionary_enabled || !column_has_dictionary_encoding(column))
+                    && policy.explicit_encoding.is_none_or(|encoding| {
+                        policy.dictionary_enabled && column_has_dictionary_encoding(column)
+                            || column
+                                .encodings()
+                                .iter()
+                                .any(|candidate| *candidate == encoding)
+                    })
+            })
+}
+
+fn column_has_dictionary_encoding(column: &parquet::file::metadata::ColumnChunkMetaData) -> bool {
+    column.encodings().iter().any(|encoding| {
+        matches!(
+            encoding,
+            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+        )
     })
 }
 
@@ -2344,17 +2452,190 @@ fn parquet_compression(
     }
 }
 
+fn parquet_writer_version(version: ParquetWriterVersion) -> WriterVersion {
+    match version {
+        ParquetWriterVersion::Parquet1 => WriterVersion::PARQUET_1_0,
+        ParquetWriterVersion::Parquet2 => WriterVersion::PARQUET_2_0,
+    }
+}
+
+fn parquet_encoding(encoding: ParquetEncoding) -> Encoding {
+    match encoding {
+        ParquetEncoding::Plain => Encoding::PLAIN,
+        ParquetEncoding::DeltaBinaryPacked => Encoding::DELTA_BINARY_PACKED,
+        ParquetEncoding::DeltaLengthByteArray => Encoding::DELTA_LENGTH_BYTE_ARRAY,
+        ParquetEncoding::DeltaByteArray => Encoding::DELTA_BYTE_ARRAY,
+        ParquetEncoding::ByteStreamSplit => Encoding::BYTE_STREAM_SPLIT,
+    }
+}
+
+fn format_writer_column_path(path: &[String]) -> String {
+    path.join(".")
+}
+
+#[derive(Clone, Debug)]
+struct WriterColumnPolicy {
+    path: ColumnPath,
+    compression: Compression,
+    dictionary_enabled: bool,
+    explicit_encoding: Option<Encoding>,
+}
+
+fn writer_column_policies(
+    parquet_schema: &SchemaDescriptor,
+    execution_options: &ParquetMergeExecutionOptions,
+) -> Result<Vec<WriterColumnPolicy>, String> {
+    let default_compression = parquet_compression(execution_options.writer_compression)
+        .map_err(|error| format!("invalid parquet writer compression: {error}"))?;
+    let mut leaf_types = HashMap::<Vec<String>, PhysicalType>::new();
+    for column in parquet_schema.columns() {
+        leaf_types.insert(column.path().parts().to_vec(), column.physical_type());
+    }
+
+    let mut option_by_path = HashMap::<Vec<String>, &ParquetWriterColumnOptions>::new();
+    for column_options in &execution_options.writer_column_options {
+        let Some(physical_type) = leaf_types.get(&column_options.path).copied() else {
+            let available = leaf_types
+                .keys()
+                .map(|path| format_writer_column_path(path))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "writer_column_options path `{}` does not match an output parquet leaf column; available leaf columns: {available}",
+                format_writer_column_path(&column_options.path)
+            ));
+        };
+        if let Some(encoding) = column_options.encoding {
+            validate_parquet_encoding_for_type(encoding, physical_type, &column_options.path)?;
+        }
+        option_by_path.insert(column_options.path.clone(), column_options);
+    }
+
+    parquet_schema
+        .columns()
+        .iter()
+        .map(|column| {
+            let path_parts = column.path().parts().to_vec();
+            let option = option_by_path.get(&path_parts).copied();
+            let compression =
+                if let Some(compression) = option.and_then(|option| option.compression) {
+                    parquet_compression(compression).map_err(|error| {
+                        format!(
+                            "invalid parquet writer compression for `{}`: {error}",
+                            format_writer_column_path(&path_parts)
+                        )
+                    })?
+                } else {
+                    default_compression
+                };
+            Ok(WriterColumnPolicy {
+                path: column.path().clone(),
+                compression,
+                dictionary_enabled: option
+                    .and_then(|option| option.dictionary_enabled)
+                    .unwrap_or(execution_options.writer_dictionary_enabled),
+                explicit_encoding: option
+                    .and_then(|option| option.encoding)
+                    .map(parquet_encoding),
+            })
+        })
+        .collect()
+}
+
+fn validate_parquet_encoding_for_type(
+    encoding: ParquetEncoding,
+    physical_type: PhysicalType,
+    path: &[String],
+) -> Result<(), String> {
+    let supported = match encoding {
+        ParquetEncoding::Plain => true,
+        ParquetEncoding::DeltaBinaryPacked => {
+            matches!(physical_type, PhysicalType::INT32 | PhysicalType::INT64)
+        }
+        ParquetEncoding::DeltaLengthByteArray => matches!(physical_type, PhysicalType::BYTE_ARRAY),
+        ParquetEncoding::DeltaByteArray => matches!(
+            physical_type,
+            PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY
+        ),
+        ParquetEncoding::ByteStreamSplit => matches!(
+            physical_type,
+            PhysicalType::INT32
+                | PhysicalType::INT64
+                | PhysicalType::FLOAT
+                | PhysicalType::DOUBLE
+                | PhysicalType::FIXED_LEN_BYTE_ARRAY
+        ),
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(format!(
+            "writer_column_options path `{}` cannot use {:?} encoding for parquet physical type {:?}",
+            format_writer_column_path(path),
+            encoding,
+            physical_type
+        ))
+    }
+}
+
+#[cfg(test)]
 fn parquet_writer_properties(
     execution_options: &ParquetMergeExecutionOptions,
 ) -> Result<WriterProperties, String> {
+    if !execution_options.writer_column_options.is_empty() {
+        return Err("writer_column_options require an output schema".to_string());
+    }
+    parquet_writer_properties_with_policies(execution_options, &[])
+}
+
+fn parquet_writer_properties_for_arrow_schema(
+    output_schema: &Schema,
+    execution_options: &ParquetMergeExecutionOptions,
+) -> Result<WriterProperties, String> {
+    let parquet_schema = ArrowSchemaConverter::new()
+        .convert(output_schema)
+        .map_err(|error| format!("failed converting arrow schema to parquet schema: {error}"))?;
+    parquet_writer_properties_for_schema_descriptor(&parquet_schema, execution_options)
+}
+
+fn parquet_writer_properties_for_schema_descriptor(
+    parquet_schema: &SchemaDescriptor,
+    execution_options: &ParquetMergeExecutionOptions,
+) -> Result<WriterProperties, String> {
+    let policies = writer_column_policies(parquet_schema, execution_options)?;
+    parquet_writer_properties_with_policies(execution_options, &policies)
+}
+
+fn parquet_writer_properties_with_policies(
+    execution_options: &ParquetMergeExecutionOptions,
+    column_policies: &[WriterColumnPolicy],
+) -> Result<WriterProperties, String> {
     let compression = parquet_compression(execution_options.writer_compression)
         .map_err(|error| format!("invalid parquet writer compression: {error}"))?;
-    Ok(WriterProperties::builder()
+    let mut builder = WriterProperties::builder()
         .set_max_row_group_size(execution_options.output_row_group_rows)
         .set_write_batch_size(execution_options.output_batch_rows)
+        .set_writer_version(parquet_writer_version(execution_options.writer_version))
         .set_compression(compression)
-        .set_dictionary_enabled(execution_options.writer_dictionary_enabled)
-        .build())
+        .set_dictionary_enabled(execution_options.writer_dictionary_enabled);
+    if let Some(data_page_size_limit) = execution_options.writer_data_page_size_limit {
+        builder = builder.set_data_page_size_limit(data_page_size_limit);
+    }
+    if let Some(dictionary_page_size_limit) = execution_options.writer_dictionary_page_size_limit {
+        builder = builder.set_dictionary_page_size_limit(dictionary_page_size_limit);
+    }
+    if let Some(data_page_row_count_limit) = execution_options.writer_data_page_row_count_limit {
+        builder = builder.set_data_page_row_count_limit(data_page_row_count_limit);
+    }
+    for policy in column_policies {
+        builder = builder
+            .set_column_compression(policy.path.clone(), policy.compression)
+            .set_column_dictionary_enabled(policy.path.clone(), policy.dictionary_enabled);
+        if let Some(encoding) = policy.explicit_encoding {
+            builder = builder.set_column_encoding(policy.path.clone(), encoding);
+        }
+    }
+    Ok(builder.build())
 }
 
 fn parquet_file_writer_schema_and_properties(
@@ -2364,7 +2645,8 @@ fn parquet_file_writer_schema_and_properties(
     let parquet_schema = ArrowSchemaConverter::new()
         .convert(output_schema)
         .map_err(|error| format!("failed converting arrow schema to parquet schema: {error}"))?;
-    let mut writer_properties = parquet_writer_properties(execution_options)?;
+    let mut writer_properties =
+        parquet_writer_properties_for_schema_descriptor(&parquet_schema, execution_options)?;
     add_encoded_arrow_schema_to_metadata(output_schema, &mut writer_properties);
     Ok((parquet_schema.root_schema_ptr(), writer_properties))
 }
@@ -3556,7 +3838,8 @@ async fn run_parallel_output_writer(
     let mut writer_start = None;
     let (parquet_schema, final_writer_properties) =
         parquet_file_writer_schema_and_properties(output_schema.as_ref(), &execution_options)?;
-    let row_group_writer_properties = parquet_writer_properties(&execution_options)?;
+    let row_group_writer_properties =
+        parquet_writer_properties_for_arrow_schema(output_schema.as_ref(), &execution_options)?;
     let output_file = StdFile::create(&output_path)
         .map_err(|error| format!("failed to create output parquet file: {error}"))?;
     let mut file_writer = SerializedFileWriter::new(
@@ -4291,7 +4574,8 @@ async fn create_async_parquet_writer(
     let output_file = BufWriter::with_capacity(1 << 20, output_file);
     let sink_metrics = Arc::new(ParquetAsyncSinkMetrics::default());
     let output_file = TimedAsyncFileWriter::new(output_file, sink_metrics.clone());
-    let writer_properties = parquet_writer_properties(execution_options)?;
+    let writer_properties =
+        parquet_writer_properties_for_arrow_schema(output_schema.as_ref(), execution_options)?;
     let writer = AsyncArrowWriter::try_new(output_file, output_schema, Some(writer_properties))
         .map_err(|error| format!("failed to create parquet writer: {error}"))?;
     Ok((writer, sink_metrics))

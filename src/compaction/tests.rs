@@ -55,6 +55,11 @@ fn ordered_execution_options(ordering_field: &str) -> ParquetMergeExecutionOptio
         unordered_merge_order: UnorderedMergeOrder::PreserveInputOrder,
         writer_compression: ParquetCompression::Uncompressed,
         writer_dictionary_enabled: true,
+        writer_column_options: Vec::new(),
+        writer_version: ParquetWriterVersion::Parquet1,
+        writer_data_page_size_limit: None,
+        writer_dictionary_page_size_limit: None,
+        writer_data_page_row_count_limit: None,
         stats_fast_path: true,
         ordered_memory_budget_bytes: None,
     }
@@ -252,6 +257,25 @@ fn parquet_compressions(path: &Path) -> Result<Vec<Compression>, Box<dyn Error>>
         }
     }
     Ok(compressions)
+}
+
+fn parquet_column_metadata(
+    path: &Path,
+    column_path: &[&str],
+) -> Result<Vec<(Compression, Vec<Encoding>)>, Box<dyn Error>> {
+    let file = StdFile::open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    let expected = column_path.join(".");
+    let mut metadata = Vec::new();
+    for row_group_index in 0..reader.num_row_groups() {
+        let row_group = reader.metadata().row_group(row_group_index);
+        for column in row_group.columns() {
+            if column.column_path().string() == expected {
+                metadata.push((column.compression(), column.encodings().to_vec()));
+            }
+        }
+    }
+    Ok(metadata)
 }
 
 fn parquet_row_group_count(path: &Path) -> Result<usize, Box<dyn Error>> {
@@ -1498,6 +1522,84 @@ fn parquet_compression_options_validate_and_map() -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
+#[test]
+fn parquet_writer_column_options_validate_and_map() -> Result<(), Box<dyn Error>> {
+    let schema = Schema::new(vec![
+        Field::new("event_id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]);
+    let options = ParquetMergeExecutionOptions {
+        writer_compression: ParquetCompression::Snappy,
+        writer_version: ParquetWriterVersion::Parquet2,
+        writer_data_page_size_limit: Some(16 * 1024),
+        writer_dictionary_page_size_limit: Some(8 * 1024),
+        writer_data_page_row_count_limit: Some(512),
+        writer_column_options: vec![
+            ParquetWriterColumnOptions {
+                path: vec!["event_id".to_string()],
+                dictionary_enabled: Some(false),
+                encoding: Some(ParquetEncoding::DeltaBinaryPacked),
+                compression: None,
+            },
+            ParquetWriterColumnOptions {
+                path: vec!["name".to_string()],
+                dictionary_enabled: Some(false),
+                encoding: Some(ParquetEncoding::Plain),
+                compression: Some(ParquetCompression::Zstd { level: 1 }),
+            },
+        ],
+        ..ParquetMergeExecutionOptions::default()
+    };
+    let properties = parquet_writer_properties_for_arrow_schema(&schema, &options)?;
+    let event_id = ColumnPath::from("event_id");
+    let name = ColumnPath::from("name");
+    assert_eq!(properties.writer_version(), WriterVersion::PARQUET_2_0);
+    assert_eq!(properties.data_page_size_limit(), 16 * 1024);
+    assert_eq!(properties.dictionary_page_size_limit(), 8 * 1024);
+    assert_eq!(properties.data_page_row_count_limit(), 512);
+    assert_eq!(properties.compression(&event_id), Compression::SNAPPY);
+    assert_eq!(
+        properties.compression(&name),
+        Compression::ZSTD(ZstdLevel::try_new(1)?)
+    );
+    assert!(!properties.dictionary_enabled(&event_id));
+    assert!(!properties.dictionary_enabled(&name));
+    assert_eq!(
+        properties.encoding(&event_id),
+        Some(Encoding::DELTA_BINARY_PACKED)
+    );
+    assert_eq!(properties.encoding(&name), Some(Encoding::PLAIN));
+
+    let missing_path = ParquetMergeExecutionOptions {
+        writer_column_options: vec![ParquetWriterColumnOptions {
+            path: vec!["missing".to_string()],
+            dictionary_enabled: Some(false),
+            encoding: None,
+            compression: None,
+        }],
+        ..ParquetMergeExecutionOptions::default()
+    };
+    assert!(parquet_writer_properties_for_arrow_schema(&schema, &missing_path).is_err());
+
+    let invalid_encoding = ParquetMergeExecutionOptions {
+        writer_column_options: vec![ParquetWriterColumnOptions {
+            path: vec!["name".to_string()],
+            dictionary_enabled: Some(false),
+            encoding: Some(ParquetEncoding::ByteStreamSplit),
+            compression: None,
+        }],
+        ..ParquetMergeExecutionOptions::default()
+    };
+    assert!(parquet_writer_properties_for_arrow_schema(&schema, &invalid_encoding).is_err());
+
+    let invalid_page_size = ParquetMergeExecutionOptions {
+        writer_data_page_size_limit: Some(0),
+        ..ParquetMergeExecutionOptions::default()
+    };
+    assert!(validate_parquet_merge_execution_options(&invalid_page_size).is_err());
+    Ok(())
+}
+
 #[tokio::test]
 async fn parallel_writer_outputs_requested_compression_and_partial_row_group()
 -> Result<(), Box<dyn Error>> {
@@ -1620,6 +1722,97 @@ async fn parallel_writer_supports_lz4_raw_and_zstd() -> Result<(), Box<dyn Error
         let _ = tokio::fs::remove_file(right_path).await;
         let _ = tokio::fs::remove_file(output_path).await;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn parallel_writer_applies_per_column_writer_options() -> Result<(), Box<dyn Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("event_id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let left_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("alpha"),
+                Some("beta"),
+                Some("gamma"),
+            ])) as ArrayRef,
+        ],
+    )?;
+    let right_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![4, 5, 6])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("delta"),
+                Some("epsilon"),
+                Some("zeta"),
+            ])) as ArrayRef,
+        ],
+    )?;
+    let left_path = unique_path("parallel_column_options_left", "parquet");
+    let right_path = unique_path("parallel_column_options_right", "parquet");
+    let output_path = unique_path("parallel_column_options_output", "parquet");
+
+    write_parquet(&left_path, schema.clone(), left_batch).await?;
+    write_parquet(&right_path, schema, right_batch).await?;
+
+    let report = merge_top_level_parquet_files_with_execution(
+        &[left_path.clone(), right_path.clone()],
+        &output_path,
+        &TopLevelMergeOptions::default(),
+        &ParquetMergeExecutionOptions {
+            read_batch_size: 2,
+            output_batch_rows: 2,
+            output_row_group_rows: 3,
+            parallelism: 2,
+            writer_compression: ParquetCompression::Snappy,
+            writer_column_options: vec![
+                ParquetWriterColumnOptions {
+                    path: vec!["event_id".to_string()],
+                    dictionary_enabled: Some(false),
+                    encoding: Some(ParquetEncoding::DeltaBinaryPacked),
+                    compression: None,
+                },
+                ParquetWriterColumnOptions {
+                    path: vec!["name".to_string()],
+                    dictionary_enabled: Some(false),
+                    encoding: Some(ParquetEncoding::Plain),
+                    compression: Some(ParquetCompression::Zstd { level: 1 }),
+                },
+            ],
+            ..ParquetMergeExecutionOptions::default()
+        },
+    )
+    .await?;
+    assert_eq!(report.rows, 6);
+
+    let event_id_metadata = parquet_column_metadata(&output_path, &["event_id"])?;
+    assert!(!event_id_metadata.is_empty());
+    assert!(event_id_metadata.iter().all(|(compression, encodings)| {
+        *compression == Compression::SNAPPY
+            && encodings.contains(&Encoding::DELTA_BINARY_PACKED)
+            && !encodings.contains(&Encoding::RLE_DICTIONARY)
+    }));
+    let name_metadata = parquet_column_metadata(&output_path, &["name"])?;
+    assert!(!name_metadata.is_empty());
+    let zstd = Compression::ZSTD(ZstdLevel::try_new(1)?);
+    assert!(name_metadata.iter().all(|(compression, encodings)| {
+        *compression == zstd
+            && encodings.contains(&Encoding::PLAIN)
+            && !encodings.contains(&Encoding::RLE_DICTIONARY)
+    }));
+    assert_eq!(
+        collect_int64_column(&read_parquet_batches(&output_path).await?, "event_id"),
+        vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]
+    );
+
+    let _ = tokio::fs::remove_file(left_path).await;
+    let _ = tokio::fs::remove_file(right_path).await;
+    let _ = tokio::fs::remove_file(output_path).await;
     Ok(())
 }
 
@@ -2402,6 +2595,12 @@ async fn ordered_merge_copies_non_overlapping_exact_schema_row_groups() -> Resul
         &ParquetMergeExecutionOptions {
             parallelism: 2,
             writer_compression: ParquetCompression::Snappy,
+            writer_column_options: vec![ParquetWriterColumnOptions {
+                path: vec!["event_id".to_string()],
+                dictionary_enabled: Some(true),
+                encoding: None,
+                compression: Some(ParquetCompression::Snappy),
+            }],
             output_row_group_rows: 2,
             ..ordered_execution_options("event_id")
         },
@@ -2572,6 +2771,80 @@ async fn ordered_merge_copy_falls_back_on_compression_mismatch() -> Result<(), B
         collect_int64_column(&read_parquet_batches(&output_path).await?, "event_id"),
         vec![Some(1), Some(2)]
     );
+
+    let _ = tokio::fs::remove_file(input_path).await;
+    let _ = tokio::fs::remove_file(output_path).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordered_merge_copy_falls_back_on_column_dictionary_mismatch() -> Result<(), Box<dyn Error>>
+{
+    let payload_fields: Fields = vec![Arc::new(Field::new("score", DataType::Int32, true))].into();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("event_id", DataType::Int64, false),
+        Field::new("org_id", DataType::Int64, false),
+        Field::new("payload", DataType::Struct(payload_fields.clone()), true),
+    ]));
+    let payload = Arc::new(StructArray::new(
+        payload_fields,
+        vec![Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef],
+        None,
+    )) as ArrayRef;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+            payload,
+        ],
+    )?;
+    let input_path = unique_path("ordered_copy_dictionary_mismatch_input", "parquet");
+    let output_path = unique_path("ordered_copy_dictionary_mismatch_output", "parquet");
+    write_parquet_with_properties(
+        &input_path,
+        schema,
+        batch,
+        Some(
+            WriterProperties::builder()
+                .set_max_row_group_size(2)
+                .set_compression(Compression::SNAPPY)
+                .set_dictionary_enabled(true)
+                .build(),
+        ),
+    )
+    .await?;
+
+    let report = merge_payload_parquet_files_with_execution(
+        &[input_path.clone()],
+        &output_path,
+        &payload_schema_options(),
+        &ParquetMergeExecutionOptions {
+            parallelism: 2,
+            writer_compression: ParquetCompression::Snappy,
+            writer_column_options: vec![ParquetWriterColumnOptions {
+                path: vec!["event_id".to_string()],
+                dictionary_enabled: Some(false),
+                encoding: Some(ParquetEncoding::Plain),
+                compression: None,
+            }],
+            output_row_group_rows: 2,
+            ..ordered_execution_options("event_id")
+        },
+    )
+    .await?;
+
+    assert_eq!(report.copy_candidate_row_groups, 0);
+    assert_eq!(report.copied_row_groups, 0);
+    assert_eq!(
+        collect_int64_column(&read_parquet_batches(&output_path).await?, "event_id"),
+        vec![Some(1), Some(2)]
+    );
+
+    let event_id_metadata = parquet_column_metadata(&output_path, &["event_id"])?;
+    assert!(event_id_metadata.iter().all(|(_, encodings)| {
+        encodings.contains(&Encoding::PLAIN) && !encodings.contains(&Encoding::RLE_DICTIONARY)
+    }));
 
     let _ = tokio::fs::remove_file(input_path).await;
     let _ = tokio::fs::remove_file(output_path).await;

@@ -20,7 +20,8 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use rust_parquet_merge::{
-    CompactionReport, NumericWideningMode, ParquetCompression, ParquetMergeExecutionOptions,
+    CompactionReport, NumericWideningMode, ParquetCompression, ParquetEncoding,
+    ParquetMergeExecutionOptions, ParquetWriterColumnOptions, ParquetWriterVersion,
     PayloadMergeOptions, TopLevelMergeOptions, UnorderedMergeOrder,
     merge_payload_parquet_files_with_execution, merge_top_level_parquet_files_with_execution,
 };
@@ -209,6 +210,108 @@ impl BenchmarkCompression {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+enum BenchmarkSizeProfile {
+    None,
+    SnappyColumnTuned,
+    Zstd1ColumnTuned,
+}
+
+impl BenchmarkSizeProfile {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "snappy_column_tuned" => Ok(Self::SnappyColumnTuned),
+            "zstd1_column_tuned" => Ok(Self::Zstd1ColumnTuned),
+            other => Err(format!(
+                "unsupported RPM_BENCH_RUST_SIZE_PROFILE value `{other}`; expected `none`, `snappy_column_tuned`, or `zstd1_column_tuned`"
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::SnappyColumnTuned => "snappy_column_tuned",
+            Self::Zstd1ColumnTuned => "zstd1_column_tuned",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+enum BenchmarkWriterVersion {
+    Parquet1,
+    Parquet2,
+}
+
+impl BenchmarkWriterVersion {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "parquet1" | "1" | "1.0" => Ok(Self::Parquet1),
+            "parquet2" | "2" | "2.0" => Ok(Self::Parquet2),
+            other => Err(format!(
+                "unsupported RPM_BENCH_RUST_WRITER_VERSION value `{other}`; expected `parquet1` or `parquet2`"
+            )),
+        }
+    }
+
+    fn execution_version(self) -> ParquetWriterVersion {
+        match self {
+            Self::Parquet1 => ParquetWriterVersion::Parquet1,
+            Self::Parquet2 => ParquetWriterVersion::Parquet2,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Parquet1 => "parquet1",
+            Self::Parquet2 => "parquet2",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+enum BenchmarkEncoding {
+    Plain,
+    DeltaBinaryPacked,
+    DeltaLengthByteArray,
+    DeltaByteArray,
+    ByteStreamSplit,
+}
+
+impl BenchmarkEncoding {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "plain" => Ok(Self::Plain),
+            "delta_binary_packed" => Ok(Self::DeltaBinaryPacked),
+            "delta_length_byte_array" => Ok(Self::DeltaLengthByteArray),
+            "delta_byte_array" => Ok(Self::DeltaByteArray),
+            "byte_stream_split" => Ok(Self::ByteStreamSplit),
+            other => Err(format!(
+                "unsupported parquet encoding `{other}`; expected `plain`, `delta_binary_packed`, `delta_length_byte_array`, `delta_byte_array`, or `byte_stream_split`"
+            )),
+        }
+    }
+
+    fn execution_encoding(self) -> ParquetEncoding {
+        match self {
+            Self::Plain => ParquetEncoding::Plain,
+            Self::DeltaBinaryPacked => ParquetEncoding::DeltaBinaryPacked,
+            Self::DeltaLengthByteArray => ParquetEncoding::DeltaLengthByteArray,
+            Self::DeltaByteArray => ParquetEncoding::DeltaByteArray,
+            Self::ByteStreamSplit => ParquetEncoding::ByteStreamSplit,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct BenchmarkColumnOptions {
+    path: Vec<String>,
+    dictionary_enabled: Option<bool>,
+    encoding: Option<BenchmarkEncoding>,
+    compression: Option<BenchmarkCompression>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct BenchmarkConfig {
     file_count: usize,
@@ -220,6 +323,12 @@ struct BenchmarkConfig {
     rust_unordered_order: BenchmarkUnorderedMergeOrder,
     rust_compression: BenchmarkCompression,
     rust_dictionary_enabled: bool,
+    rust_size_profile: BenchmarkSizeProfile,
+    rust_writer_version: BenchmarkWriterVersion,
+    rust_writer_data_page_size_limit: Option<usize>,
+    rust_writer_dictionary_page_size_limit: Option<usize>,
+    rust_writer_data_page_row_count_limit: Option<usize>,
+    rust_column_options: Vec<BenchmarkColumnOptions>,
     rust_read_batch_size: Option<usize>,
     rust_output_batch_rows: Option<usize>,
     rust_output_row_group_rows: Option<usize>,
@@ -263,12 +372,15 @@ struct ScenarioSummary {
     rust_unordered_order: String,
     rust_compression: String,
     rust_dictionary_enabled: bool,
+    rust_size_profile: String,
+    rust_writer_version: String,
     duckdb_threads: Option<usize>,
     duckdb_compression: Option<String>,
     rust_output_bytes: u64,
     duckdb_output_bytes: u64,
     rust_parquet_metadata: Vec<ParquetMetadataSummary>,
     duckdb_parquet_metadata: Vec<ParquetMetadataSummary>,
+    parquet_column_size_deltas: Vec<ParquetColumnSizeDelta>,
     validation: ValidationSummary,
     rust: Option<EngineSummary>,
     duckdb: Option<EngineSummary>,
@@ -276,11 +388,28 @@ struct ScenarioSummary {
 
 #[derive(Clone, Debug, Serialize)]
 struct ParquetMetadataSummary {
+    path: String,
     compression: String,
     encodings: String,
     chunks: u64,
     compressed_bytes: u64,
     uncompressed_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ParquetColumnSizeDelta {
+    path: String,
+    rust_compression: String,
+    rust_encodings: String,
+    rust_chunks: u64,
+    rust_compressed_bytes: u64,
+    rust_uncompressed_bytes: u64,
+    duckdb_compression: String,
+    duckdb_encodings: String,
+    duckdb_chunks: u64,
+    duckdb_compressed_bytes: u64,
+    duckdb_uncompressed_bytes: u64,
+    compressed_delta_percent: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -414,6 +543,87 @@ fn parse_env_bool(name: &str, default: bool) -> Result<bool, Box<dyn Error>> {
     }
 }
 
+fn parse_column_path(value: &str, env_name: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let path = value
+        .split('.')
+        .map(|part| part.trim().to_string())
+        .collect::<Vec<_>>();
+    if path.is_empty() || path.iter().any(|part| part.is_empty()) {
+        return Err(format!("{env_name} contains invalid column path `{value}`").into());
+    }
+    Ok(path)
+}
+
+fn parse_column_option_assignments(
+    name: &str,
+) -> Result<Vec<(Vec<String>, String)>, Box<dyn Error>> {
+    let value = match env::var(name) {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return Ok(Vec::new()),
+        Err(error) => return Err(format!("failed reading {name}: {error}").into()),
+    };
+    let mut assignments = Vec::new();
+    for entry in value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let Some((path, setting)) = entry.split_once('=') else {
+            return Err(format!("{name} entry `{entry}` must be `path=value`").into());
+        };
+        assignments.push((parse_column_path(path, name)?, setting.trim().to_string()));
+    }
+    Ok(assignments)
+}
+
+fn parse_env_column_options() -> Result<Vec<BenchmarkColumnOptions>, Box<dyn Error>> {
+    let mut options_by_path = BTreeMap::<Vec<String>, BenchmarkColumnOptions>::new();
+
+    for (path, value) in parse_column_option_assignments("RPM_BENCH_RUST_COLUMN_DICTIONARY")? {
+        let enabled = match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" => false,
+            _ => {
+                return Err(format!(
+                    "failed to parse RPM_BENCH_RUST_COLUMN_DICTIONARY value `{value}` as bool"
+                )
+                .into());
+            }
+        };
+        options_by_path
+            .entry(path.clone())
+            .or_insert_with(|| BenchmarkColumnOptions {
+                path,
+                ..BenchmarkColumnOptions::default()
+            })
+            .dictionary_enabled = Some(enabled);
+    }
+
+    for (path, value) in parse_column_option_assignments("RPM_BENCH_RUST_COLUMN_ENCODING")? {
+        let encoding = BenchmarkEncoding::parse(&value)?;
+        options_by_path
+            .entry(path.clone())
+            .or_insert_with(|| BenchmarkColumnOptions {
+                path,
+                ..BenchmarkColumnOptions::default()
+            })
+            .encoding = Some(encoding);
+    }
+
+    for (path, value) in parse_column_option_assignments("RPM_BENCH_RUST_COLUMN_COMPRESSION")? {
+        let compression = BenchmarkCompression::parse(&value)?;
+        options_by_path
+            .entry(path.clone())
+            .or_insert_with(|| BenchmarkColumnOptions {
+                path,
+                ..BenchmarkColumnOptions::default()
+            })
+            .compression = Some(compression);
+    }
+
+    Ok(options_by_path.into_values().collect())
+}
+
 fn parse_duckdb_compression() -> Result<Option<String>, Box<dyn Error>> {
     match env::var("RPM_BENCH_DUCKDB_COMPRESSION") {
         Ok(value) => {
@@ -460,10 +670,30 @@ fn load_config() -> Result<BenchmarkConfig, Box<dyn Error>> {
     let rust_unordered_order = BenchmarkUnorderedMergeOrder::parse(
         &env::var("RPM_BENCH_RUST_UNORDERED_ORDER").unwrap_or_else(|_| "preserve".to_string()),
     )?;
-    let rust_compression = BenchmarkCompression::parse(
+    let mut rust_compression = BenchmarkCompression::parse(
         &env::var("RPM_BENCH_RUST_COMPRESSION").unwrap_or_else(|_| "uncompressed".to_string()),
     )?;
     let rust_dictionary_enabled = parse_env_bool("RPM_BENCH_RUST_DICTIONARY", true)?;
+    let rust_size_profile = BenchmarkSizeProfile::parse(
+        &env::var("RPM_BENCH_RUST_SIZE_PROFILE").unwrap_or_else(|_| "none".to_string()),
+    )?;
+    match rust_size_profile {
+        BenchmarkSizeProfile::None => {}
+        BenchmarkSizeProfile::SnappyColumnTuned => rust_compression = BenchmarkCompression::Snappy,
+        BenchmarkSizeProfile::Zstd1ColumnTuned => {
+            rust_compression = BenchmarkCompression::Zstd { level: 1 }
+        }
+    }
+    let rust_writer_version = BenchmarkWriterVersion::parse(
+        &env::var("RPM_BENCH_RUST_WRITER_VERSION").unwrap_or_else(|_| "parquet1".to_string()),
+    )?;
+    let rust_writer_data_page_size_limit =
+        parse_env_optional_usize("RPM_BENCH_RUST_DATA_PAGE_SIZE_LIMIT")?;
+    let rust_writer_dictionary_page_size_limit =
+        parse_env_optional_usize("RPM_BENCH_RUST_DICTIONARY_PAGE_SIZE_LIMIT")?;
+    let rust_writer_data_page_row_count_limit =
+        parse_env_optional_usize("RPM_BENCH_RUST_DATA_PAGE_ROW_COUNT_LIMIT")?;
+    let rust_column_options = parse_env_column_options()?;
     let rust_read_batch_size = parse_env_optional_usize("RPM_BENCH_RUST_READ_BATCH_SIZE")?;
     let rust_output_batch_rows = parse_env_optional_usize("RPM_BENCH_RUST_OUTPUT_BATCH_ROWS")?;
     let rust_output_row_group_rows =
@@ -509,6 +739,15 @@ fn load_config() -> Result<BenchmarkConfig, Box<dyn Error>> {
     if rust_ordered_memory_budget_mib == Some(0) {
         return Err("RPM_BENCH_RUST_ORDERED_MEMORY_BUDGET_MIB must be > 0 when set".into());
     }
+    if rust_writer_data_page_size_limit == Some(0) {
+        return Err("RPM_BENCH_RUST_DATA_PAGE_SIZE_LIMIT must be > 0 when set".into());
+    }
+    if rust_writer_dictionary_page_size_limit == Some(0) {
+        return Err("RPM_BENCH_RUST_DICTIONARY_PAGE_SIZE_LIMIT must be > 0 when set".into());
+    }
+    if rust_writer_data_page_row_count_limit == Some(0) {
+        return Err("RPM_BENCH_RUST_DATA_PAGE_ROW_COUNT_LIMIT must be > 0 when set".into());
+    }
     let rust_ordered_memory_budget_bytes =
         rust_ordered_memory_budget_mib.map(|mib| mib.saturating_mul(1024 * 1024));
 
@@ -522,6 +761,12 @@ fn load_config() -> Result<BenchmarkConfig, Box<dyn Error>> {
         rust_unordered_order,
         rust_compression,
         rust_dictionary_enabled,
+        rust_size_profile,
+        rust_writer_version,
+        rust_writer_data_page_size_limit,
+        rust_writer_dictionary_page_size_limit,
+        rust_writer_data_page_row_count_limit,
+        rust_column_options,
         rust_read_batch_size,
         rust_output_batch_rows,
         rust_output_row_group_rows,
@@ -1394,10 +1639,11 @@ fn total_input_bytes(input_paths: &[PathBuf]) -> Result<u64, Box<dyn Error>> {
 fn parquet_metadata_summary(path: &Path) -> Result<Vec<ParquetMetadataSummary>, Box<dyn Error>> {
     let file = std::fs::File::open(path)?;
     let reader = SerializedFileReader::new(file)?;
-    let mut groups = BTreeMap::<(String, String), ParquetMetadataSummary>::new();
+    let mut groups = BTreeMap::<(String, String, String), ParquetMetadataSummary>::new();
     for row_group_index in 0..reader.num_row_groups() {
         let row_group = reader.metadata().row_group(row_group_index);
         for column in row_group.columns() {
+            let path = column.column_path().string();
             let compression = format!("{:?}", column.compression());
             let encodings = column
                 .encodings()
@@ -1406,8 +1652,9 @@ fn parquet_metadata_summary(path: &Path) -> Result<Vec<ParquetMetadataSummary>, 
                 .collect::<Vec<_>>()
                 .join(", ");
             let entry = groups
-                .entry((compression.clone(), encodings.clone()))
+                .entry((path.clone(), compression.clone(), encodings.clone()))
                 .or_insert_with(|| ParquetMetadataSummary {
+                    path,
                     compression,
                     encodings,
                     chunks: 0,
@@ -1420,6 +1667,79 @@ fn parquet_metadata_summary(path: &Path) -> Result<Vec<ParquetMetadataSummary>, 
         }
     }
     Ok(groups.into_values().collect())
+}
+
+fn parquet_column_size_deltas(
+    rust: &[ParquetMetadataSummary],
+    duckdb: &[ParquetMetadataSummary],
+) -> Vec<ParquetColumnSizeDelta> {
+    let rust_by_path = aggregate_metadata_by_path(rust);
+    let duckdb_by_path = aggregate_metadata_by_path(duckdb);
+    let mut paths = rust_by_path
+        .keys()
+        .chain(duckdb_by_path.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .map(|path| {
+            let rust = rust_by_path.get(&path).cloned().unwrap_or_default();
+            let duckdb = duckdb_by_path.get(&path).cloned().unwrap_or_default();
+            let compressed_delta_percent = if duckdb.compressed_bytes == 0 {
+                None
+            } else {
+                Some(
+                    ((rust.compressed_bytes as f64 - duckdb.compressed_bytes as f64)
+                        / duckdb.compressed_bytes as f64)
+                        * 100.0,
+                )
+            };
+            ParquetColumnSizeDelta {
+                path,
+                rust_compression: rust.compressions.join("|"),
+                rust_encodings: rust.encodings.join("|"),
+                rust_chunks: rust.chunks,
+                rust_compressed_bytes: rust.compressed_bytes,
+                rust_uncompressed_bytes: rust.uncompressed_bytes,
+                duckdb_compression: duckdb.compressions.join("|"),
+                duckdb_encodings: duckdb.encodings.join("|"),
+                duckdb_chunks: duckdb.chunks,
+                duckdb_compressed_bytes: duckdb.compressed_bytes,
+                duckdb_uncompressed_bytes: duckdb.uncompressed_bytes,
+                compressed_delta_percent,
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Default)]
+struct AggregatedParquetMetadata {
+    compressions: Vec<String>,
+    encodings: Vec<String>,
+    chunks: u64,
+    compressed_bytes: u64,
+    uncompressed_bytes: u64,
+}
+
+fn aggregate_metadata_by_path(
+    metadata: &[ParquetMetadataSummary],
+) -> BTreeMap<String, AggregatedParquetMetadata> {
+    let mut by_path = BTreeMap::<String, AggregatedParquetMetadata>::new();
+    for entry in metadata {
+        let aggregate = by_path.entry(entry.path.clone()).or_default();
+        if !aggregate.compressions.contains(&entry.compression) {
+            aggregate.compressions.push(entry.compression.clone());
+        }
+        if !aggregate.encodings.contains(&entry.encodings) {
+            aggregate.encodings.push(entry.encodings.clone());
+        }
+        aggregate.chunks += entry.chunks;
+        aggregate.compressed_bytes += entry.compressed_bytes;
+        aggregate.uncompressed_bytes += entry.uncompressed_bytes;
+    }
+    by_path
 }
 
 async fn parquet_row_count_and_schema(
@@ -1633,12 +1953,20 @@ async fn ensure_duckdb_version(duckdb_bin: &str) -> Result<String, Box<dyn Error
     Ok(version)
 }
 
-fn benchmark_execution_options(config: &BenchmarkConfig) -> ParquetMergeExecutionOptions {
+fn benchmark_execution_options(
+    config: &BenchmarkConfig,
+    scenario: Scenario,
+) -> ParquetMergeExecutionOptions {
     let mut options = ParquetMergeExecutionOptions {
         parallelism: config.rust_parallelism,
         unordered_merge_order: config.rust_unordered_order.execution_order(),
-        writer_compression: config.rust_compression.execution_compression(),
+        writer_compression: scenario_rust_compression(config, scenario).execution_compression(),
         writer_dictionary_enabled: config.rust_dictionary_enabled,
+        writer_column_options: scenario_writer_column_options(config, scenario),
+        writer_version: config.rust_writer_version.execution_version(),
+        writer_data_page_size_limit: config.rust_writer_data_page_size_limit,
+        writer_dictionary_page_size_limit: config.rust_writer_dictionary_page_size_limit,
+        writer_data_page_row_count_limit: config.rust_writer_data_page_row_count_limit,
         ..ParquetMergeExecutionOptions::default()
     };
     apply_benchmark_tuning(config, &mut options);
@@ -1662,6 +1990,7 @@ fn apply_benchmark_tuning(config: &BenchmarkConfig, options: &mut ParquetMergeEx
 
 fn ordered_benchmark_execution_options(
     config: &BenchmarkConfig,
+    scenario: Scenario,
     ordering_field: &str,
 ) -> ParquetMergeExecutionOptions {
     let mut options = ParquetMergeExecutionOptions {
@@ -1672,8 +2001,13 @@ fn ordered_benchmark_execution_options(
         output_row_group_rows: 512_000,
         parallelism: config.rust_parallelism,
         unordered_merge_order: config.rust_unordered_order.execution_order(),
-        writer_compression: config.rust_compression.execution_compression(),
+        writer_compression: scenario_rust_compression(config, scenario).execution_compression(),
         writer_dictionary_enabled: config.rust_dictionary_enabled,
+        writer_column_options: scenario_writer_column_options(config, scenario),
+        writer_version: config.rust_writer_version.execution_version(),
+        writer_data_page_size_limit: config.rust_writer_data_page_size_limit,
+        writer_dictionary_page_size_limit: config.rust_writer_dictionary_page_size_limit,
+        writer_data_page_row_count_limit: config.rust_writer_data_page_row_count_limit,
         stats_fast_path: true,
         ordered_memory_budget_bytes: config.rust_ordered_memory_budget_bytes,
     };
@@ -1685,6 +2019,79 @@ fn ordered_benchmark_execution_options(
     }
     apply_benchmark_tuning(config, &mut options);
     options
+}
+
+fn scenario_rust_compression(config: &BenchmarkConfig, scenario: Scenario) -> BenchmarkCompression {
+    if copy_protected_profile_scenario(config, scenario) {
+        BenchmarkCompression::Snappy
+    } else {
+        config.rust_compression
+    }
+}
+
+fn copy_protected_profile_scenario(config: &BenchmarkConfig, scenario: Scenario) -> bool {
+    config.rust_size_profile != BenchmarkSizeProfile::None
+        && matches!(
+            scenario,
+            Scenario::OrderedPayloadMixedPragmatic | Scenario::OrderedPayloadStringMixedPragmatic
+        )
+}
+
+fn scenario_writer_column_options(
+    config: &BenchmarkConfig,
+    scenario: Scenario,
+) -> Vec<ParquetWriterColumnOptions> {
+    let mut options_by_path = BTreeMap::<Vec<String>, BenchmarkColumnOptions>::new();
+    if !copy_protected_profile_scenario(config, scenario) {
+        for option in size_profile_column_options(config.rust_size_profile, scenario) {
+            options_by_path.insert(option.path.clone(), option);
+        }
+    }
+    for option in &config.rust_column_options {
+        options_by_path.insert(option.path.clone(), option.clone());
+    }
+    options_by_path
+        .into_values()
+        .map(|option| ParquetWriterColumnOptions {
+            path: option.path,
+            dictionary_enabled: option.dictionary_enabled,
+            encoding: option.encoding.map(BenchmarkEncoding::execution_encoding),
+            compression: option
+                .compression
+                .map(BenchmarkCompression::execution_compression),
+        })
+        .collect()
+}
+
+fn size_profile_column_options(
+    profile: BenchmarkSizeProfile,
+    scenario: Scenario,
+) -> Vec<BenchmarkColumnOptions> {
+    if profile == BenchmarkSizeProfile::None {
+        return Vec::new();
+    }
+    let paths: &[&[&str]] =
+        match scenario {
+            Scenario::TopLevelPragmatic => &[&["event_id"], &["name"]],
+            Scenario::NestedPayloadPragmatic | Scenario::OrderedPayloadPragmatic => &[
+                &["event_id"],
+                &["payload", "profile", "name"],
+                &["payload", "scores", "list", "item"],
+            ],
+            Scenario::OrderedPayloadStringPragmatic
+            | Scenario::OrderedPayloadLargeStringPragmatic => &[&["event_key"]],
+            Scenario::OrderedPayloadMixedPragmatic
+            | Scenario::OrderedPayloadStringMixedPragmatic => &[],
+        };
+    paths
+        .iter()
+        .map(|path| BenchmarkColumnOptions {
+            path: path.iter().map(|part| (*part).to_string()).collect(),
+            dictionary_enabled: Some(false),
+            encoding: None,
+            compression: None,
+        })
+        .collect()
 }
 
 fn resolve_benchmark_parallelism(requested: usize, input_count: usize) -> usize {
@@ -1769,7 +2176,7 @@ async fn run_rust_merge(
                 &TopLevelMergeOptions {
                     numeric_mode: NumericWideningMode::Float64Pragmatic,
                 },
-                &benchmark_execution_options(config),
+                &benchmark_execution_options(config, scenario),
             )
             .await?
         }
@@ -1778,7 +2185,7 @@ async fn run_rust_merge(
                 input_paths,
                 output_path,
                 &PayloadMergeOptions::default(),
-                &benchmark_execution_options(config),
+                &benchmark_execution_options(config, scenario),
             )
             .await?
         }
@@ -1793,6 +2200,7 @@ async fn run_rust_merge(
                 &PayloadMergeOptions::default(),
                 &ordered_benchmark_execution_options(
                     config,
+                    scenario,
                     scenario
                         .ordering_field()
                         .expect("ordered scenarios have an ordering field"),
@@ -2181,14 +2589,17 @@ async fn benchmark_scenario(
                 generated.input_paths.len(),
             ),
             rust_unordered_order: config.rust_unordered_order.label().to_string(),
-            rust_compression: config.rust_compression.label(),
+            rust_compression: scenario_rust_compression(config, scenario).label(),
             rust_dictionary_enabled: config.rust_dictionary_enabled,
+            rust_size_profile: config.rust_size_profile.label().to_string(),
+            rust_writer_version: config.rust_writer_version.label().to_string(),
             duckdb_threads: config.duckdb_threads,
             duckdb_compression: config.duckdb_compression.clone(),
             rust_output_bytes: 0,
             duckdb_output_bytes: 0,
             rust_parquet_metadata: Vec::new(),
             duckdb_parquet_metadata: Vec::new(),
+            parquet_column_size_deltas: Vec::new(),
             validation,
             rust: None,
             duckdb: None,
@@ -2222,6 +2633,8 @@ async fn benchmark_scenario(
     let duckdb_output_bytes = std::fs::metadata(&duckdb_output)?.len();
     let rust_parquet_metadata = parquet_metadata_summary(&rust_output)?;
     let duckdb_parquet_metadata = parquet_metadata_summary(&duckdb_output)?;
+    let parquet_column_size_deltas =
+        parquet_column_size_deltas(&rust_parquet_metadata, &duckdb_parquet_metadata);
 
     Ok(ScenarioSummary {
         name: scenario.name().to_string(),
@@ -2233,14 +2646,17 @@ async fn benchmark_scenario(
             generated.input_paths.len(),
         ),
         rust_unordered_order: config.rust_unordered_order.label().to_string(),
-        rust_compression: config.rust_compression.label(),
+        rust_compression: scenario_rust_compression(config, scenario).label(),
         rust_dictionary_enabled: config.rust_dictionary_enabled,
+        rust_size_profile: config.rust_size_profile.label().to_string(),
+        rust_writer_version: config.rust_writer_version.label().to_string(),
         duckdb_threads: config.duckdb_threads,
         duckdb_compression: config.duckdb_compression.clone(),
         rust_output_bytes,
         duckdb_output_bytes,
         rust_parquet_metadata,
         duckdb_parquet_metadata,
+        parquet_column_size_deltas,
         validation,
         rust: Some(summarize_rust_runs(
             &rust_warmup,
@@ -2266,12 +2682,38 @@ fn format_metadata_summary(summary: &[ParquetMetadataSummary]) -> String {
         .iter()
         .map(|entry| {
             format!(
-                "{} [{}] chunks={} compressed={} uncompressed={}",
+                "{}: {} [{}] chunks={} compressed={} uncompressed={}",
+                entry.path,
                 entry.compression,
                 entry.encodings,
                 entry.chunks,
                 entry.compressed_bytes,
                 entry.uncompressed_bytes
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn format_column_size_deltas(deltas: &[ParquetColumnSizeDelta]) -> String {
+    if deltas.is_empty() {
+        return "n/a".to_string();
+    }
+    deltas
+        .iter()
+        .map(|entry| {
+            let delta = entry
+                .compressed_delta_percent
+                .map(|value| format!("{value:+.1}%"))
+                .unwrap_or_else(|| "n/a".to_string());
+            format!(
+                "{} rust={} duckdb={} delta={} rust_enc=[{}] duckdb_enc=[{}]",
+                entry.path,
+                entry.rust_compressed_bytes,
+                entry.duckdb_compressed_bytes,
+                delta,
+                entry.rust_encodings,
+                entry.duckdb_encodings
             )
         })
         .collect::<Vec<_>>()
@@ -2300,11 +2742,13 @@ fn print_summary(summary: &BenchmarkSummary) {
     println!("DuckDB CLI: {}", summary.duckdb_version);
     println!("Benchmark artifacts: {}", summary.benchmark_dir);
     println!(
-        "Rust settings: parallelism={} unordered_order={} compression={} dictionary={} ordered_memory_budget={} | DuckDB threads={} compression={}",
+        "Rust settings: parallelism={} unordered_order={} compression={} dictionary={} size_profile={} writer_version={} ordered_memory_budget={} | DuckDB threads={} compression={}",
         summary.config.rust_parallelism,
         summary.config.rust_unordered_order.label(),
         summary.config.rust_compression.label(),
         summary.config.rust_dictionary_enabled,
+        summary.config.rust_size_profile.label(),
+        summary.config.rust_writer_version.label(),
         summary
             .config
             .rust_ordered_memory_budget_bytes
@@ -2330,11 +2774,13 @@ fn print_summary(summary: &BenchmarkSummary) {
             scenario.input_bytes as f64 / (1024.0 * 1024.0)
         );
         println!(
-            "  Rust execution: resolved_parallelism={} unordered_order={} compression={} dictionary={} ordered_memory_budget={}",
+            "  Rust execution: resolved_parallelism={} unordered_order={} compression={} dictionary={} size_profile={} writer_version={} ordered_memory_budget={}",
             scenario.rust_resolved_parallelism,
             scenario.rust_unordered_order,
             scenario.rust_compression,
             scenario.rust_dictionary_enabled,
+            scenario.rust_size_profile,
+            scenario.rust_writer_version,
             summary
                 .config
                 .rust_ordered_memory_budget_bytes
@@ -2386,6 +2832,10 @@ fn print_summary(summary: &BenchmarkSummary) {
         println!(
             "  DuckDB parquet: {}",
             format_metadata_summary(&scenario.duckdb_parquet_metadata)
+        );
+        println!(
+            "  Column size deltas: {}",
+            format_column_size_deltas(&scenario.parquet_column_size_deltas)
         );
 
         let rust = scenario
